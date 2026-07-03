@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>SquidMIP — Plate View (prototype)</title>
+<style>
+  :root{--bg:#0b0e14;--panel:#131824;--panel2:#0f141e;--border:#232b3a;--ink:#e6edf3;--muted:#8b98ad;--faint:#5b6675;--accent:#58a6ff;--cell:20px;--hdr:30px;}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+  .app{display:flex;flex-direction:column;height:100vh}
+  header{padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  h1{font-size:16px;font-weight:750;margin:0}
+  .badge{font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);border:1px solid var(--border);border-radius:999px;padding:3px 9px}
+  .note{font-size:11.5px;color:var(--muted);max-width:440px}
+  .toolbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-left:auto}
+  .zoom{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--muted)}.zoom input{width:110px}
+  .jump{display:flex;align-items:center;gap:6px}
+  .jump input{background:#0a0d13;border:1px solid var(--border);color:var(--ink);border-radius:7px;padding:6px 9px;width:92px;font:inherit;text-transform:uppercase}
+  .jump input:focus{outline:none;border-color:var(--accent)}
+  .jump button{background:var(--accent);border:0;color:#04121f;font-weight:700;border-radius:7px;padding:6px 11px;cursor:pointer;font:inherit}
+  .body{display:flex;flex:1;min-height:0}
+  .plateWrap{flex:1;overflow:auto;padding:16px}
+  .plateTag{font-size:11px;color:var(--faint);margin-bottom:8px}
+  .colhead,.rowhead{color:var(--faint);font-size:10px;display:flex;align-items:center;justify-content:center}
+  .plate{display:grid;grid-template-columns:var(--hdr) repeat(48,var(--cell));grid-auto-rows:var(--cell);gap:1px}
+  .cell{border-radius:2px;background:#0a0d13;cursor:pointer;transition:transform .06s}
+  .cell:hover{transform:scale(1.6);z-index:3;outline:1px solid rgba(255,255,255,.4)}
+  .cell.sel{outline:2px solid var(--accent);z-index:4}
+  .detail{width:430px;flex:0 0 430px;border-left:1px solid var(--border);padding:16px;overflow:auto;background:var(--panel2)}
+  .detail h2{font-size:22px;margin:0 0 2px;font-weight:750}
+  .detail .sub{color:var(--muted);font-size:12px;margin-bottom:12px}
+  #cv{width:100%;aspect-ratio:1/1;background:#000;border:1px solid var(--border);border-radius:10px;display:block;image-rendering:pixelated}
+  .ctrl{margin-top:12px;border:1px solid var(--border);border-radius:10px;padding:11px 12px;background:#0a0d13}
+  .ctrl .h{font-size:10.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);margin-bottom:9px}
+  .tabs{display:flex;gap:6px;margin-bottom:10px}
+  .tab{display:flex;align-items:center;gap:6px;border:1px solid var(--border);border-radius:8px;padding:4px 8px;cursor:pointer;font-size:11.5px;color:var(--muted)}
+  .tab.foc{border-color:var(--accent);color:var(--ink);background:#111b2b}
+  .tab .sw{width:11px;height:11px;border-radius:50%;cursor:pointer}
+  .tab.hidden .sw{box-shadow:inset 0 0 0 2px #000;opacity:.35}
+  #hist{width:100%;height:64px;display:block;background:#05070b;border:1px solid var(--border);border-radius:7px}
+  .crow{display:flex;align-items:center;gap:9px;margin:7px 0;font-size:11.5px}
+  .crow span{color:var(--muted);width:42px}.crow input[type=range]{flex:1}
+  .crow b{width:54px;text-align:right;font-variant-numeric:tabular-nums}
+  .actions{display:flex;align-items:center;gap:8px;margin-top:9px;flex-wrap:wrap}
+  .actions button{background:#1b2431;border:1px solid var(--border);color:var(--ink);border-radius:7px;padding:5px 10px;cursor:pointer;font:inherit;font-size:11px}
+  .actions button:hover{border-color:var(--accent)}
+  .drange{font-size:11px;color:var(--faint)}
+  .meta{margin-top:14px;font-size:12px;color:var(--muted)}.meta div{display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border)}.meta .k{color:var(--faint)}
+  .empty{color:var(--faint);font-size:13px;margin-top:40px;text-align:center}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>SquidMIP · Plate View</h1><span class="badge">prototype</span>
+    <span class="note">1536-well · 32×48. Grid = <b>downsampled</b> thumbnails; detail = <b>full-res 16-bit array viewer</b> with per-channel windows. Real channels/colors; placeholder pixels until dataset wired.</span>
+    <div class="toolbar">
+      <label class="zoom">Zoom <input type="range" id="zoom" min="8" max="48" value="20"/><b id="zval" style="color:var(--muted)">20px</b></label>
+      <div class="jump"><input id="jin" placeholder="E5 / AA12" maxlength="4"/><button id="jbtn">Jump</button></div>
+    </div>
+  </header>
+  <div class="body">
+    <div class="plateWrap">
+      <div class="plateTag">Downsampled plate overview — click a well (or jump) for the full-res array viewer →</div>
+      <div class="plate" id="plate"></div>
+    </div>
+    <div class="detail" id="detail">
+      <div class="empty" id="empty">Click a well, or jump to one (e.g. <b>E5</b>, <b>AA12</b>) to open the full-res array viewer.</div>
+      <div id="dwrap" style="display:none">
+        <h2 id="dwell">—</h2>
+        <div class="sub" id="dsub">MIP (max over z)</div>
+        <canvas id="cv" width="384" height="384"></canvas>
+        <div class="ctrl">
+          <div class="h">Contrast · per-channel 16-bit windowing</div>
+          <div class="tabs" id="tabs"></div>
+          <canvas id="hist" width="400" height="64"></canvas>
+          <div class="crow"><span>Black</span><input type="range" id="lo" min="0" max="65535" value="0"/><b id="lov">0</b></div>
+          <div class="crow"><span>White</span><input type="range" id="hi" min="0" max="65535" value="65535"/><b id="hiv">65535</b></div>
+          <div class="actions"><button id="auto">Auto (channel)</button><button id="autoall">Auto all</button><button id="full">Full</button><span class="drange" id="drange"></span></div>
+        </div>
+        <div class="meta" id="dmeta"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  const ROWS=[];for(let i=0;i<26;i++)ROWS.push(String.fromCharCode(65+i));for(let i=0;i<6;i++)ROWS.push('A'+String.fromCharCode(65+i));
+  const COLS=48,Z=20,W=384,H=384,MAXV=65535;
+  const CH=[  // real channels + display colors from acquisition_channels.yaml
+    {n:'405 nm',c:[0x20,0xAD,0xF8]},
+    {n:'488 nm',c:[0x1F,0xFF,0x00]},
+    {n:'561 nm',c:[0xFF,0xCF,0x00]},
+    {n:'638 nm',c:[0xFF,0x00,0x00]},
+  ];
+  const on=CH.map(()=>true), lo=CH.map(()=>0), hi=CH.map(()=>MAXV);
+  let FIELDS={}, DMIN=CH.map(()=>0), DMAX=CH.map(()=>MAXV), FC=0, SEL=null;
+
+  function hash(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return h>>>0;}
+  function mul(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
+  function inten(w,ci){return((hash(w+'#'+ci)%1000)/1000)*0.85+0.12;}
+  function el(t,cls,txt){const e=document.createElement('div');if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e;}
+
+  // plate grid
+  const plate=document.getElementById('plate'),frag=document.createDocumentFragment();
+  frag.appendChild(el('div','colhead',''));for(let c=1;c<=COLS;c++)frag.appendChild(el('div','colhead',String(c)));
+  for(const r of ROWS){frag.appendChild(el('div','rowhead',r));for(let c=1;c<=COLS;c++){const d=el('div','cell','');d.dataset.well=r+c;d.title=r+c;frag.appendChild(d);}}
+  plate.appendChild(frag);
+  function tileColor(w){let r=0,g=0,b=0;CH.forEach((ch,ci)=>{if(!on[ci])return;const k=inten(w,ci);r+=ch.c[0]*k;g+=ch.c[1]*k;b+=ch.c[2]*k;});return`rgb(${Math.min(255,r*.6)|0},${Math.min(255,g*.6)|0},${Math.min(255,b*.6)|0})`;}
+  function paintTiles(){for(const c of plate.querySelectorAll('.cell'))c.style.background=tileColor(c.dataset.well);}
+  paintTiles();
+
+  const zoom=document.getElementById('zoom');
+  zoom.addEventListener('input',()=>{document.documentElement.style.setProperty('--cell',zoom.value+'px');document.getElementById('zval').textContent=zoom.value+'px';});
+
+  // 16-bit synthetic field per channel (low mean, sparse bright — like the real data)
+  function makeField(w,ci){const f=new Float32Array(W*H),rnd=mul(hash(w+'@'+ci));
+    const bg=150+rnd()*1300;f.fill(bg);const k=inten(w,ci),nb=6+Math.floor(rnd()*16);
+    for(let b=0;b<nb;b++){const cx=rnd()*W,cy=rnd()*H,sig=5+rnd()*24,amp=(8000+rnd()*40000)*k,s2=2*sig*sig,R=Math.ceil(sig*3);
+      const x0=Math.max(0,(cx-R)|0),x1=Math.min(W,(cx+R)|0),y0=Math.max(0,(cy-R)|0),y1=Math.min(H,(cy+R)|0);
+      for(let y=y0;y<y1;y++){const dy=y-cy;for(let x=x0;x<x1;x++){const dx=x-cx;f[y*W+x]+=amp*Math.exp(-(dx*dx+dy*dy)/s2);}}}
+    return f;}
+  function buildFields(w){FIELDS={};CH.forEach((ch,ci)=>{const f=makeField(w,ci);FIELDS[ci]=f;let mn=Infinity,mx=-Infinity;
+    for(let i=0;i<f.length;i+=7){const v=f[i];if(v<mn)mn=v;if(v>mx)mx=v;}DMIN[ci]=Math.floor(mn);DMAX[ci]=Math.ceil(mx);});}
+  function autoCh(ci){const f=FIELDS[ci];if(!f)return[0,MAXV];const bins=256,hh=new Uint32Array(bins),span=(DMAX[ci]-DMIN[ci])||1;let tot=0;
+    for(let i=0;i<f.length;i+=4){let bi=((f[i]-DMIN[ci])/span*bins)|0;if(bi<0)bi=0;if(bi>=bins)bi=bins-1;hh[bi]++;tot++;}
+    let c=0,l=DMIN[ci],h=DMAX[ci];for(let i=0;i<bins;i++){c+=hh[i];if(c>=tot*0.02){l=DMIN[ci]+i/bins*span;break;}}
+    c=0;for(let i=bins-1;i>=0;i--){c+=hh[i];if(c>=tot*0.005){h=DMIN[ci]+(i+1)/bins*span;break;}}
+    return[Math.round(l),Math.round(Math.max(h,l+1))];}
+
+  function render(){const cv=document.getElementById('cv'),g=cv.getContext('2d'),img=g.createImageData(W,H),px=img.data;
+    for(let q=0;q<px.length;q+=4){px[q]=0;px[q+1]=0;px[q+2]=0;px[q+3]=255;}
+    CH.forEach((ch,ci)=>{if(!on[ci]||!FIELDS[ci])return;const f=FIELDS[ci],col=ch.c,l=lo[ci],inv=255/Math.max(1,hi[ci]-l);
+      for(let p=0,q=0;p<f.length;p++,q+=4){let t=(f[p]-l)*inv;if(t<0)t=0;else if(t>255)t=255;
+        let r=px[q]+t*col[0]/255,gg=px[q+1]+t*col[1]/255,bb=px[q+2]+t*col[2]/255;px[q]=r>255?255:r;px[q+1]=gg>255?255:gg;px[q+2]=bb>255?255:bb;}});
+    g.putImageData(img,0,0);}
+
+  function drawHist(){const cv=document.getElementById('hist'),g=cv.getContext('2d'),Wc=cv.width,Hc=cv.height;
+    g.clearRect(0,0,Wc,Hc);const f=FIELDS[FC];if(!f)return;const bins=Wc,hh=new Float32Array(bins),span=(DMAX[FC]-DMIN[FC])||1;let mx=0;
+    for(let i=0;i<f.length;i+=3){let bi=((f[i]-DMIN[FC])/span*bins)|0;if(bi<0)bi=0;if(bi>=bins)bi=bins-1;hh[bi]++;}
+    for(let i=0;i<bins;i++){hh[i]=Math.sqrt(hh[i]);if(hh[i]>mx)mx=hh[i];}
+    const col=CH[FC].c;g.fillStyle=`rgba(${col[0]},${col[1]},${col[2]},0.55)`;
+    for(let i=0;i<bins;i++){const h=mx?hh[i]/mx*(Hc-2):0;g.fillRect(i,Hc-h,1,h);}
+    // black/white markers (map data value -> x over DMIN..DMAX)
+    const xOf=v=>Math.max(0,Math.min(Wc,(v-DMIN[FC])/span*Wc));
+    g.strokeStyle='#7f8794';g.lineWidth=1;
+    [['#3a4150',lo[FC]],['#e6edf3',hi[FC]]].forEach(([c,v])=>{g.strokeStyle=c;g.beginPath();g.moveTo(xOf(v),0);g.lineTo(xOf(v),Hc);g.stroke();});}
+
+  // tabs (per channel: click = focus; swatch = toggle visibility)
+  function buildTabs(){const t=document.getElementById('tabs');t.innerHTML='';
+    CH.forEach((ch,ci)=>{const tab=el('div','tab'+(ci===FC?' foc':'')+(on[ci]?'':' hidden'),'');
+      const sw=document.createElement('span');sw.className='sw';sw.style.background=`rgb(${ch.c.join(',')})`;
+      sw.onclick=(e)=>{e.stopPropagation();on[ci]=!on[ci];paintTiles();buildTabs();render();};
+      tab.appendChild(sw);tab.appendChild(document.createTextNode(ch.n));
+      tab.onclick=()=>{FC=ci;syncSliders();buildTabs();drawHist();};
+      t.appendChild(tab);});}
+  function syncSliders(){const L=document.getElementById('lo'),Hh=document.getElementById('hi');
+    L.value=lo[FC];Hh.value=hi[FC];document.getElementById('lov').textContent=lo[FC];document.getElementById('hiv').textContent=hi[FC];
+    document.getElementById('drange').textContent=`data ${DMIN[FC]}–${DMAX[FC]} · 16-bit`;}
+
+  function updateMeta(w){const m=w.match(/^([A-Z]+)(\d+)$/);document.getElementById('dsub').textContent=`MIP (max over z=${Z}) · ${on.filter(Boolean).length}/${CH.length} channels`;
+    document.getElementById('dmeta').innerHTML=row('well',w)+row('row / col',`${m[1]} / ${m[2]}`)+row('bit depth','16-bit uint16')+row('frame','4168 × 4168 (real)')+row('projection','max over z')+row('full-res','lazy from OME-zarr pyramid');}
+  function row(k,v){return`<div><span class="k">${k}</span><span>${v}</span></div>`;}
+
+  function select(w){SEL=w;for(const c of plate.querySelectorAll('.cell.sel'))c.classList.remove('sel');
+    const cell=[...plate.querySelectorAll('.cell')].find(c=>c.dataset.well===w);if(cell){cell.classList.add('sel');cell.scrollIntoView({block:'center',inline:'center',behavior:'smooth'});}
+    document.getElementById('empty').style.display='none';document.getElementById('dwrap').style.display='';document.getElementById('dwell').textContent=w;
+    buildFields(w);CH.forEach((ch,ci)=>{const a=autoCh(ci);lo[ci]=a[0];hi[ci]=a[1];});
+    buildTabs();syncSliders();render();drawHist();updateMeta(w);}
+
+  plate.addEventListener('click',e=>{const c=e.target.closest('.cell');if(c)select(c.dataset.well);});
+  const L=document.getElementById('lo'),Hh=document.getElementById('hi');
+  L.addEventListener('input',()=>{lo[FC]=+L.value;if(hi[FC]<=lo[FC]){hi[FC]=lo[FC]+1;Hh.value=hi[FC];}document.getElementById('lov').textContent=lo[FC];document.getElementById('hiv').textContent=hi[FC];render();drawHist();});
+  Hh.addEventListener('input',()=>{hi[FC]=+Hh.value;if(lo[FC]>=hi[FC]){lo[FC]=hi[FC]-1;L.value=lo[FC];}document.getElementById('lov').textContent=lo[FC];document.getElementById('hiv').textContent=hi[FC];render();drawHist();});
+  document.getElementById('auto').onclick=()=>{const a=autoCh(FC);lo[FC]=a[0];hi[FC]=a[1];syncSliders();render();drawHist();};
+  document.getElementById('autoall').onclick=()=>{CH.forEach((ch,ci)=>{const a=autoCh(ci);lo[ci]=a[0];hi[ci]=a[1];});syncSliders();render();drawHist();};
+  document.getElementById('full').onclick=()=>{lo[FC]=DMIN[FC];hi[FC]=DMAX[FC];syncSliders();render();drawHist();};
+
+  function parseWell(s){s=(s||'').trim().toUpperCase();const m=s.match(/^([A-Z]{1,2})(\d{1,2})$/);if(!m)return null;const r=m[1],c=parseInt(m[2],10);if(!ROWS.includes(r)||c<1||c>COLS)return null;return r+c;}
+  function doJump(){const inp=document.getElementById('jin'),w=parseWell(inp.value);if(w){inp.style.borderColor='';select(w);}else inp.style.borderColor='#ff5d5d';}
+  document.getElementById('jbtn').onclick=doJump;
+  document.getElementById('jin').addEventListener('keydown',e=>{if(e.key==='Enter')doJump();});
+})();
+</script>
+</body>
+</html>

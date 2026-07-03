@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>SquidMIP — Architecture</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#131824; --panel2:#0f141e; --border:#232b3a;
+    --ink:#e6edf3; --muted:#8b98ad; --faint:#5b6675;
+    --in:#3fb950; --core:#58a6ff; --out:#db61a2; --reuse:#a371f7; --warn:#e3b341;
+    --shadow:0 6px 18px rgba(0,0,0,.4);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:radial-gradient(1200px 600px at 50% -10%,#141b28,var(--bg));
+    color:var(--ink);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+  .wrap{max-width:1500px;margin:0 auto;padding:22px 22px 26px}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  h1{font-size:21px;font-weight:750;letter-spacing:-.02em;margin:0}
+  .sub{color:var(--muted);font-size:12.5px}
+  .tag{font-size:10.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);
+    border:1px solid var(--border);border-radius:999px;padding:3px 9px;margin-left:auto}
+  .banner{margin:10px 0 14px;border:1px solid color-mix(in srgb,var(--core) 40%,transparent);
+    background:color-mix(in srgb,var(--core) 9%,transparent);border-radius:9px;padding:8px 13px;
+    font-size:12px;color:color-mix(in srgb,var(--core) 90%,#fff 12%)}
+
+  .board{display:flex;align-items:stretch;gap:8px}
+  @media(max-width:1080px){.board{flex-wrap:wrap}.harr{display:none}}
+  .harr{align-self:center;color:var(--faint);font-size:22px;flex:0 0 auto}
+  .col{display:flex;flex-direction:column;gap:8px;min-width:210px}
+  .col.grow{flex:1 1 0}
+  .col-h{font-size:10.5px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;
+    display:flex;align-items:center;gap:6px;color:var(--pc);min-height:20px}
+
+  .node{background:var(--panel);border:1px solid var(--border);border-radius:11px;padding:10px 12px;box-shadow:var(--shadow)}
+  .node .t{font-weight:650;font-size:12.5px;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  .node .d{color:var(--muted);font-size:11.5px;margin-top:4px}
+  .node .d b{color:#e9eef6;font-weight:600}
+  .badge{font-size:9.5px;font-weight:700;padding:1px 6px;border-radius:5px;
+    border:1px solid color-mix(in srgb,var(--bc,var(--muted)) 45%,transparent);color:var(--bc,var(--muted));
+    background:color-mix(in srgb,var(--bc,var(--muted)) 12%,transparent)}
+  .tik{font-size:9px;color:var(--faint);font-weight:700}
+
+  .core{border:1.5px dashed color-mix(in srgb,var(--core) 45%,transparent);border-radius:14px;padding:10px;
+    background:color-mix(in srgb,var(--core) 5%,transparent);display:flex;flex-direction:column;gap:8px}
+  .core .lbl{font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--core)}
+  .loopnote{font-size:10.5px;color:color-mix(in srgb,var(--core) 85%,#fff 15%)}
+  .down{align-self:center;color:var(--core);font-size:14px;line-height:1}
+
+  .reuse{color:var(--reuse);border-color:color-mix(in srgb,var(--reuse) 50%,transparent);
+    background:color-mix(in srgb,var(--reuse) 12%,transparent)}
+
+  .foot{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+  @media(max-width:720px){.foot{grid-template-columns:1fr}}
+  .card{background:var(--panel2);border:1px solid var(--border);border-radius:11px;padding:11px 14px}
+  .card h3{margin:0 0 6px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+  .rule{display:flex;gap:8px;font-size:11.5px;padding:3px 0}
+  .rule .k{color:var(--faint);flex:0 0 26px;font-weight:700}
+  .pill{font-size:9.5px;font-weight:800;padding:1px 6px;border-radius:5px}
+  .pill.open{background:rgba(227,179,65,.18);color:var(--warn)}
+  .pill.set{background:rgba(63,185,80,.16);color:var(--in)}
+  code{background:#0a0d13;border:1px solid var(--border);border-radius:4px;padding:0 5px;font-size:10.5px;color:#c9d4e3}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>SquidMIP — Architecture</h1>
+    <span class="sub">Squid acquisition &rarr; max-projected plate. One FOV per well, no stitching.</span>
+    <span class="tag">draft v0.1</span>
+  </header>
+
+  <div class="banner"><b>CPU &middot; I/O-bound &middot; no GPU.</b> Wells processed in parallel by a worker pool; only one well's z-stack is resident per worker, so memory is bounded regardless of plate size (1536wp OK). Bottleneck is TIFF decode/disk, not compute.</div>
+
+  <div class="board">
+
+    <!-- INPUT -->
+    <div class="col" style="--pc:var(--in)">
+      <div class="col-h">Input</div>
+      <div class="node">
+        <div class="t">Squid acquisition</div>
+        <div class="d">Raw <b>z-stack per well</b> (1 FOV/well). On disk: individual TIFF / OME-TIFF tiles / zarr + <code>coordinates.csv</code> + <code>acquisition parameters.json</code>.</div>
+      </div>
+    </div>
+
+    <div class="harr">&rarr;</div>
+
+    <!-- CORE -->
+    <div class="col grow" style="--pc:var(--core)">
+      <div class="col-h">SquidMIP core</div>
+      <div class="core">
+        <div class="lbl">per well &middot; parallel workers</div>
+
+        <div class="node">
+          <div class="t">io &nbsp;<span class="badge reuse">reuse tilefusion</span><span class="tik">IMA-189</span></div>
+          <div class="d"><code>open_reader(path)</code> &rarr; metadata (wells, fovs, channels, Nz) + <code>read(well,fov,ch,z)</code>. Auto-recognizes Squid formats. <b>The value over FIJI.</b></div>
+        </div>
+        <div class="down">&darr;</div>
+        <div class="node">
+          <div class="t">fov select <span class="tik">IMA-183 / 187</span></div>
+          <div class="d">Pick FOV(s) per well. Default <b>1</b>; count is a parameter (future 4).</div>
+        </div>
+        <div class="down">&darr;</div>
+        <div class="node">
+          <div class="t">project &middot; <code>mip = np.max(z)</code> <span class="tik">IMA-183 / 188</span></div>
+          <div class="d">Collapse the z-stack per channel. Single <code>project()</code> seam; only <b>max</b> ships (EMF/EDF optional, not built).</div>
+        </div>
+        <div class="down">&darr;</div>
+        <div class="node">
+          <div class="t">write &nbsp;<span class="badge reuse">reuse tilefusion</span><span class="tik">IMA-184</span></div>
+          <div class="d">Assemble channels (distinct &mdash; no z-as-channel bug) &rarr; serialize. OME-NGFF metadata + zarr writer reused.</div>
+        </div>
+
+        <div class="loopnote">wrapped by <b>cli</b> (argparse/typer, batch over a plate) &middot; <span class="tik">IMA-186</span></div>
+      </div>
+    </div>
+
+    <div class="harr">&rarr;</div>
+
+    <!-- OUTPUT -->
+    <div class="col" style="--pc:var(--out)">
+      <div class="col-h">Outputs &middot; two consumers</div>
+      <div class="node">
+        <div class="t">OME-zarr plate <span class="badge" style="--bc:var(--out)">canonical</span></div>
+        <div class="d">Chunked, multiscale. &rarr; <b>ndviewer_light</b> (array-viewer): full-res, <b>lazy per-well</b> load, well labels. <span class="tik">IMA-185</span></div>
+      </div>
+      <div class="down" style="color:var(--out)">&darr; view</div>
+      <div class="node">
+        <div class="t">per-well TIFF <span class="badge" style="--bc:var(--out)">export</span></div>
+        <div class="d">One <code>&lt;well&gt;.tif</code> per well &rarr; <b>external analysis software</b> (Nick's ask). Plain vs OME-TIFF = open decision.</div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="foot">
+    <div class="card">
+      <h3>Decisions</h3>
+      <div class="rule"><span class="k">A</span><span>IO reuse &rarr; <b>depend on tilefusion</b> (needed for OME-zarr writer) <span class="pill open">CONFIRM</span></span></div>
+      <div class="rule"><span class="k">B</span><span>Output = <b>OME-zarr canonical + TIFF export</b> <span class="pill set">REVISED</span></span></div>
+      <div class="rule"><span class="k">C</span><span>Throughput target for 1536wp <span class="pill open">TBD number</span></span></div>
+      <div class="rule"><span class="k">&middot;</span><span>Method = MIP (max over z) <span class="pill set">SETTLED</span> &middot; modality: fluorescence (confirm)</span></div>
+    </div>
+    <div class="card">
+      <h3>Acceptance = Nick's + You Yan's requirements</h3>
+      <div class="rule"><span class="k">1</span><span>one image/well, matches FIJI Z-Project(Max)</span></div>
+      <div class="rule"><span class="k">2</span><span>TIFF opens in external analysis software</span></div>
+      <div class="rule"><span class="k">3</span><span>opens full-res in ndviewer_light (array-viewer)</span></div>
+      <div class="rule"><span class="k">4</span><span>one-command batch over a plate; FOV count a param</span></div>
+      <div class="rule"><span class="k">5</span><span>1536wp within target, memory bounded</span></div>
+      <div class="rule"><span class="k">6</span><span>auto-recognizes Squid format; channels distinct, z collapsed</span></div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

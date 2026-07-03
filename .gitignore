@@ -1,0 +1,5 @@
+.spec/
+.sprint/
+__pycache__/
+*.pyc
+.DS_Store
