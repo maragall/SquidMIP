@@ -14,8 +14,5 @@
 - **Context:** Confirmed against a real dataset yaml and `colors.py:45-55`. Correct-by-luck today because the fallback palette matches the standard 4-channel wavelengths. Also map channels by NAME, not position (yaml order is descending 638→405).
 - **Depends on / blocked by:** whoever owns `~/CEPHLA/projects/explorer/squid2minerva`.
 
-### Parallelize per-well writing (perf, if needed)
-- **What:** Optional writer pool to parallelize per-well zarr/TIFF writes on large plates.
-- **Why:** A 1536-well plate is many sequential writes; may bottleneck.
-- **Context:** Premature today — throughput is bounded by IMA-188's sequential yield, and streaming keeps peak memory at one well. Precondition: measure 1536-well timing first; only parallelize if sequential proves too slow.
-- **Depends on / blocked by:** measured large-plate timing.
+### (Reconciled 2026-07-05) Write parallelism is IMA-188's, not IMA-184's
+- Superseded by the build-order reconcile: IMA-188 is the parallel/streaming engine and may call 184's writer concurrently per `(well, fov)`. 184 does not add its own parallel layer; it must be **concurrency-safe** instead (guard the shared `plate`/`well` group-metadata writes). That safety requirement is now in-scope (plan decision 6), not a deferred TODO.
