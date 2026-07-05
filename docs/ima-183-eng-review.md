@@ -226,14 +226,21 @@ Intent asserted on the Notion "Squid MIP" page (IMA-183 section).
 
 Public surface (added to `squidmip/__init__`): `select_fovs`, `project`, `project_well`.
 - `squidmip/projection.py` — the three functions + module ASCII data-flow docstring.
-- `tests/test_projection.py` — 20 unit tests (project primitive, project_well, select_fovs;
-  incl. non-contiguous-z and multi-timepoint fixtures).
-- `tests/test_integration_projection.py` — cross-slot 189+183, marked `integration`.
+- `tests/test_projection.py` — unit tests (project primitive, project_well, select_fovs;
+  non-contiguous-z, multi-timepoint) + `tests/test_acquisition.py` dead-attribute guard.
+- `tests/test_integration.py` — the shared cross-slot ("cross commit") file, one section per
+  ticket. IMA-183 ↔ IMA-189 section covers, on real data:
+  - **pixel-exact**: `project_well` == independent `np.max` over the reader's reads;
+  - **efficacy**: MIP dominates every single z-slice AND (with >1 z) equals no single slice —
+    proves it genuinely combines planes, not a pass-through;
+  - **Nz-mismatch**: asserts the reader warns + trusts filenames on `sim_1536wp`;
+  - **memory-bounded** single-well projection at 1536wp scale.
 
-Results: **63 unit tests pass** (clean-room `pytest -m "not integration"`). **Cross-slot
-integration green on two datasets:** the synthetic `sim_1536wp` (1536 wells, pixel-exact,
-memory-bounded) and a real Squid acquisition on disk (the `real_dataset` fixture, different
-shape/Nz).
+Results: **64 unit tests pass** (clean-room `pytest -m "not integration"`); **71 with
+integration** on two datasets — synthetic `sim_1536wp` (1536 wells) and a real Squid
+acquisition on disk (`real_dataset`, different shape/Nz). Two visual cross-checks saved to
+`/tmp`: FIJI-equivalent bit-identical MIP (`|diff|=0`), and MIP-vs-single-slice showing the
+projection recovers signal from other planes (68% of pixels brighter on the real z-stack).
 
 **Single metadata format (JSON removed) — cross-slot decision carried in this branch.** Every
 real acquisition we have (the real Squid dataset, sim_1536wp, current Squid) writes `acquisition.yaml`, so the legacy

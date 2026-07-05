@@ -147,3 +147,27 @@ def test_real_acquisition_pipeline_end_to_end(real_dataset):
     assert set(wells) == set(meta["regions"])
     region = meta["regions"][0]
     _assert_well_matches_np_max(reader, region, wells[region][0])
+
+
+@pytest.mark.integration
+def test_real_acquisition_mip_actually_combines_z(real_dataset):
+    # Efficacy on the real z-stack: the MIP must (a) dominate every single z-slice pixel-wise
+    # (the max-projection property) and (b) genuinely COMBINE planes — with >1 z it must not
+    # equal any single slice, i.e. it is not silently passing one plane through.
+    reader = open_reader(real_dataset)
+    meta = reader.metadata
+    region = meta["regions"][0]
+    fov = meta["fovs_per_region"][region][0]
+    z_levels = meta["z_levels"]
+    out = project_well(reader, region, fov)              # (T, C, 1, Y, X) — computed once
+    # validate EVERY timepoint and EVERY channel, not just t0/c0
+    for t in range(meta["n_t"]):
+        for c_i, ch in enumerate(c["name"] for c in meta["channels"]):
+            mip = out[t, c_i, 0]
+            slices = [reader.read(region, fov, ch, z, t) for z in z_levels]
+            for s in slices:
+                assert (mip >= s).all()                  # (a) dominates every slice
+            assert np.array_equal(mip, np.max(np.stack(slices), axis=0))
+            if len(z_levels) > 1:                        # (b) combines, not a pass-through
+                assert all(not np.array_equal(mip, s) for s in slices)
+                assert (mip > np.stack(slices).min(axis=0)).any()
