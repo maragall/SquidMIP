@@ -66,7 +66,11 @@ def _assert_well_matches_np_max(reader, region, fov):
 # --- sim_1536wp (synthetic plate scale) ---
 @pytest.mark.integration
 def test_sim1536_metadata_sanity(sim_1536wp):
-    meta = open_reader(sim_1536wp).metadata
+    # sim_1536wp's acquisition.yaml declares nz=3 but 20 z-planes exist on disk. The reader
+    # must WARN and trust the filenames (IMA-189 "filenames are ground truth"). Asserting the
+    # warning here turns incidental noise into a documented check + covers the Nz-mismatch path.
+    with pytest.warns(UserWarning, match="Recorded Nz"):
+        meta = open_reader(sim_1536wp).metadata
     assert len(meta["regions"]) == 1536
     assert all(
         fovs == [0] for fovs in meta["fovs_per_region"].values()
@@ -78,6 +82,7 @@ def test_sim1536_metadata_sanity(sim_1536wp):
     assert meta["frame_shape"] == (4168, 4168)
 
 
+@pytest.mark.filterwarnings("ignore:Recorded Nz")  # asserted in test_sim1536_metadata_sanity
 @pytest.mark.integration
 def test_sim1536_select_one_fov_per_well(sim_1536wp):
     meta = open_reader(sim_1536wp).metadata
@@ -86,6 +91,7 @@ def test_sim1536_select_one_fov_per_well(sim_1536wp):
     assert all(fovs == [0] for fovs in wells.values())
 
 
+@pytest.mark.filterwarnings("ignore:Recorded Nz")  # asserted in test_sim1536_metadata_sanity
 @pytest.mark.integration
 def test_sim1536_project_sampled_wells_pixel_exact(sim_1536wp):
     reader = open_reader(sim_1536wp)
@@ -98,6 +104,7 @@ def test_sim1536_project_sampled_wells_pixel_exact(sim_1536wp):
         _assert_well_matches_np_max(reader, region, 0)
 
 
+@pytest.mark.filterwarnings("ignore:Recorded Nz")  # asserted in test_sim1536_metadata_sanity
 @pytest.mark.integration
 def test_sim1536_single_well_memory_bounded(sim_1536wp):
     # Streaming MIP must NOT materialise the whole z-stack. For one well the honest peak is
