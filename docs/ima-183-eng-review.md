@@ -1,0 +1,271 @@
+# IMA-183 — Engineering Review (longform)
+
+**Ticket:** IMA-183 — One FOV per well for well-plate acquisitions
+**Branch:** `juliomaragall/ima-183-one-fov-per-well-for-well-plate-acquisitions`
+**Review:** `/plan-eng-review`, completed 2026-07-04. Outside voice: Claude subagent (Codex not installed).
+**Status:** CLEARED for planning — but see §0. The reader assumptions were rebuilt after IMA-189 locked.
+
+> This document is the reviewable record of the plan-eng-review. The working plan lives at
+> `.spec/open/ima-183.md` (gitignored). Everything load-bearing is reproduced here so the
+> merge diff is self-contained. The only behavior-bearing file this ticket has added to the
+> tracked tree so far is `TODOS.md`; the implementation (T1–T6) lands after this doc is
+> approved.
+
+## Commits so far
+
+| Commit | What | Tracked? |
+|--------|------|----------|
+| `b93b179` | Scaffold repo (shared base — README, gitignore, docs) | pre-existing |
+| `479b54e` | `TODOS.md`: defer RGB/brightfield MIP read-path exactness | **yes, pushed** |
+| _(pending)_ | This doc: `docs/ima-183-eng-review.md` | on approval |
+| _(pending)_ | Implementation T1–T6 | after code review |
+
+The enriched `.spec/open/ima-183.md` (15 KB) is **gitignored by project convention**
+(`.gitignore:1: .spec/`), so it does not appear in the diff. It is mirrored in
+`~/.gstack/projects/maragall-SquidMIP/`. This doc is the tracked, reviewable substitute.
+
+---
+
+## 0. Post-review reconciliation with the LOCKED IMA-189 (2026-07-05)
+
+The review below was run when IMA-189 was still scoped as a *thin adapter over tilefusion*.
+**IMA-189 has since been locked to a standalone reader** (`.spec/open/ima-189.md`,
+`docs/ima-189-eng-review.md`). That changes the ground IMA-183 stands on. These corrections
+**OVERRIDE** the corresponding statements later in this doc. This is the section to review
+hardest.
+
+**C1 — The reader API is different. Every IMA-183 signature was rewritten.**
+My review assumed tilefusion's tile-indexed API: `reader.read_tile(tile_idx, z_level)` +
+`tile_identifiers`/`unique_regions`. The locked IMA-189 reader is **key-indexed**:
+
+```
+open_reader(path) -> SquidReader
+SquidReader.metadata -> { regions:[str] (natural-sorted),
+                          fovs_per_region:{region:[int]},
+                          channels:[{name,display_name,display_color,ex}],
+                          n_z:int, z_levels:[int], dz_um, pixel_size_um,
+                          wellplate_format, frame_shape:(Y,X), dtype, n_t }
+SquidReader.read(region, fov, channel, z, t=0) -> (Y,X) native-dtype, exact
+    # KeyError on unknown (region,fov,z,channel); IndexError on bad t;
+    # raises on non-2D or dtype outside {uint8, uint16}
+```
+_(Verified against merged `squidmip/reader.py`. NOTE: `positions`/`coordinates.csv`
+were **dropped** in the locked 189 — one FOV/well needs no per-FOV XY; plate layout
+comes from the well ID + `wellplate_format`. Iterate `z_levels` (may be sparse), not
+`range(n_z)`.)_
+
+So `select_fovs` groups over `metadata.fovs_per_region` (not `tile_identifiers`), and
+`project_well` loops `reader.read(region, fov, channel, z)` (not `read_tile`). Corrected
+signatures in §4.
+
+**C2 — "uint16" was wrong; preserve NATIVE dtype.** IMA-189's own §0 correction (verified
+against `Cephla-Lab/Squid`): `4168×4168` is the *unbinned* crop; default binning is 2×2 →
+~2084², and pixel format spans MONO8 (uint8) to MONO12/16 (uint16). The reader reads
+`frame_shape`+`dtype` from the first real frame and preserves native dtype. **IMA-183 must
+not hardcode uint16.** The MIP is `np.maximum` in native dtype; no cast. AC "bit-identical to
+FIJI" stands, but the dtype is whatever the acquisition used.
+
+**C3 — My D9 cross-model tension was moot (premise already corrected in IMA-189).** The whole
+"read raw uint16 vs `read_tile` float32" debate rested on "float32 destroys exact uint16."
+That is false: uint16 ⊂ float32 exactly (65535 < 2²⁴) and `_to_grayscale_2d` is a no-op for a
+2D plane (`individual_tiffs.py:234`). The reversal I ran (D9) reached the right place — reuse
+the reader — for a **wrong reason**. Under IMA-189 the point is simply: `reader.read()` already
+returns exact native-dtype pixels, so IMA-183 does no dtype gymnastics at all. Cleaner than
+either D9 option.
+
+**C4 — Packaging is already done by IMA-189, and there is NO tilefusion dependency.** My
+Issue 1 said "declare tilefusion in pyproject.toml." Locked IMA-189 is a standalone package
+(deps: numpy, tifffile, pandas, pyyaml; **no tilefusion**) and adds `pyproject.toml` +
+CI itself. IMA-183 adds nothing to packaging; it just imports `squidmip`. (tilefusion re-enters
+only at IMA-184 for the OME-zarr writer.)
+
+**C5 — coordinates.csv is not IMA-183's concern at all.** My Issue 5 (DRY: don't re-parse
+coordinates.csv) is satisfied for free — IMA-189 owns all parsing (from *filenames*, the
+version-robust ground truth; `fov` is the per-region enumeration index). IMA-183 touches only
+`reader.metadata` and `reader.read()`.
+
+**What survives unchanged:** the IMA-187 fold (§2), the pluggable-projector seam for IMA-188
+(§2), streaming running-max (§4), fail-loud on missing planes (§4), the no-stitching guarantee,
+and the fov-selection *semantics* (positional, §4) — these are all reader-agnostic.
+
+---
+
+## 1. Scope challenge (Step 0)
+
+IMA-183 is genuinely small: given a reader, group FOVs by well, pick the first `n_fovs`, and
+max each selected FOV's z-stack per channel. No new services, no complexity trigger. The real
+risk was never size — it was **sequencing** and **hidden coupling**, which is where the review
+spent its effort.
+
+- **What already exists:** the SquidReader (IMA-189) does all ingest — well/FOV/channel/z
+  discovery from filenames and exact per-plane reads. IMA-183 writes no parser.
+- **Minimum change:** `select_fovs` + `project_well` + a `mip` reduce callable. ~2 small modules.
+- **Not built here:** throughput (188), writer (184), CLI (186), viewer (185).
+
+## 2. Build-order fold (user-supplied state machine)
+
+IMA-183 is **slot #2** (189 → **183 (+187)** → 188 → 184 → 185 → 186 → 192). Consequences
+folded into the plan:
+
+- **Fold IMA-187 (FOV-count param).** The data model carries N FOVs/well from the start:
+  `select_fovs(...) -> dict[well, list[fov]]`, parameter `n_fovs` (default 1). v1 uses length-1
+  lists; IMA-187 multi-FOV needs no data-model change. Baking the list shape in now is the
+  1-point constraint; retrofitting after 188/184 consume a `well→single` shape is a real
+  refactor.
+- **Pluggable projector for IMA-188.** The z-reduce is a named callable `mip(stack)->2D`, not
+  `np.maximum` inlined into control flow. IMA-188 (slot #3) owns the projector *registry* (MIP
+  now, EDF later) and swaps this callable — 183 must not make that swap a rewrite. 183 ships
+  only `mip`.
+- **No writer assumed.** IMA-184 (slot #4) does not exist yet; `project_well` returns an
+  in-memory array.
+
+## 3. Review findings (7 issues, all resolved)
+
+| # | Area | Finding | Resolution |
+|---|------|---------|------------|
+| 1 | Arch | Depends on unbuilt reader + no packaging | Prereq stated. **Superseded by C4** — 189 owns packaging, no tilefusion. |
+| 2 | Arch | MIP scope seam between 183/188 | 183 = FOV-select + single-well MIP; 188 = throughput. Kept. |
+| 3 | Arch | Read path / pixel exactness | Raw uint16 read. **Reversed at D9, then mooted by C2/C3** — use `reader.read()`. |
+| 4 | Arch | "correct FOV" undefined | Positional selection. Kept; sourced from `fovs_per_region` (C1). |
+| 5 | Quality | DRY: don't re-parse coordinates.csv | Kept; **satisfied for free by C5** — 189 parses, 183 uses metadata. |
+| 6 | Quality | Missing/corrupt z-plane | Fail loud, name well/channel/z. Kept; partly enforced by reader validation. |
+| 7 | Perf | MIP memory | Streaming running-max, one plane in flight. Kept. |
+
+## 4. Corrected component design (post-C1/C2)
+
+```
+select_fovs(metadata, n_fovs=1) -> dict[well, list[fov]]
+  • group metadata.fovs_per_region by well (region)
+  • take first n_fovs FOVs positionally (sorted); default 1 → one FOV/well
+  • manual/no-region: region token is "manual" → one region, many fovs (see open Q1)
+  • n_fovs > available for a well → clear error naming the well + its count
+
+project_well(reader, well, fov, reduce=project) -> (T, C, 1, Y, X) native-dtype  # TCZYX, Z=1
+  • for each t in range(n_t), each channel c in reader.metadata.channels:
+      planes = (reader.read(well, fov, c.name, z, t) for z in reader.metadata.z_levels)
+      acc = project(planes)                    # streaming running-max over z_levels
+  • assemble → (T, C, 1, Y, X) TCZYX, Z kept size-1 (in-place reduction, not axis removal);
+    matches Squid job_processing.py Zarr order → IMA-184 writer needs no special-casing
+  • NO dtype cast (reader returns native uint8/uint16, exact)
+  • iterate metadata.z_levels (may be sparse), NOT range(n_z)
+  • missing/unreadable plane: reader.read raises located error; propagate loud
+  • single z_level → project returns that plane unchanged
+  • project is the pluggable primitive; 188 wraps + registers it
+
+project(planes_iterable) -> 2D    # pure, dtype-preserving, bounded-memory reduction
+  # running np.maximum fold; streams planes, never holds the whole z-stack.
+  # the ONLY projector 183 ships (MIP); 188 adds EDF/etc. via its registry.
+```
+
+Data flow:
+
+```
+open_reader(path) ─► SquidReader (IMA-189)
+        │ metadata.fovs_per_region, .channels, .n_z
+        ▼
+select_fovs(metadata, n_fovs=1) ─► {well: [fov, ...]}        (v1: one fov/well)
+        │
+        ▼  for each (well, fov):
+project_well(reader, well, fov, reduce=mip)
+        │  per channel: running-max over z via reader.read(well,fov,ch,z)
+        ▼
+(T, C, 1, Y, X) TCZYX native-dtype ─► [IMA-188 throughput / IMA-184 OME-zarr writer]
+```
+
+## 5. Test plan (greenfield; fixture = `~/CEPHLA/Data/sim_1536wp`)
+
+Fixture: 1536 wells, fov=0 everywhere, Nz=20, 4 channels, uint16 4168×4168 (this sim is
+unbinned uint16; real acquisitions may be binned uint8 — tests must not assume uint16, per C2).
+
+- `select_fovs`: region grouping → 1536 length-1 lists; `n_fovs=2` on a multi-FOV fixture → 2
+  FOVs/well; `n_fovs` over available → located error; manual token handling (open Q1).
+- `project_well`: running-max equals `np.max(np.stack)` reference; **dtype == input dtype**
+  (uint16 fixture → uint16; add a uint8 fixture); missing-plane → loud located error; `n_z==1`
+  → single plane; C channels distinct.
+- Integration: E2E over a well subset → one image/well (AC1); structural no-stitch test (AC3).
+
+## 6. Failure modes
+
+| Codepath | Failure | Test | Handling | Visible |
+|----------|---------|------|----------|---------|
+| read z loop | corrupt/missing plane | yes | reader raises + propagate | loud, located |
+| select_fovs | `n_fovs` > available | yes | clear error | loud |
+| manual branch | multi-position grab | yes | see open Q1 | — |
+| streaming max | dtype/shape mismatch | assert | raise | loud |
+
+No failure is silent AND untested AND unhandled → no critical gaps.
+
+## 7. Implementation tasks
+
+- [ ] **T1 (P1)** — verify `squidmip` imports (packaging from IMA-189); add nothing unless 189 didn't. [C4]
+- [ ] **T2 (P1)** — `select_fovs(metadata, n_fovs=1) -> dict[well, list[fov]]`; positional; over-count error. [Issues 4,5; D10,D11; IMA-187 fold; C1,C5]
+- [ ] **T3 (P1)** — `project_well` via `reader.read(...)`, streaming running-max, native dtype, `mip` isolated callable. [D9→C2,C3; Issue 7; IMA-188 seam]
+- [ ] **T4 (P1)** — fail-loud on missing/unreadable plane, located. [Issue 6]
+- [ ] **T5 (P2)** — structural no-stitching test. [AC3]
+- [ ] **T6 (P2)** — E2E over sim_1536wp subset. [AC1]
+
+## 8. Resolved decisions (from block-by-block feedback, 2026-07-05)
+
+- **Manual/no-region → OUT OF SCOPE.** IMA-183 is a well-plate ticket; layout comes from well
+  ID + `wellplate_format`. No special-casing; a `manual_...` region simply isn't handled here.
+- **Native dtype, never upcast.** MIP preserves uint8/uint16 as the reader returns it; fail
+  loud on anything else. So downstream (184) writes exactly what the camera produced.
+- **Projection is `project(planes_iterable) -> plane` in IMA-183** (ships MIP only). IMA-188
+  owns the pluggable projector *registry* + the parallel/streaming engine; 183 just keeps the
+  primitive pure and bounded-memory so 188 can wrap and register it.
+- **Dimensional model:** an FOV spans t, c, z. MIP reduces **z only**; t and c preserved.
+  Per-FOV output = **(T, C, 1, Y, X)** TCZYX with **Z kept size-1** (Squid Zarr order, verified
+  in `job_processing.py`) — in-place z-reduction, not axis removal.
+- **IMA-187 fold** is the orthogonal FOV-count axis: `select_fovs(metadata, n_fovs=1) ->
+  dict[well, list[fov]]`, driven off `metadata.fovs_per_region`; v1 = one FOV/well, the list
+  shape carries up-to-4 future with no data-model change.
+
+Intent asserted on the Notion "Squid MIP" page (IMA-183 section).
+
+## 9. What shipped + test results
+
+Public surface (added to `squidmip/__init__`): `select_fovs`, `project`, `project_well`.
+- `squidmip/projection.py` — the three functions + module ASCII data-flow docstring.
+- `tests/test_projection.py` — 20 unit tests (project primitive, project_well, select_fovs;
+  incl. non-contiguous-z and multi-timepoint fixtures).
+- `tests/test_integration_projection.py` — cross-slot 189+183, marked `integration`.
+
+Results: **63 unit tests pass** (clean-room `pytest -m "not integration"`). **Cross-slot
+integration green on two datasets:** the synthetic `sim_1536wp` (1536 wells, pixel-exact,
+memory-bounded) and a real Squid acquisition on disk (the `real_dataset` fixture, different
+shape/Nz).
+
+**Single metadata format (JSON removed) — cross-slot decision carried in this branch.** Every
+real acquisition we have (the real Squid dataset, sim_1536wp, current Squid) writes `acquisition.yaml`, so the legacy
+flat `acquisition parameters.json` fallback had no real input — dead code with a permanent
+two-format test burden. Removed it: `acquisition.yaml` is now the single required format
+(`_acquisition.py` raises `FileNotFoundError` if absent — no silent recompute, no None-degrade).
+This edits IMA-189's merged `_acquisition.py` + `test_acquisition.py` (a 189-contract change
+carried in the 183 branch). Consequence for downstream: **IMA-184 can assume `pixel_size_um` /
+`wellplate_format` are present** (no None-handling). IMA-183's projection reads no sidecar
+scalars, so it is unaffected either way; the contract is just simpler now.
+
+The `sim_1536wp` run also confirmed the design under stress: its recorded `Nz=3` disagreed with
+the 20 z-planes on disk; the reader overrode it (filename-derived) and `project_well` iterated
+`z_levels` correctly — the "filenames are ground truth" contract proving itself.
+
+## 10. Handoff to IMA-188 — throughput + pluggable projector
+
+Inherited state = IMA-183's `project()` primitive + `project_well()` + `select_fovs()`. IMA-188
+wraps `project()` in the parallel/streaming engine and registers it (MIP now, EDF later) via
+`project_well(..., reduce=<projector>)` — the seam is already a parameter, no 183 rewrite needed.
+
+### Cross-commit (MANDATORY before IMA-188 merges)
+
+IMA-188 **owns the 188↔183 cross commit**: an integration test, no mocks, that drives 183's
+`project()`/`project_well` through 188's parallel/streaming engine on
+`/Users/julioamaragall/CEPHLA/Data/sim_1536wp`, asserting (a) parallel output is pixel-identical
+to the single-threaded `project_well` here, and (b) per-worker memory stays bounded (streaming
+holds, ×N workers). Committed on the 188 slot, `@pytest.mark.integration`, green before merge.
+A slot isn't done until its cross commit is green (see the "Cross commit" preamble on the
+Notion "Squid MIP" page).
+
+---
+
+**Verdict:** IMA-183 CODE LOCKED — 189+183 cross-slot green on real data. Ready for block-by-block
+review → merge. The reader-facing design in §4 supersedes the tilefusion-based §3 (§0).
