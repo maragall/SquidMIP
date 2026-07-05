@@ -280,54 +280,89 @@ Reading:
   `::test_single_well_speed_baseline` and `::test_single_well_memory_footprint`; 188 imports
   `benchmark_single_well` to compare its per-worker cost apples-to-apples.
 
-## 11. Handoff to IMA-188 — throughput + pluggable projector
+## 11. IMA-188 handoff — preamble (short; prefix to the handoff)
 
-**Preamble.** You inherit a correct, memory-bounded, single-threaded per-well projector (183)
-on top of the standalone reader (189). The projection is *done and optimal per well* (§10) —
-your job is **throughput, not correctness**. Take the ~8–9 min single-thread plate down to
-~1 min by running `project_well` across wells in parallel with bounded per-worker memory, and
-make the projector **pluggable** (MIP now, EDF later) without touching 183. Read the
-"Cross commit" rule on the Notion "Squid MIP" page first — you own the 188↔183 cross commit.
+> You are the **IMA-188 slot: throughput + pluggable projector.** You inherit a correct,
+> memory-bounded, single-threaded per-well projector (IMA-183) on the standalone reader
+> (IMA-189) — the projection is *done and optimal per well* (single-thread baseline
+> **~0.35 s/well, ~8–9 min for 1536 warm**; `tests/test_performance.py`, §10). Your job is
+> **throughput, not correctness**: run `project_well` across wells in parallel with bounded
+> per-worker memory, and make the projector **pluggable** (MIP now via `project()`, EDF later)
+> through the existing `project_well(..., reduce=)` seam — no 183 rewrite. **numba won't help**
+> the memory-bandwidth-bound MIP; parallelize **across wells with a thread pool** (tifffile
+> decode + `np.maximum` both release the GIL; a process pool would pay ~139 MB result pickling
+> per well). You **own the 188↔183 cross commit** — append a `SECTION: IMA-188 ↔ IMA-183` block
+> to `tests/test_integration.py`: parallel output pixel-identical to single-thread, beats the
+> §10 baseline, per-worker memory bounded (via `benchmark_single_well`). Read the Notion
+> "Squid MIP" page (state machine + "Cross commit" rule) first.
 
-Inherited state = `project()` + `project_well(..., reduce=)` + `select_fovs()`, plus the perf
-baseline and `benchmark_single_well` helper in `tests/test_performance.py`. IMA-188 wraps
-`project()` in the parallel/streaming engine and registers it via the `reduce=` seam — already
-a parameter, no 183 rewrite needed.
+## 12. IMA-184 handoff (full — pasteable)
 
-**Parallelization note (grounded in §10 — read before choosing a design).** The MIP compute is
-`np.maximum`: already SIMD, at the memory-bandwidth roofline, and the tifffile decode that is the
-other half of the cost is C (libtiff/imagecodecs). So **numba / JIT will not speed the MIP up** —
-don't reach for it. The lever is **across-well concurrency**, not within-well JIT: `np.maximum` is
-single-threaded, so run many wells at once and each well's max lands on a different core (aggregate
-= all cores). Prefer a **thread pool** — both tifffile decode and `np.maximum` release the GIL, so
-threads give true parallelism with bounded per-worker memory and no ~139 MB result pickling (a
-process pool would pay that per well). Reserve numba for a genuinely compute-heavy projector (EDF)
-if one lands; MIP does not need it. Boring tech (a `concurrent.futures` thread pool + streaming)
-wins here.
+Assumes 188's output entry point (188 finalizes its exact public API; contract below is stable).
 
-### Cross-commit (MANDATORY before IMA-188 merges)
+```
+You are the IMA-184 slot in the SquidMIP build. SquidMIP is a high-throughput z-stack
+maximum-intensity-projection tool for Squid well-plate acquisitions, built as a review-first
+state machine — one git worktree per ticket, landed in dependency order. You are in the
+ima-184 worktree, in your own independent context.
 
-Append a `SECTION: IMA-188 ↔ IMA-183` block to `tests/test_integration.py`. No mocks, on
-`/Users/julioamaragall/CEPHLA/Data/sim_1536wp`, assert: (a) parallel plate output is
-**pixel-identical** to single-threaded `project_well`; (b) **per-worker memory bounded**
-(streaming holds ×N workers, via `benchmark_single_well`); (c) **wall-clock beats the §10
-single-thread baseline**. `@pytest.mark.integration`, green before merge.
+━━━ STEP 0 — READ THE SHARED STATE FIRST (before any code) ━━━
+1. Notion "Squid MIP" (Blogs DB, id 3942dfbf-6ae4-81cf-bc41-fed456ddd398). Read the whole
+   page: the state-machine model, the "Cross commit" rule, and the completed IMA-189 / 183 /
+   188 sections. Your section goes under a new "IMA-184" header.
+2. On main: docs/ima-189-eng-review.md, docs/ima-183-eng-review.md, docs/ima-188-eng-review.md,
+   and the squidmip/ package. `git -C <this-worktree> merge origin/main` so you have the
+   reader + projection + parallel engine.
 
-## 12. Handoff to IMA-184 — output (OME-zarr + per-well TIFF)  [drafted; 188 finalizes]
+━━━ WHAT IS ALREADY DONE (state you inherit — 189 + 183 + 188, on main) ━━━
+    from squidmip import open_reader, select_fovs, project_well   # + 188's parallel engine
+    - open_reader(path).metadata: regions, fovs_per_region, channels[{name, display_name,
+      display_color, ex}], n_z, z_levels, dz_um, pixel_size_um, wellplate_format, frame_shape,
+      dtype, n_t.  acquisition.yaml is REQUIRED (JSON removed) -> pixel_size_um and
+      wellplate_format are GUARANTEED present (no None-handling).
+    - Per (well, fov) the projection yields (T, C, 1, Y, X) native dtype in Squid's canonical
+      Zarr order (TCZYX, Z=1) -> serialize WITHOUT transposition.
+    - 188's parallel engine produces the projected plate (all wells), bounded memory.
+    Confirm 188's exact public entry point from docs/ima-188-eng-review.md — 188 finalizes it.
 
-Two slots downstream; this is the preliminary contract IMA-188 refines at its close-out.
+━━━ YOUR TASK — IMA-184: output (OME-zarr canonical + per-well TIFF) ━━━
+    - Write the projected plate as multiscale OME-zarr (canonical, navigable): axes TCZYX,
+      pixel_size_um as the physical scale, channels[].display_color as omero rendering so it
+      opens in ndviewer_light.
+    - Per-well TIFF export (Nick's ask): one <well>.tif per well for external analysis software.
+    - VENDOR the tilefusion OME-zarr writer (copy create_zarr_store / write_ome / colors.py into
+      squidmip; do NOT import tilefusion — heavy __init__. See the IMA-184 writer notes in the
+      project memory).
+    - Standalone deps only (add zarr / tensorstore etc. to pyproject as needed).
+    - Streaming / bounded memory: write each well as it is projected; never hold the whole plate.
+    - Out of scope: parallel projection (188), UI/montage (185), CLI (186).
 
-Inherited state (after 188) = the parallel engine yields, per (well, fov), a projected
-`(T, C, 1, Y, X)` native-dtype array in Squid's canonical Zarr axis order (TCZYX, Z=1) — so it
-serializes **without transposition**. 184's job: write multiscale **OME-zarr** (canonical) +
-per-well **TIFF** export, using the **vendored** tilefusion OME-zarr writer (copied in, NOT
-imported — tilefusion's heavy `__init__`; see IMA-189/184 notes). Reader metadata available and
-**guaranteed present** since JSON removal: `pixel_size_um` (µm scale for zarr axes),
-`wellplate_format` (plate layout), `channels[].display_color` (omero rendering).
+━━━ CROSS COMMIT (MANDATORY — you own 184 ↔ 188/183) ━━━
+    Append a "SECTION: IMA-184 ↔ 188/183" block to tests/test_integration.py. No mocks, on
+    /Users/julioamaragall/CEPHLA/Data/sim_1536wp: write the output, read the OME-zarr back, and
+    assert it equals the in-memory projected plate (pixel-exact, dtype, TCZYX axes); assert a
+    per-well TIFF round-trips; confirm it opens in ndviewer_light. @pytest.mark.integration,
+    green before merge. A slot isn't done until its cross commit is green.
 
-Cross commit (184 ↔ 188/183): read the written OME-zarr back and assert it equals the in-memory
-projected plate; confirm it opens in `ndviewer_light`. `@pytest.mark.integration` on `sim_1536wp`.
-Out of scope for 184: UI/montage (185), CLI (186).
+━━━ CLEAN-CODING CONVENTIONS (every slot — read as one hand) ━━━
+    - Thin public surface in squidmip/__init__; logic in private modules; ASCII data-flow
+      docstring on the main module. No cross-repo imports (vendor, don't import).
+    - Preserve native dtype; fail LOUD; no dead/unused attributes. Bounded memory; lazy.
+    - Tests: unit (mocked seam) AND the cross commit above; CI clean-room
+      `pip install .[test]` + `pytest -m "not integration"`.
+    - Encode intent a priori (design + tests before behavior); human reviews each block.
+
+━━━ HOW YOU CLOSE OUT (handoff for the next slot = IMA-185) ━━━
+    - Write docs/ima-184-eng-review.md (mirror 189/183/188).
+    - Populate an "IMA-184" section on the Notion page: what you built, the human review points
+      (in the user's voice), the output contract IMA-185 consumes, the Testing line. Add a
+      "Placeholder for IMA-185" header.
+    - After block-by-block review + test, merge --no-ff to main and push. Produce the IMA-185
+      handoff prompt (same structure).
+
+STOP after Step 0 and confirm your understanding of the inherited API + your task before
+writing code. Encode intent a priori.
+```
 
 ---
 
