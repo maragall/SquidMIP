@@ -357,6 +357,11 @@ ima-184 worktree, in your own independent context.
     - Populate an "IMA-184" section on the Notion page: what you built, the human review points
       (in the user's voice), the output contract IMA-185 consumes, the Testing line. Add a
       "Placeholder for IMA-185" header.
+    - VERIFICATION FIGURES (184 is visual — do this): render proof figures (e.g. an
+      ndviewer_light screenshot of the written plate; an OME-zarr read-back-vs-in-memory diff
+      panel). The Notion MCP CANNOT embed local PNGs, so save them to ~/Downloads and add
+      labeled "[ drag PNG here ]" placeholders in your Notion section for the human to drag in
+      (same pattern as IMA-183's verification figures).
     - After block-by-block review + test, merge --no-ff to main and push. Produce the IMA-185
       handoff prompt (same structure).
 
