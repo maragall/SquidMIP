@@ -16,6 +16,7 @@ dependencies = [
     "pandas>=2.0",
     "pyyaml>=6.0",
     "tensorstore>=0.1.45",
+    "pillow>=10.0",
 ]
 
 # No tilefusion dependency: IMA-189 ingest is self-contained (see docs/ima-189-eng-review.md).

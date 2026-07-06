@@ -34,7 +34,7 @@ import pytest
 import tensorstore as ts
 import tifffile
 
-from squidmip import open_reader, project_plate, project_well, select_fovs, write_plate
+from squidmip import build_montage, open_reader, project_plate, project_well, select_fovs, write_plate
 from squidmip._output import plate_metadata, split_well, write_from_stream
 from tests.test_performance import benchmark_single_well  # shared single-thread baseline harness
 
@@ -391,3 +391,79 @@ def test_ima184_sim1536_streamed_subset(sim_1536wp, tmp_path):
     for region, fov, img in picked:
         row, col = split_well(region)
         np.testing.assert_array_equal(_read_zarr_array(tmp_path / "plate.ome.zarr" / row / col / "0" / "0"), img)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# SECTION: IMA-185 ↔ IMA-184  —  build_montage over the OME-zarr HCS plate write_plate wrote.
+# Real seam, no mocks, on both datasets: write_plate(reader) -> build_montage(that plate) ->
+# assert the montage enumerates EVERY written well (count + ids + grid), renders real signal,
+# and carries each channel's display_color. The montage consumes only the canonical plate
+# (self-describing), so this proves the 185<-184 output contract end to end.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+import json as _json  # noqa: E402  (kept local to this section's helpers)
+
+
+def _montage_wells(sidecar_path):
+    return {w["well_id"]: w for w in _json.loads(Path(sidecar_path).read_text())["wells"]}
+
+
+# --- real Squid acquisition: full plate written, montage enumerates + renders every well ---
+@pytest.mark.integration
+def test_ima185_real_montage_enumerates_and_renders_all_wells(real_dataset, tmp_path):
+    from PIL import Image
+
+    reader = open_reader(real_dataset)
+    meta = reader.metadata
+    write_plate(reader, tmp_path, n_fovs=1, workers=4, tiff=False)
+
+    manifest = build_montage(tmp_path, cell_px=64)
+
+    # 1. every written well appears in the montage, exactly once, by id.
+    assert manifest["n_wells"] == len(meta["regions"])
+    wells = _montage_wells(manifest["sidecar"])
+    assert set(wells) == set(meta["regions"])
+
+    # 2. PNG dimensions == grid (rows x cols) * cell_px, RGB.
+    n_rows, n_cols = manifest["grid"]
+    rgb = np.asarray(Image.open(manifest["montage"]))
+    assert rgb.shape == (n_rows * 64, n_cols * 64, 3)
+
+    # 3. real data has signal -> the montage is not a black frame, and each well's own cell
+    #    carries some rendered intensity (not a silent blank).
+    assert rgb.max() > 0
+    for w in wells.values():
+        cell = rgb[w["y0"] : w["y1"], w["x0"] : w["x1"]]
+        assert cell.sum() > 0, f"well {w['well_id']} rendered fully black"
+
+    # 4. the colors a viewer sees come straight from IMA-189's resolved display_color, in order.
+    side = _json.loads(Path(manifest["sidecar"]).read_text())
+    assert [c["color"] for c in side["channels"]] == [
+        c["display_color"].lstrip("#") for c in meta["channels"]
+    ]
+
+
+# --- sim_1536wp: real project_plate -> write -> montage seam on a bounded subset ---
+@pytest.mark.integration
+@pytest.mark.filterwarnings("ignore:Recorded Nz")
+def test_ima185_sim1536_montage_real_seam_subset(sim_1536wp, tmp_path):
+    from PIL import Image
+
+    reader = open_reader(sim_1536wp)
+    picked = list(islice(project_plate(reader, n_fovs=1, workers=4), 6))  # 6 real wells, real seam
+    submeta = {
+        **reader.metadata,
+        "regions": [r for r, _, _ in picked],
+        "fovs_per_region": {r: [f] for r, f, _ in picked},
+    }
+    write_from_stream(submeta, iter(picked), tmp_path, n_fovs=1, tiff=False)
+
+    manifest = build_montage(tmp_path, cell_px=48)
+
+    # the montage enumerates exactly the written wells (ids from the real 1536wp layout).
+    assert manifest["n_wells"] == len(picked)
+    assert set(_montage_wells(manifest["sidecar"])) == {r for r, _, _ in picked}
+    n_rows, n_cols = manifest["grid"]
+    rgb = np.asarray(Image.open(manifest["montage"]))
+    assert rgb.shape == (n_rows * 48, n_cols * 48, 3)
+    assert rgb.max() > 0
