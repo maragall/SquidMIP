@@ -1,7 +1,7 @@
 # TODOS
 
-Deferred work captured during the IMA-189 plan-eng-review (2026-07-04). Each item
-records the reasoning so a future session doesn't rediscover it from zero.
+Deferred work captured during plan-eng-reviews. Each item records the reasoning
+so a future session doesn't rediscover it from zero.
 
 ## Scale-test fixture generator → IMA-188
 - **What:** A generator that fans the 48 real hongquan FOVs across a 1536-well plate via **symlinks** (Squid layout), synthesizing 20 z (cycling the real 3) × 4 channels. On-disk ≈ source (~19 GB); logical read ≈ 1536×20×4×33 MB ≈ **4 TB** (served from OS cache — proves scale/parse/decode/memory, NOT raw disk bandwidth; that needs Nick's real storage).
@@ -9,7 +9,15 @@ records the reasoning so a future session doesn't rediscover it from zero.
 - **Pros:** Proves the reader + projection hold at plate scale with bounded memory, cheaply (symlinks, not 4 TB of real bytes).
 - **Cons:** Breaks on Windows CI runners (no symlink checkout); ~120k inodes; slow to materialize.
 - **Context:** The IMA-189 `SquidReader` reads one plane per call, so a symlink fan-out exercises the exact read path at scale. Keep 189's own tests on small real-shaped fixtures.
-- **Depends on / blocked by:** IMA-189 reader (this ticket) must land first; belongs to **IMA-188**.
+- **Depends on / blocked by:** IMA-189 reader (landed); belongs to **IMA-188 (this slot)**.
+
+## Resume / checkpoint for long plate runs → fast-follow after IMA-184
+- **What:** Skip wells whose complete output already exists; clean partial output files on rerun.
+- **Why:** A full 1536wp run takes minutes-to-hours; a crash mid-run currently restarts from 0, and partial outputs can silently corrupt the plate.
+- **Pros:** Turns a full-run loss into an incremental retry; mitigates the threads segfault residual (a rerun skips finished wells).
+- **Cons:** Needs a per-well "complete output" definition + atomic write/rename or cleanup logic.
+- **Context:** IMA-188 engine uses ThreadPoolExecutor; failure policy = per-well manifest. A C-level segfault in decode can still abort the whole process. Surfaced by /plan-eng-review outside-voice #7 (2026-07-04).
+- **Depends on:** IMA-184 output layout (what a "complete well output" looks like).
 
 ## Brightfield / RGB channel ingest → future ticket
 - **What:** Support Squid brightfield channels saved as `(H,W,3)` RGB (and per-LED `_B/_G/_R`) planes, with a defined reduction-to-2D (or explicit color) policy.
