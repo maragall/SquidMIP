@@ -14,7 +14,7 @@ The public surface is intentionally tiny::
         ...                                              # (T, C, 1, Y, X) per well, bounded memory
 """
 
-from squidmip._engine import available_projectors, project_plate, register_projector
+from squidmip._engine import add_projector, available_projectors, project_plate
 from squidmip.projection import project, project_well, select_fovs
 from squidmip.reader import SquidReader, open_reader
 
@@ -25,7 +25,7 @@ __all__ = [
     "project",
     "project_well",
     "project_plate",
-    "register_projector",
+    "add_projector",
     "available_projectors",
 ]
 __version__ = "0.1.0"

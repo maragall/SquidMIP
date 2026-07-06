@@ -1,6 +1,6 @@
-"""Parallel/streaming plate engine + pluggable projector registry (IMA-188).
+"""Parallel/streaming plate engine + pluggable projector table (IMA-188).
 
-IMA-183 made per-well projection *correct and optimal* (single-thread ~0.35 s/well,
+IMA-183 made per-well projection *correct and optimal* (single-thread ~0.44 s/well,
 memory-bounded via a streaming running-max). IMA-188 makes it *fast across the whole
 plate* without changing a single pixel: run ``project_well`` across wells on a thread
 pool, stream results well-by-well so the whole plate never sits in RAM, and let the
@@ -28,13 +28,13 @@ Data flow::
         │        ▼   wait(FIRST_COMPLETED)            footprint, FLAT in plate size
         │     as each future completes:
         │        result = fut.result()  ── raises ──► propagate LOUD (fail-fast; per-well
-        │        submit one refill (keep window full)  resilience/manifest is IMA-186's job)
+        │        submit one refill (slide the window)  resilience/manifest is IMA-186's job)
         │        yield (region, fov, result)
         ▼
     Iterator[(region, fov, ndarray(T, C, 1, Y, X))]   ← the stream IMA-184 serializes
 
-The projector registry is the IMA-188 half of the pluggable-projector contract: 183 ships
-``project`` (MIP); a future EDF/EMF/mean projector registers a name here and runs through
+The projector table is the IMA-188 half of the pluggable-projector contract: 183 ships
+``project`` (MIP); a future EDF/EMF/mean projector is added by name here and runs through
 ``project_plate(..., projector="<name>")`` with **zero engine edits**.
 """
 
@@ -52,22 +52,42 @@ if TYPE_CHECKING:  # avoid import cost / cycle at runtime
     from squidmip.reader import SquidReader
 
 # A projector reduces one channel's z-planes to a single plane (the ``reduce=`` argument of
-# project_well). MIP is the only one 183 ships; the registry is the seam for the rest.
+# project_well). MIP is the only one 183 ships; the projector table is the seam for the rest.
 Projector = Callable[[Iterable[np.ndarray]], np.ndarray]
 
+# name -> z-reduction callable. Selected by name in project_plate; extended via add_projector.
 _PROJECTORS: dict[str, Projector] = {"mip": project}
 
 
-def register_projector(name: str, projector: Projector) -> None:
-    """Register a named z-reduction so it can be selected by name in :func:`project_plate`.
+def _default_workers() -> int:
+    """Thread count when the caller doesn't specify — adapt to the machine, never hardcode.
+
+    Prefers the number of CPUs actually usable by *this process* (respects CPU-affinity and
+    cgroup/container limits), then falls back across Python versions and platforms:
+      1. ``os.process_cpu_count()``      — Python 3.13+, affinity/cgroup aware
+      2. ``len(os.sched_getaffinity(0))``— Linux, the CPUs this process may run on
+      3. ``os.cpu_count()``              — total logical cores
+      4. ``1``                           — last-resort floor
+    """
+    n = os.process_cpu_count() if hasattr(os, "process_cpu_count") else None
+    if not n and hasattr(os, "sched_getaffinity"):
+        n = len(os.sched_getaffinity(0))
+    if not n:
+        n = os.cpu_count()
+    return n or 1
+
+
+def add_projector(name: str, projector: Projector) -> None:
+    """Add a named z-reduction so it can be selected by name in :func:`project_plate`.
 
     This is how a future projector (EDF/EMF/mean) plugs in **without touching the engine**:
-    register a name, then call ``project_plate(..., projector="<name>")``.
+    add a name, then call ``project_plate(..., projector="<name>")``. (Named ``add_``, not
+    ``register_``, to avoid confusion with image *registration* / alignment.)
 
     Parameters
     ----------
     name:
-        The projector's registry key (e.g. ``"mip"``, ``"mean"``). Non-empty.
+        The projector's table key (e.g. ``"mip"``, ``"mean"``). Non-empty.
     projector:
         A callable with the :func:`squidmip.project` signature — takes an iterable of
         equal-shape planes and returns one plane. It SHOULD stream (bounded memory) to keep
@@ -77,7 +97,7 @@ def register_projector(name: str, projector: Projector) -> None:
     Raises
     ------
     ValueError
-        If *name* is empty, *projector* is not callable, or *name* is already registered
+        If *name* is empty, *projector* is not callable, or *name* is already defined
         (a silent clobber of an existing projector would be a quiet correctness bug).
     """
     if not name:
@@ -86,14 +106,14 @@ def register_projector(name: str, projector: Projector) -> None:
         raise ValueError(f"projector for {name!r} is not callable: {projector!r}")
     if name in _PROJECTORS:
         raise ValueError(
-            f"projector {name!r} is already registered; pick a distinct name "
-            f"(registered: {available_projectors()})."
+            f"projector {name!r} is already defined; pick a distinct name "
+            f"(defined: {available_projectors()})."
         )
     _PROJECTORS[name] = projector
 
 
 def available_projectors() -> list[str]:
-    """Return the registered projector names, sorted (``["mip", ...]``)."""
+    """Return the available projector names, sorted (``["mip", ...]``)."""
     return sorted(_PROJECTORS)
 
 
@@ -104,7 +124,7 @@ def _resolve_projector(name: str) -> Projector:
     except KeyError:
         raise KeyError(
             f"unknown projector {name!r}; available: {available_projectors()}. "
-            "Register new modes with squidmip.register_projector(name, fn)."
+            "Add new modes with squidmip.add_projector(name, fn)."
         ) from None
 
 
@@ -132,10 +152,11 @@ def project_plate(
     n_fovs:
         FOVs per well to project (default 1). Passed to :func:`squidmip.select_fovs`.
     workers:
-        Thread-pool size. ``None`` (default) → ``os.cpu_count()``. Peak RSS scales with this,
+        Thread-pool size. ``None`` (default) → :func:`_default_workers` (CPUs usable by this
+        process — affinity/cgroup aware, not a hardcoded constant). Peak RSS scales with this,
         so pin it on many-core machines.
     projector:
-        Registered projector name (default ``"mip"``). See :func:`register_projector`.
+        A projector name from the table (default ``"mip"``). See :func:`add_projector`.
 
     Yields
     ------
@@ -148,7 +169,7 @@ def project_plate(
     ValueError
         If *workers* < 1, or (via ``select_fovs``) *n_fovs* is invalid for the plate.
     KeyError
-        If *projector* names an unregistered projector.
+        If *projector* names a projector that is not in the table.
     Exception
         Any error from a well (e.g. a corrupt/missing plane raised by ``reader.read``) is
         propagated LOUD, aborting the stream. Skip/manifest/resume resilience is IMA-186's
@@ -157,13 +178,14 @@ def project_plate(
     Notes
     -----
     Bounded window: exactly *workers* tasks are primed, then one refill is submitted for each
-    completion. At most ``workers`` results are in flight plus the one being yielded, so
-    ~139 MB per-well results cannot accumulate into an unbounded backlog if the consumer is
-    slow. This is what keeps peak RSS independent of the number of wells.
+    completion (the window slides forward one well at a time). At most ``workers`` results are
+    in flight plus the one being yielded, so ~139 MB per-well results cannot accumulate into an
+    unbounded backlog if the consumer is slow. This is what keeps peak RSS independent of the
+    number of wells.
     """
     if workers is not None and workers < 1:
         raise ValueError(f"workers must be >= 1, got {workers}")
-    n_workers = workers if workers is not None else (os.cpu_count() or 1)
+    n_workers = workers if workers is not None else _default_workers()
 
     reduce = _resolve_projector(projector)
 
@@ -196,5 +218,5 @@ def project_plate(
             for future in done:
                 region, fov = in_flight.pop(future)
                 image = future.result()  # raises here → propagate loud (fail-fast)
-                _submit_next()  # refill the window before handing the result to the consumer
+                _submit_next()  # slide the window forward before handing the result on
                 yield region, fov, image

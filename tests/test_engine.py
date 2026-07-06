@@ -1,7 +1,7 @@
-"""IMA-188 unit tests — parallel/streaming plate engine + projector registry.
+"""IMA-188 unit tests — parallel/streaming plate engine + projector table.
 
 Clean-room (no ``integration`` mark, no data on disk): the reader is a controllable in-memory
-fake so we can exercise the engine's own logic — registry, projector swap (AC4), completion
+fake so we can exercise the engine's own logic — projector table, projector swap (AC4), completion
 streaming, bounded in-flight window, fail-loud propagation, and metadata warm-up ordering —
 without the real 1536wp fixture. The real seam (189 reader → 188 engine on real pixels) is
 proven separately by the 188↔183 cross commit in ``tests/test_integration.py``.
@@ -20,10 +20,10 @@ import pytest
 
 import squidmip._engine as engine
 from squidmip import (
+    add_projector,
     available_projectors,
     project_plate,
     project_well,
-    register_projector,
 )
 
 
@@ -96,8 +96,8 @@ class FakeReader:
 
 
 @pytest.fixture(autouse=True)
-def _restore_projector_registry():
-    """Snapshot/restore the module-global registry so tests that register don't leak."""
+def _restore_projector_table():
+    """Snapshot/restore the module-global projector table so tests that add don't leak."""
     saved = dict(engine._PROJECTORS)
     try:
         yield
@@ -111,29 +111,29 @@ def _collect(reader, **kw) -> dict[tuple[str, int], np.ndarray]:
     return {(r, f): img for r, f, img in project_plate(reader, **kw)}
 
 
-# ── registry ────────────────────────────────────────────────────────────────────────────
+# ── projector table ─────────────────────────────────────────────────────────────────────
 
-def test_mip_is_registered_by_default():
+def test_mip_is_available_by_default():
     assert "mip" in available_projectors()
 
 
 def test_available_projectors_is_sorted_and_reflects_registration():
-    register_projector("zzz_custom", lambda planes: next(iter(planes)))
+    add_projector("zzz_custom", lambda planes: next(iter(planes)))
     names = available_projectors()
     assert names == sorted(names)
     assert "zzz_custom" in names
 
 
-def test_register_duplicate_name_raises():
-    with pytest.raises(ValueError, match="already registered"):
-        register_projector("mip", lambda planes: next(iter(planes)))
+def test_add_duplicate_name_raises():
+    with pytest.raises(ValueError, match="already defined"):
+        add_projector("mip", lambda planes: next(iter(planes)))
 
 
-def test_register_rejects_empty_name_and_non_callable():
+def test_add_rejects_empty_name_and_non_callable():
     with pytest.raises(ValueError, match="non-empty"):
-        register_projector("", lambda planes: next(iter(planes)))
+        add_projector("", lambda planes: next(iter(planes)))
     with pytest.raises(ValueError, match="not callable"):
-        register_projector("bad", object())  # type: ignore[arg-type]
+        add_projector("bad", object())  # type: ignore[arg-type]
 
 
 def test_project_plate_unknown_projector_raises_named():
@@ -182,7 +182,7 @@ def test_respects_n_fovs():
 def test_projector_swap_runs_through_the_same_engine():
     # A non-MIP projector (returns the FIRST z-plane) selected purely by name — the engine
     # code is untouched. Proves project_plate(..., projector=<name>) is the pluggable seam.
-    register_projector("first_z", lambda planes: next(iter(planes)))
+    add_projector("first_z", lambda planes: next(iter(planes)))
     reader = FakeReader(n_wells=3, z_levels=(0, 1, 2, 3))
     out = _collect(reader, workers=2, projector="first_z")
     for (region, fov), img in out.items():
