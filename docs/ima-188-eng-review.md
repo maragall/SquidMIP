@@ -177,6 +177,13 @@ ima-184 worktree, in your own independent context. You are slot #4 (189 → 183(
     dead attributes; bounded/streaming memory. Tests: unit (mocked seam) AND the cross commit;
     CI clean-room `pip install .[test]` + `pytest -m "not integration"`. Encode intent a-priori.
 
+━━━ HUMAN REVIEW GATE (before merge) ━━━
+    The human reviews each block. After you commit your scripts + tests, PRINT a copy-pasteable
+    nvim command opening ONLY the files you changed, as tabs, so the human cycles them with `gt`:
+        cd <this-worktree> && nvim -p <changed file> <changed file> ...
+    (relative paths; changed scripts + tests only, not the canon). STOP for feedback; apply it
+    block by block; re-run unit + integration; THEN merge.
+
 ━━━ HOW YOU CLOSE OUT (handoff for the next slot = IMA-185) ━━━
     - Write docs/ima-184-eng-review.md (mirror 189/183/188).
     - Populate an "IMA-184" section on the Notion page (Intent a-priori → the output contract 185
