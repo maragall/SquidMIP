@@ -4,14 +4,16 @@ Consumes IMA-188's ``project_plate`` stream (single-thread — the engine parall
 projection internally and hands results back one at a time, so the writer needs no locking)
 and writes each well as it arrives. Two outputs from one pass:
 
-  1. ``<out>/plate.ome.zarr``  — OME-NGFF v0.5 HCS *plate* (zarr v3):
+  1. ``<out>/plate.ome.zarr``  — OME-NGFF v0.5 HCS *plate* (zarr v3), matching Squid's canonical
+     ``control/core/zarr_writer.py`` (single resolution level, no pyramid — a per-FOV pyramid is
+     pointless for one small field; plate-view thumbnails are IMA-193's, not this writer's):
         plate.ome.zarr/                     zarr.json  = plate group (rows/columns/wells)
           {row}/                            zarr.json  = row group (bare)
-            {col}/                          zarr.json  = well group (images -> field indices)
-              {field}/                      zarr.json  = image group (multiscales + omero)
-                0/  1/  2/                  arrays: 0 = full-res (T,C,1,Y,X), 1/2 = pyramid
-     Opens in ndviewer_light (directory-walk -> array ``0`` + ``omero`` colors) AND validates
-     as a spec plate (plate/well group metadata + a >=2-level pyramid ndviewer_light ignores).
+            {col}/                          zarr.json  = well group (images -> raw fov ids)
+              {fov}/                        zarr.json  = image group (multiscales + omero)
+                0/                          array: full-res (T, C, 1, Y, X), native dtype
+     Opens in ndviewer_light (directory-walk -> array ``0`` + ``omero`` colors) AND validates as
+     a spec plate (plate/well group metadata) under an independent reader (zarr-python).
 
   2. ``<out>/tiff/{t}/{region}_{fov}_0_{channel}.tiff`` — individual per-plane TIFFs in Squid's
      filename convention, z collapsed to ``0`` (the projection), native dtype. You Yan's
@@ -25,7 +27,7 @@ Flow::
                                         completion-order arrival needs no ordering logic)
     project_plate(reader, ...) ─► (region, fov, (T,C,1,Y,X))
                                        │  per well, as it arrives:
-                                       ├─► field group: arrays 0/1/2 (pyramid) + multiscales+omero
+                                       ├─► field group: array 0 (full-res) + multiscales + omero
                                        └─► individual TIFFs (one per channel, per timepoint)
 
 Colors come from ``metadata.channels[].display_color`` (IMA-189 already resolves them, mapped
@@ -48,27 +50,39 @@ from squidmip._zarr_store import create_array, write_array, write_group
 from squidmip.projection import select_fovs
 
 _NGFF_VERSION = "0.5"
-_PYRAMID_FACTORS = (1, 2, 4)  # level 0 (full), 1 (/2), 2 (/4); clamped to array size
-_WELL_RE = re.compile(r"^([A-Za-z]+)(\d+)$")  # e.g. B2 -> ("B", "2"); AA12 -> ("AA", "12")
+_WAVELENGTH_RE = re.compile(r"(?<!\d)(\d{3,4})(?!\d)")  # a standalone 3-4 digit nm in a channel name
 
 
 # --- well id <-> row/col --------------------------------------------------------------------
 
-def split_well(region: str) -> tuple[str, str]:
-    """Split a well id into (row, col) so ``row + col == region`` round-trips.
+def parse_well_id(region: str) -> tuple[str, str]:
+    """Split a well id into (row_letters, col_digits) — vendored from Squid ``utils.parse_well_id``.
 
-    ndviewer_light rebuilds ``well_id = row_dir + col_dir`` by string concatenation, so the
-    column is NOT zero-padded (``B2`` -> ``B``/``2``, not ``B``/``02``) — padding would break
-    discovery. A region that is not ``<letters><digits>`` (e.g. a manual/no-plate acquisition)
-    is refused loud rather than written to a mislabelled directory.
+    Squid's canonical parser upper-cases then partitions alphabetic vs numeric characters
+    (``"aa3" -> ("AA", "3")``); the HCS layout is ``plate.ome.zarr/{row}/{col}/{fov}/0`` and
+    ndviewer_light rebuilds ``well_id = row_dir + col_dir`` by concatenation. So the column is
+    NOT zero-padded — ``B2 -> B/2`` (``B/02`` would still be discovered, ``"02".isdigit()`` is
+    True, but report the well as ``B02`` != the real id ``B2``, breaking well-id fidelity).
+
+    We match Squid's accepted inputs exactly (uppercase, multi-letter rows, no padding) but,
+    for a scientific tool, additionally ASSERT the canonical ``<letters><digits>`` shape and
+    fail loud: a manual/no-plate region (Squid would silently accumulate stray chars into the
+    column) must not be written to a mislabelled directory.
     """
-    m = _WELL_RE.match(region)
-    if not m:
+    s = str(region).upper()
+    letters = "".join(c for c in s if c.isalpha())
+    digits = "".join(c for c in s if not c.isalpha())
+    if not letters or not digits.isdigit() or letters + digits != s:
         raise ValueError(
-            f"region {region!r} is not a <letters><digits> well id (e.g. 'B2'); the HCS plate "
-            "layout needs a row/column split. Manual/no-plate acquisitions are out of scope."
+            f"region {region!r} is not a canonical <letters><digits> well id (e.g. 'B2', 'AA3'); "
+            "the HCS plate layout needs a row/column split. Manual/no-plate acquisitions are out "
+            "of scope (IMA-189: well-plate layout only)."
         )
-    return m.group(1), m.group(2)
+    return letters, digits
+
+
+# Back-compat alias for the earlier name used in this module's history.
+split_well = parse_well_id
 
 
 def _row_sort_key(row: str):
@@ -99,86 +113,83 @@ def plate_metadata(regions: Iterable[str], field_count: int, name: str = "plate"
     }
 
 
-def _multiscales(pixel_size_um: Optional[float], n_levels: int) -> dict:
-    """multiscales metadata: datasets named 0..n-1, y/x scale doubling per level."""
+def _multiscales(pixel_size_um: Optional[float], dz_um: Optional[float] = None) -> dict:
+    """Single-level multiscales metadata (Squid canonical: one dataset ``0``, no pyramid).
+
+    A per-FOV pyramid is pointless for one small field; plate-view thumbnails are a navigator
+    concern (IMA-193), not this writer's. Scale/axes mirror Squid's zarr_writer exactly.
+    """
     p = float(pixel_size_um) if pixel_size_um else 1.0
-    datasets = [
-        {
-            "path": str(i),
-            "coordinateTransformations": [
-                {"type": "scale", "scale": [1.0, 1.0, 1.0, p * (2 ** i), p * (2 ** i)]}
-            ],
-        }
-        for i in range(n_levels)
-    ]
+    dz = float(dz_um) if dz_um else 1.0
     return {
         "version": _NGFF_VERSION,
         "name": "0",
         "axes": [
-            {"name": "t", "type": "time"},
+            {"name": "t", "type": "time", "unit": "second"},
             {"name": "c", "type": "channel"},
-            {"name": "z", "type": "space"},
+            {"name": "z", "type": "space", "unit": "micrometer"},
             {"name": "y", "type": "space", "unit": "micrometer"},
             {"name": "x", "type": "space", "unit": "micrometer"},
         ],
-        "datasets": datasets,
+        "datasets": [
+            {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0, dz, p, p]}]}
+        ],
     }
+
+
+def _wavelength_nm(channel: dict) -> Optional[int]:
+    """Best-effort emission wavelength (nm) parsed from the channel name, else None."""
+    m = _WAVELENGTH_RE.search(channel.get("name", ""))
+    return int(m.group(1)) if m else None
 
 
 def _omero(channels: list[dict], dtype) -> dict:
-    """omero rendering metadata: per-channel label + hex color (no '#') + a full-range window."""
+    """omero rendering metadata (Squid shape): label, hex color (no '#'), window, wavelength."""
     dmax = float(np.iinfo(np.dtype(dtype)).max)
-    return {
-        "channels": [
-            {
-                "label": ch.get("display_name") or ch["name"],
-                "color": str(ch["display_color"]).lstrip("#"),
-                "active": True,
-                "window": {"min": 0.0, "max": dmax, "start": 0.0, "end": dmax},
-            }
-            for ch in channels
-        ]
-    }
-
-
-# --- pyramid ---------------------------------------------------------------------------------
-
-def _downsample(arr: np.ndarray, factor: int) -> np.ndarray:
-    """Block-mean reduce Y and X by *factor* (crop the remainder), preserving dtype."""
-    t, c, z, y, x = arr.shape
-    ny, nx = y // factor, x // factor
-    cropped = arr[..., : ny * factor, : nx * factor]
-    reduced = cropped.reshape(t, c, z, ny, factor, nx, factor).mean(axis=(4, 6))
-    return reduced.astype(arr.dtype)
-
-
-def pyramid_levels(arr: np.ndarray, factors: tuple[int, ...] = _PYRAMID_FACTORS) -> list[np.ndarray]:
-    """Full-res + downsampled levels; a level is emitted only while both Y//f and X//f >= 1."""
-    levels: list[np.ndarray] = []
-    for f in factors:
-        if arr.shape[-2] // f < 1 or arr.shape[-1] // f < 1:
-            break
-        levels.append(arr if f == 1 else _downsample(arr, f))
-    return levels
+    out = []
+    for ch in channels:
+        entry = {
+            "label": ch.get("display_name") or ch["name"],
+            "color": str(ch["display_color"]).lstrip("#"),
+            "active": True,
+            "window": {"min": 0.0, "max": dmax, "start": 0.0, "end": dmax},
+        }
+        wl = _wavelength_nm(ch)
+        if wl is not None:
+            entry["emission_wavelength"] = {"value": wl, "unit": "nanometer"}
+        out.append(entry)
+    return {"channels": out}
 
 
 # --- field + tiff writers --------------------------------------------------------------------
 
-def _write_field(field_dir: Path, image: np.ndarray, channels: list[dict], pixel_size_um) -> int:
-    """Write one field's pyramid arrays (0/1/2) + image-group metadata. Returns level count."""
-    levels = pyramid_levels(image)
-    for i, level in enumerate(levels):
-        store = create_array(field_dir / str(i), level.shape, level.dtype)
-        write_array(store, level)
+def _validate_image(image: np.ndarray, channels: list[dict]) -> None:
+    """Fail loud on anything that isn't a projected ``(T, C, 1, Y, X)`` frame for these channels."""
+    if image.ndim != 5 or image.shape[2] != 1:
+        raise ValueError(
+            f"expected a projected (T, C, 1, Y, X) array (z collapsed to 1), got shape {image.shape}. "
+            "IMA-184 writes the projection output of IMA-188; a non-5D or Z>1 array is a seam bug."
+        )
+    if image.shape[1] != len(channels):
+        raise ValueError(
+            f"image has C={image.shape[1]} channels but metadata lists {len(channels)} "
+            f"({[c['name'] for c in channels]}); channel/axis mismatch — refusing to mislabel omero."
+        )
+
+
+def _write_field(field_dir: Path, image: np.ndarray, channels: list[dict], pixel_size_um, dz_um=None) -> None:
+    """Write one field: the single full-res array ``0`` + image-group multiscales + omero."""
+    _validate_image(image, channels)
+    store = create_array(field_dir / "0", image.shape, image.dtype)
+    write_array(store, image)
     write_group(
         field_dir,
         {
             "version": _NGFF_VERSION,
-            "multiscales": [_multiscales(pixel_size_um, len(levels))],
+            "multiscales": [_multiscales(pixel_size_um, dz_um)],
             "omero": _omero(channels, image.dtype),
         },
     )
-    return len(levels)
 
 
 def _write_tiffs(tiff_root: Path, region: str, fov: int, image: np.ndarray, channel_names: list[str]) -> None:
@@ -212,30 +223,29 @@ def write_from_stream(
     tiff_root = out_dir / "tiff"
 
     wells = select_fovs(metadata, n_fovs=n_fovs)  # {region: [fov, ...]}, deterministic
-    field_index = {  # (region, fov) -> 0-based field index within the well
-        (region, fov): i for region, fovs in wells.items() for i, fov in enumerate(fovs)
-    }
 
     # Full plate/row/well group metadata written UP FRONT (layout is fully known from metadata).
     write_group(plate_dir, plate_metadata(wells.keys(), field_count=n_fovs))
     for region, fovs in wells.items():
-        row, col = split_well(region)
+        row, col = parse_well_id(region)
         write_group(plate_dir / row)  # bare row group
+        # well.images paths are the RAW fov ids (Squid uses {fov} as the field dir + image path),
+        # not a re-indexed 0-based field index — so a non-contiguous fov set stays faithful.
         write_group(
             plate_dir / row / col,
-            {"version": _NGFF_VERSION, "well": {"images": [{"path": str(i)} for i in range(len(fovs))]}},
+            {"version": _NGFF_VERSION, "well": {"images": [{"path": str(f)} for f in fovs]}},
         )
 
     channels = metadata["channels"]
     channel_names = [c["name"] for c in channels]
     pixel_size_um = metadata.get("pixel_size_um")
+    dz_um = metadata.get("dz_um")
 
     n_written = 0
-    levels_seen = 0
     for region, fov, image in stream:
-        row, col = split_well(region)
-        field = field_index[(region, fov)]
-        levels_seen = _write_field(plate_dir / row / col / str(field), image, channels, pixel_size_um)
+        row, col = parse_well_id(region)
+        # field directory is the RAW fov id (Squid convention), digit-named for ndviewer.
+        _write_field(plate_dir / row / col / str(fov), image, channels, pixel_size_um, dz_um)
         if tiff:
             _write_tiffs(tiff_root, region, fov, image, channel_names)
         n_written += 1
@@ -245,7 +255,6 @@ def write_from_stream(
         "tiff": str(tiff_root) if tiff else None,
         "n_wells": len(wells),
         "n_fields_written": n_written,
-        "pyramid_levels": levels_seen,
     }
 
 
