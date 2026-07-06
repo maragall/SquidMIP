@@ -14,7 +14,7 @@ The public surface is intentionally tiny::
         ...                                              # (T, C, 1, Y, X) per well, bounded memory
 
     write_plate(reader, "/path/out")          # canonical OME-zarr plate + individual-TIFF export
-    build_montage("/path/out")                # static whole-plate montage (thumbnail mosaic) + sidecar
+    build_montage("/path/out")                # static plate montage PNG + region-jump sidecar + hover viewer
 """
 
 from squidmip._engine import add_projector, available_projectors, project_plate

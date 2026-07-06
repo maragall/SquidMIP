@@ -176,6 +176,23 @@ def test_montage_blank_cells_are_black(tmp_path):
     assert rgb[0:4, 0:4].sum() > 0
 
 
+def test_montage_emits_self_contained_hover_viewer(tmp_path):
+    # build_montage also writes a zero-dependency HTML viewer that maps a hover to a well id
+    # from the region-jump sidecar geometry. Assert it is emitted, self-contained, and carries
+    # the well ids + the cursor-locate handler (no external fetch, so the data is inlined).
+    images = {"B2": _ramp([300, 0]), "C3": _ramp([0, 300])}
+    out = _make_plate(tmp_path, images)
+    manifest = build_montage(out, cell_px=4)
+
+    viewer = Path(manifest["viewer"])
+    assert viewer.name == "plate_montage.html" and viewer.exists()
+    html = viewer.read_text()
+    assert '<img id="montage" src="plate_montage.png"' in html  # points at the montage, same dir
+    assert "mousemove" in html and "getBoundingClientRect" in html  # hover indicator wired
+    assert '"well_id": "B2"' in html and '"well_id": "C3"' in html  # sidecar geometry inlined
+    assert "http://" not in html and "https://" not in html  # self-contained, no external deps
+
+
 def test_montage_sidecar_records_per_channel_window(tmp_path):
     images = {"B2": _image([200, 50])}
     out = _make_plate(tmp_path, images)
@@ -184,6 +201,38 @@ def test_montage_sidecar_records_per_channel_window(tmp_path):
     assert [c["color"] for c in side["channels"]] == ["FF0000", "20ADF8"]
     for c in side["channels"]:
         assert c["window"]["high"] >= c["window"]["low"]  # a real, ordered window per channel
+
+
+def test_montage_memory_is_bounded_not_whole_plate(tmp_path):
+    """build_montage reads ONE well at a time: peak ~ canvas + one well, never all N wells.
+
+    Feeds a plate of N sizable wells and checks the peak stays far below "all wells resident"
+    (N x one-well bytes). Proves the montage never accumulates the full-res plate — it holds one
+    well plus the downsampled montage canvas (which scales with montage resolution, not plate size).
+    """
+    import tracemalloc
+
+    N, F = 20, 512  # 20 wells, 512x512 frames -> "all resident" would be obvious
+    ch = [{"name": "c0", "display_name": "c0", "display_color": "#FF0000"}]
+    regions = [f"A{i + 1}" for i in range(N)]
+    meta = {"regions": regions, "fovs_per_region": {r: [0] for r in regions}, "channels": ch,
+            "pixel_size_um": 0.325}
+
+    def _img():
+        a = np.zeros((1, 1, 1, F, F), np.uint16)
+        a[0, 0, 0] = (np.arange(F * F).reshape(F, F) % 1000).astype(np.uint16)
+        return a
+
+    write_from_stream(meta, ((r, 0, _img()) for r in regions), tmp_path, n_fovs=1, tiff=False)
+    well_bytes = F * F * 2
+
+    tracemalloc.start()
+    build_montage(tmp_path, cell_px=48)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+
+    # holding all N wells would be N*well_bytes; assert peak stays well under a quarter of that.
+    assert peak < N * well_bytes * 0.25, f"montage peak {peak} not bounded (all wells = {N * well_bytes})"
 
 
 # --- fail loud ------------------------------------------------------------------------------

@@ -25,6 +25,7 @@ Flow (single streaming pass — peak memory is the montage canvas + ONE well, ne
                      (one window per channel across all wells, so wells stay comparable)
         window each channel to [0,1], composite additively via display_color ─► RGB uint8
         write plate_montage.png  +  plate_montage.json (region-jump: well id -> cell bbox)
+                                 +  plate_montage.html (zero-dep viewer: hover a cell -> well id)
 
 Why global-per-channel contrast: a montage is for comparing wells at a glance; a per-well
 window would make a dim well and a bright well look identical. Why downsample ``array 0``
@@ -153,6 +154,137 @@ def _hex_to_rgb01(hex_color: str) -> np.ndarray:
     return np.array([int(h[i : i + 2], 16) for i in (0, 2, 4)], dtype=np.float32) / 255.0
 
 
+# --- hover viewer (self-contained HTML over the montage + region-jump sidecar) ----------------
+
+# The montage sits under a top bar; row (A..) + column (1..) labels frame it; black grid lines
+# (the background color) separate the wells into tiles. Hovering a well draws a thin RED box on
+# that cell and shows the region id in LARGE text in the bar ABOVE the montage (never over the
+# wells). A cursor is mapped to a well purely from the sidecar geometry, so it needs no server.
+# Full-res-on-click (detail) remains the Plate View navigator ticket.
+_VIEWER_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>__TITLE__</title>
+<style>
+  :root{--bg:#070a0f;--border:#232b3a;--ink:#e6edf3;--muted:#8b98ad;--faint:#5b6675;--accent:#58a6ff;--hdr:46px;--colh:30px;--grid:#000}
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);overflow:hidden;
+    font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+  header{display:flex;align-items:center;gap:18px;padding:8px 18px;border-bottom:1px solid var(--border);height:58px}
+  h1{font-size:13px;font-weight:700;margin:0;color:var(--muted);letter-spacing:.02em;white-space:nowrap}
+  /* the region readout: LARGE text, in the bar ABOVE the montage (never overlaps the wells) */
+  #readout{font-size:clamp(24px,3vw,40px);font-weight:800;letter-spacing:.01em;color:var(--ink);
+    font-variant-numeric:tabular-nums;min-width:5ch}
+  #readout .empty{color:var(--faint)}
+  #readout .idle{color:var(--faint);font-size:15px;font-weight:600}
+  #readout small{font-size:.42em;font-weight:600;color:var(--faint);margin-left:10px;text-transform:uppercase;letter-spacing:.08em}
+  .right{display:flex;align-items:center;gap:20px;margin-left:auto}
+  .legend{display:flex;gap:13px;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .sw{width:10px;height:10px;border-radius:50%}
+  .zoom{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11.5px}.zoom input{width:130px}
+  #plate{position:absolute;top:57px;left:0;right:0;bottom:0;overflow:auto;background:var(--bg)}
+  #grid{display:grid;grid-template-columns:var(--hdr) max-content;grid-template-rows:var(--colh) max-content;width:max-content}
+  .corner{position:sticky;top:0;left:0;z-index:6;background:var(--bg);border-right:1px solid var(--border);border-bottom:1px solid var(--border)}
+  #colruler{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--border)}
+  #rowruler{position:sticky;left:0;z-index:5;background:var(--bg);border-right:1px solid var(--border)}
+  .lab{position:absolute;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:600;color:var(--muted);overflow:hidden}
+  .lab.on{color:var(--accent);font-weight:800}
+  #stage{position:relative;line-height:0}
+  #montage{display:block}
+  #lines{position:absolute;inset:0;pointer-events:none;z-index:1}   /* black grid lines between wells */
+  #box{position:absolute;display:none;border:2px solid #ff2d2d;pointer-events:none;z-index:3}
+</style></head>
+<body>
+<header>
+  <h1>__TITLE__</h1>
+  <div id="readout"><span class="idle">hover a well</span></div>
+  <div class="right">
+    <div class="legend" id="legend"></div>
+    <label class="zoom">Zoom <input type="range" id="zoom" min="8" max="140"/></label>
+  </div>
+</header>
+<div id="plate">
+  <div id="grid">
+    <div class="corner"></div>
+    <div id="colruler"></div>
+    <div id="rowruler"></div>
+    <div id="stage">
+      <img id="montage" src="__PNG__" alt="plate montage"/>
+      <div id="lines"></div>
+      <div id="box"></div>
+    </div>
+  </div>
+</div>
+<script>
+const D = __DATA__;
+const NR = D.grid.n_rows, NC = D.grid.n_cols, byRC = {};
+for (const w of D.wells) byRC[w.row_index + "," + w.col_index] = w;
+const stage = document.getElementById("stage"), img = document.getElementById("montage"),
+      colr = document.getElementById("colruler"), rowr = document.getElementById("rowruler"),
+      lines = document.getElementById("lines"), box = document.getElementById("box"),
+      readout = document.getElementById("readout"), zoom = document.getElementById("zoom");
+
+// compact channel legend: color dot + wavelength (parsed from the channel label when present)
+document.getElementById("legend").innerHTML = (D.channels || []).map(c => {
+  const m = (c.label || "").match(/(\\d{3,4})/); const t = m ? m[1] : (c.label || "");
+  return '<span><i class="sw" style="background:#' + c.color + '"></i>' + t + "</span>";
+}).join("");
+
+const colLabs = [], rowLabs = [];
+for (let c = 0; c < NC; c++){ const el = document.createElement("div"); el.className = "lab"; el.textContent = D.grid.columns[c];
+  colr.appendChild(el); colLabs.push(el); }
+for (let r = 0; r < NR; r++){ const el = document.createElement("div"); el.className = "lab"; el.textContent = D.grid.rows[r];
+  rowr.appendChild(el); rowLabs.push(el); }
+
+let Dc = 20;  // displayed px per well
+function layout(){
+  const W = NC*Dc, H = NR*Dc;
+  img.style.width = W+"px"; img.style.height = H+"px"; stage.style.width = W+"px"; stage.style.height = H+"px";
+  colr.style.width = W+"px"; rowr.style.height = H+"px";
+  // black grid lines every Dc px (1px lines, the background color) so each well reads as a tile
+  // 3px black gutters between wells; a well will hold a multi-FOV grid later (IMA-187)
+  lines.style.backgroundImage = "linear-gradient(to right,var(--grid) 3px,transparent 3px),linear-gradient(to bottom,var(--grid) 3px,transparent 3px)";
+  lines.style.backgroundSize = Dc+"px "+Dc+"px";
+  for (let c=0;c<NC;c++){ const e=colLabs[c]; e.style.left=(c*Dc)+"px"; e.style.top="0"; e.style.width=Dc+"px"; e.style.height="var(--colh)"; }
+  for (let r=0;r<NR;r++){ const e=rowLabs[r]; e.style.top=(r*Dc)+"px"; e.style.left="0"; e.style.height=Dc+"px"; e.style.width="var(--hdr)"; }
+}
+function fitZoom(){ const a = document.getElementById("plate").clientWidth - 44; return Math.max(8, Math.min(140, Math.floor(a/NC))); }
+
+let on = {c:-1,r:-1};
+function clearLabs(){ if(on.c>=0) colLabs[on.c].classList.remove("on"); if(on.r>=0) rowLabs[on.r].classList.remove("on"); on={c:-1,r:-1}; }
+function hide(){ box.style.display="none"; clearLabs(); readout.innerHTML = '<span class="idle">hover a well</span>'; }
+stage.addEventListener("mousemove", e => {
+  const r = stage.getBoundingClientRect();
+  const ci = Math.floor((e.clientX-r.left)/Dc), ri = Math.floor((e.clientY-r.top)/Dc);
+  if (ci<0||ri<0||ci>=NC||ri>=NR){ hide(); return; }
+  box.style.display="block"; box.style.left=(ci*Dc)+"px"; box.style.top=(ri*Dc)+"px"; box.style.width=Dc+"px"; box.style.height=Dc+"px";
+  clearLabs(); colLabs[ci].classList.add("on"); rowLabs[ri].classList.add("on"); on={c:ci,r:ri};
+  const w = byRC[ri+","+ci];  // well id already encodes row+col, so don't repeat it
+  readout.innerHTML = w ? (w.well_id)
+                        : ('<span class="empty">'+D.grid.rows[ri]+D.grid.columns[ci]+'</span><small>empty</small>');
+});
+stage.addEventListener("mouseleave", hide);
+zoom.addEventListener("input", () => { Dc = +zoom.value; layout(); hide(); });
+function init(){ Dc = fitZoom(); zoom.value = Dc; layout(); }
+if (img.complete) init(); else img.addEventListener("load", init);
+</script>
+</body></html>
+"""
+
+
+def _write_viewer_html(out_dir: Path, png_name: str, sidecar: dict, title: str) -> Path:
+    """Emit the self-contained hover viewer next to the montage PNG."""
+    html = (
+        _VIEWER_HTML.replace("__TITLE__", title)
+        .replace("__PNG__", png_name)
+        .replace("__DATA__", json.dumps(sidecar))
+    )
+    path = out_dir / "plate_montage.html"
+    path.write_text(html)
+    return path
+
+
 # --- public entry ----------------------------------------------------------------------------
 
 def build_montage(
@@ -267,9 +399,13 @@ def build_montage(
     }
     sidecar_path.write_text(json.dumps(sidecar, indent=2))
 
+    # self-contained hover-indicator viewer (uses the sidecar geometry; no server, no deps)
+    viewer_path = _write_viewer_html(out_dir, montage_path.name, sidecar, title="SquidMIP plate montage")
+
     return {
         "montage": str(montage_path),
         "sidecar": str(sidecar_path),
+        "viewer": str(viewer_path),
         "n_wells": len(layout.wells),
         "grid": (n_rows, n_cols),
         "cell_px": int(cell_px),
