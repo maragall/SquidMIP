@@ -71,9 +71,20 @@ def _validate_plane(arr, path: Path):
     return arr
 
 
-def _natural_key(s: str):
-    """Natural sort key so well IDs order as B2 < B3 < B10 (not lexicographic B10 < B2)."""
-    return [int(tok) if tok.isdigit() else tok for tok in re.split(r"(\d+)", s)]
+def _plate_key(region: str):
+    """Sort well ids in true plate ROW-MAJOR order: A,B,...,Z,AA,AB,... with the column by integer
+    (so B2 < B3 < B10, and B < AA — single-letter rows before double-letter, not lexicographic
+    where "AA" < "B"). Downstream consumers (projection engine, plate viewer) then process wells
+    top-to-bottom, left-to-right. Non-well-plate region names fall back after the plate wells.
+
+    Changed from a plain natural sort in IMA-189: the old key ordered "AA" before "B", so a 1536wp
+    plate processed row A, then the AA-AF rows, then B..Z — filling the plate view out of visual
+    order. Row-major here fixes fill/scrub order for every slot. (Owner: IMA-185; see eng review.)
+    """
+    m = re.match(r"^([A-Za-z]+)(\d+)$", region)
+    if not m:
+        return (1, len(region), region, 0)          # non-plate ids: stable, after the wells
+    return (0, len(m.group(1)), m.group(1).upper(), int(m.group(2)))
 
 
 def open_reader(path) -> "SquidReader":
@@ -156,7 +167,7 @@ class SquidReader:
             channels.add(channel)
             z_levels.add(z)
         # Deterministic, natural-sorted order (filesystem iteration order is not stable).
-        regions = sorted(fovs, key=_natural_key)
+        regions = sorted(fovs, key=_plate_key)   # true plate row-major (A,B,...,Z,AA,...)
 
         z_sorted = sorted(z_levels)
         n_z = len(z_sorted)
@@ -212,6 +223,20 @@ class SquidReader:
             raise IndexError(f"t={t} out of range (n_t={len(time_folders)}).")
         path = self._resolve_file(time_folders[t], key, index[key])
         return _validate_plane(tifffile.imread(path), path)
+
+    def plane_path(self, region, fov, channel, z, t=0) -> Path:
+        """Path to one raw plane's TIFF on disk (no decode). The HCS viewer points the embedded
+        ndviewer at these raw files directly (register_image), so the detail view is the true
+        z-stack with zero extra bytes copied — read-only, never written."""
+        index = self._build_index()
+        time_folders = self._discover_time_folders()
+        key = (str(region), int(fov), int(z), str(channel))
+        if key not in index:
+            raise KeyError(f"No such plane region={region!r} fov={fov} channel={channel!r} z={z}.")
+        t = int(t)
+        if not 0 <= t < len(time_folders):
+            raise IndexError(f"t={t} out of range (n_t={len(time_folders)}).")
+        return self._resolve_file(time_folders[t], key, index[key])
 
     # -- helpers ----------------------------------------------------------
     @staticmethod

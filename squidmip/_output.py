@@ -212,11 +212,16 @@ def write_from_stream(
     *,
     n_fovs: int = 1,
     tiff: bool = True,
+    on_well=None,
 ) -> dict:
     """Write the plate + TIFFs from a ``(region, fov, image)`` stream and *metadata*.
 
     The core of :func:`write_plate`, split out so it can be driven clean-room in tests with a
     fabricated metadata dict + a hand-built stream (no reader, no data on disk).
+
+    ``on_well(region, fov, image)`` is an optional callback invoked after each well is written
+    (field + TIFFs). It lets a live consumer (the plate viewer) render each well's tile and push
+    it into the embedded viewer as MIP completes — the canonical output is unchanged.
     """
     out_dir = Path(out_dir)
     plate_dir = out_dir / "plate.ome.zarr"
@@ -249,6 +254,8 @@ def write_from_stream(
         if tiff:
             _write_tiffs(tiff_root, region, fov, image, channel_names)
         n_written += 1
+        if on_well is not None:  # live consumer (plate viewer): render tile + push to ndviewer
+            on_well(region, fov, image)
 
     return {
         "plate": str(plate_dir),
@@ -266,6 +273,7 @@ def write_plate(
     workers: Optional[int] = None,
     projector: str = "mip",
     tiff: bool = True,
+    on_well=None,
 ) -> dict:
     """Project a plate (IMA-188) and write the canonical OME-zarr + individual TIFFs.
 
@@ -290,4 +298,4 @@ def write_plate(
     """
     metadata = reader.metadata
     stream = project_plate(reader, n_fovs=n_fovs, workers=workers, projector=projector)
-    return write_from_stream(metadata, stream, out_dir, n_fovs=n_fovs, tiff=tiff)
+    return write_from_stream(metadata, stream, out_dir, n_fovs=n_fovs, tiff=tiff, on_well=on_well)

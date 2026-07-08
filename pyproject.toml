@@ -28,6 +28,14 @@ dependencies = [
 # ome-zarr-models: official OME-NGFF v0.5 pydantic schema — validates written plate metadata
 # in tests (test-time only; the runtime writer stays lean, no extra runtime dep).
 test = ["pytest>=7.0", "ome-zarr-models>=1.7"]
+# gui: the HCS viewer (hcs-viewer). PyQt5 is OPTIONAL — the headless pipeline
+# (reader/projection/engine/output/montage) never imports it. ndviewer_light is an optional
+# runtime companion for the embedded detail view (imported lazily; the GUI degrades without it).
+gui = ["PyQt5>=5.15"]
+
+[project.scripts]
+hcs-viewer = "squidmip._viewer:main"
+squidmip-view = "squidmip._viewer:main"   # legacy alias for the same entry point
 
 [tool.hatch.build.targets.wheel]
 packages = ["squidmip"]
