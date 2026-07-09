@@ -1,86 +1,59 @@
-# Setup-Windows.ps1 - create the conda env and a Desktop shortcut for the MIP tool.
+# Setup-Windows.ps1 - set up the MIP tool on Windows with a plain Python venv (NO conda needed)
+# and put a "MIP tool" shortcut on the Desktop.
 #
 # Run once, from the repo root, in Windows PowerShell:
 #     powershell -ExecutionPolicy Bypass -File scripts\Setup-Windows.ps1
 #
-# Finds conda.exe directly (works even if 'conda' is not on PowerShell's PATH / you never ran
-# 'conda init powershell'), creates the "squidmip" env if missing, and drops a "MIP tool" Desktop
-# shortcut that launches the app with NO console window and with the env ACTIVATED (activation is
-# required on Windows or Qt fails to load).
+# Requires Python 3.10+ (from https://www.python.org/downloads/, "Add python.exe to PATH") and git.
+# A venv is self-contained, so the Desktop shortcut runs the venv's pythonw directly - no activation,
+# no environment-variable changes, nothing global touched.
 
 $ErrorActionPreference = "Stop"
-$EnvName = "squidmip"
-$Module  = "squidmip._viewer"
 $AppName = "MIP tool"
-
-# 1. Locate conda.exe. Try $CONDA_EXE, then common install dirs, then whatever is on PATH.
-$conda = $env:CONDA_EXE
-if (-not $conda -or -not (Test-Path $conda)) {
-    $cands = @(
-        (Join-Path $env:USERPROFILE "miniconda3\Scripts\conda.exe"),
-        (Join-Path $env:USERPROFILE "anaconda3\Scripts\conda.exe"),
-        (Join-Path $env:LOCALAPPDATA "miniconda3\Scripts\conda.exe"),
-        (Join-Path $env:LOCALAPPDATA "anaconda3\Scripts\conda.exe"),
-        (Join-Path $env:LOCALAPPDATA "Continuum\miniconda3\Scripts\conda.exe"),
-        (Join-Path $env:LOCALAPPDATA "Continuum\anaconda3\Scripts\conda.exe"),
-        "C:\ProgramData\miniconda3\Scripts\conda.exe",
-        "C:\ProgramData\Anaconda3\Scripts\conda.exe",
-        "C:\miniconda3\Scripts\conda.exe",
-        "C:\Anaconda3\Scripts\conda.exe"
-    )
-    $conda = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
-}
-if (-not $conda) {
-    # PATH fallback: conda may be reachable as conda.exe or as condabin\conda.bat (e.g. Anaconda Prompt).
-    $g = Get-Command conda -ErrorAction SilentlyContinue
-    if ($g) {
-        $base = Split-Path (Split-Path $g.Source)      # parent of Scripts\ or condabin\
-        $try = Join-Path $base "Scripts\conda.exe"
-        if (Test-Path $try) { $conda = $try } elseif ($g.Source -like "*.exe") { $conda = $g.Source }
-    }
-}
-if (-not $conda) {
-    Write-Error "Could not find conda. Easiest fix: open 'Anaconda PowerShell Prompt' from the Start menu and re-run this script there. (Or run:  `$env:CONDA_EXE = 'C:\path\to\Scripts\conda.exe'  then re-run.)"
-}
-$condaBase = Split-Path (Split-Path $conda)
+$Module  = "squidmip._viewer"
 $repo = Split-Path $PSScriptRoot -Parent
 
-# 2. Create the env if it is not there.
-$envDir = Join-Path $condaBase ("envs\" + $EnvName)
-if (-not (Test-Path $envDir)) {
-    Write-Host ("Creating conda env '" + $EnvName + "' (first time, may take a few minutes)...")
-    & $conda env create -f (Join-Path $repo "environment.yml")
-} else {
-    Write-Host ("conda env '" + $EnvName + "' already exists.")
+# 1. Find a Python 3.10+ (the 'py' launcher if present, else 'python' on PATH).
+$pyExe = $null; $pyArgs = @()
+if (Get-Command py -ErrorAction SilentlyContinue) {
+    $pyExe = "py"; $pyArgs = @("-3")
+} elseif (Get-Command python -ErrorAction SilentlyContinue) {
+    $pyExe = (Get-Command python).Source
+}
+if (-not $pyExe) {
+    Write-Error "No Python found. Install Python 3.11 from https://www.python.org/downloads/ (tick 'Add python.exe to PATH'), then re-run."
+}
+$ver = (& $pyExe @pyArgs -c "import sys;print('%d.%d'%sys.version_info[:2])").Trim()
+if ([version]$ver -lt [version]"3.10") {
+    Write-Error ("Found Python " + $ver + " but 3.10+ is required. Install Python 3.11 from python.org and re-run.")
+}
+Write-Host ("Using Python " + $ver)
+
+# 2. Create the venv (once).
+$venv = Join-Path $env:LOCALAPPDATA "squidmip\venv"
+$vpy  = Join-Path $venv "Scripts\python.exe"
+$vpyw = Join-Path $venv "Scripts\pythonw.exe"
+if (-not (Test-Path $vpy)) {
+    Write-Host ("Creating virtual environment at " + $venv + " ...")
+    & $pyExe @pyArgs -m venv $venv
 }
 
-# 3. Write a hidden launcher: activate the env in cmd (so Qt DLLs load), then pythonw (no console).
-$appDir = Join-Path $env:LOCALAPPDATA $EnvName
-New-Item -ItemType Directory -Force -Path $appDir | Out-Null
-$cmd = Join-Path $appDir "launch.cmd"
-$activate = Join-Path $condaBase "Scripts\activate.bat"
-$cmdLines = @(
-    "@echo off",
-    ('call "' + $activate + '" ' + $EnvName),
-    ("pythonw -m " + $Module + " %*")
-)
-Set-Content -Path $cmd -Value $cmdLines -Encoding ASCII
-$vbs = Join-Path $appDir "launch.vbs"
-$vbsLine = 'CreateObject("WScript.Shell").Run """' + $cmd + '""", 0, False'
-Set-Content -Path $vbs -Value $vbsLine -Encoding ASCII
+# 3. Install the app + GUI deps (PyQt5 + ndviewer_light). First run downloads a few packages.
+Write-Host "Installing the MIP tool and its dependencies (first time takes a few minutes) ..."
+& $vpy -m pip install --upgrade pip
+& $vpy -m pip install ($repo + "[gui]")
 
-# 4. Desktop shortcut -> wscript runs the VBS hidden (no console window at all).
+# 4. Desktop shortcut -> venv pythonw -m module (self-contained; no console, no activation).
 $desktop = [Environment]::GetFolderPath("Desktop")
 $lnk = Join-Path $desktop ($AppName + ".lnk")
 $shell = New-Object -ComObject WScript.Shell
 $sc = $shell.CreateShortcut($lnk)
-$sc.TargetPath = (Join-Path $env:SystemRoot "System32\wscript.exe")
-$sc.Arguments = '"' + $vbs + '"'
+$sc.TargetPath = $vpyw
+$sc.Arguments = "-m " + $Module
 $sc.WorkingDirectory = $env:USERPROFILE
-$sc.IconLocation = (Join-Path $envDir "python.exe") + ",0"
+$sc.IconLocation = $vpyw + ",0"
 $sc.Description = $AppName
 $sc.Save()
 
 Write-Host ""
 Write-Host ("Done. '" + $AppName + "' is on your Desktop - double-click it, then drop an acquisition folder.")
-Write-Host ("Launcher: " + $cmd)
