@@ -194,10 +194,33 @@ def test_nz_mismatch_warns(squid_dataset):
 
 
 # --- format dispatch ---------------------------------------------------------
-def test_open_reader_rejects_ome_tiff(tmp_path):
-    (tmp_path / "ome_tiff").mkdir()
+def test_open_reader_rejects_ome_tiff_with_files(tmp_path):
+    # ome_tiff/ that actually CONTAINS .ome.tiff files -> the OME-TIFF format (not yet implemented).
+    ome = tmp_path / "ome_tiff"
+    ome.mkdir()
+    (ome / "A1_0.ome.tiff").write_bytes(b"")   # presence is enough for the dispatch
     with pytest.raises(NotImplementedError, match="OME-TIFF"):
         open_reader(tmp_path)
+
+
+def test_open_reader_ignores_empty_ome_tiff_placeholder(tmp_path):
+    # Squid leaves an EMPTY ome_tiff/ beside an individual-TIFF acquisition; it must NOT block the
+    # individual-TIFF reader. With individual TIFFs present, open_reader should succeed.
+    import numpy as np
+    import tifffile
+
+    (tmp_path / "ome_tiff").mkdir()                        # empty placeholder
+    (tmp_path / "0").mkdir()
+    tifffile.imwrite(tmp_path / "0" / "A1_0_0_Fluorescence_488_nm_-_Penta.tiff",
+                     np.zeros((4, 4), np.uint16))
+    (tmp_path / "acquisition_channels.yaml").write_text(
+        "version: 1\nchannels:\n- name: Fluorescence 488 nm - Penta\n"
+        "  camera_settings:\n    '1':\n      display_color: '#00FF00'\n      exposure_time_ms: 1.0\n")
+    (tmp_path / "acquisition.yaml").write_text(
+        "sample:\n  wellplate_format: 384 well plate\nz_stack:\n  nz: 1\n  delta_z_mm: 0.0\n"
+        "time_series:\n  nt: 1\n")
+    r = open_reader(tmp_path)                              # must NOT raise
+    assert r.metadata["regions"] == ["A1"]
 
 
 def test_open_reader_rejects_non_directory(tmp_path):
