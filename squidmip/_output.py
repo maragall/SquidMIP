@@ -332,20 +332,27 @@ def write_from_stream(
     n_written = 0
     n_levels = 1
     n_writers = max(1, int(write_workers))
-    with ThreadPoolExecutor(max_workers=n_writers, thread_name_prefix="squidmip-write") as ex:
-        pending: set = set()
-        for region, fov, image in stream:
-            if stop is not None and stop():
-                break
-            pending.add(ex.submit(_write_one, region, fov, image))
-            if len(pending) >= n_writers:        # keep <= n_writers wells in flight (bounded memory)
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for f in done:
-                    n_levels = f.result()        # re-raises a writer-thread exception here
-                    n_written += 1
-        for f in pending:                         # drain the tail (and any in-flight after a stop)
-            n_levels = f.result()
-            n_written += 1
+    try:
+        with ThreadPoolExecutor(max_workers=n_writers, thread_name_prefix="squidmip-write") as ex:
+            pending: set = set()
+            for region, fov, image in stream:
+                if stop is not None and stop():
+                    break
+                pending.add(ex.submit(_write_one, region, fov, image))
+                if len(pending) >= n_writers:    # keep <= n_writers wells in flight (bounded memory)
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for f in done:
+                        n_levels = f.result()    # re-raises a writer-thread exception here
+                        n_written += 1
+            for f in pending:                     # drain the tail (and any in-flight after a stop)
+                n_levels = f.result()
+                n_written += 1
+    finally:
+        # Close the producer promptly on a stop/exception (don't wait for GC) so project_plate's
+        # own thread pool shuts down now. Guarded: a plain iterator (used in tests) has no close().
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
 
     return {
         "plate": str(plate_dir),

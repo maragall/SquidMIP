@@ -353,10 +353,11 @@ def build_montage(
             )
         y0, x0 = r_i * cell_px, c_i * cell_px
         for ch in range(n_ch):
-            canvas[ch, y0 : y0 + cell_px, x0 : x0 + cell_px] = _area_downsample(
-                well[ch], cell_px, cell_px
-            )
-        filled[y0 : y0 + cell_px, x0 : x0 + cell_px] = True
+            tile = _area_downsample(well[ch], cell_px, cell_px)   # never upsamples: a field smaller
+            th, tw = tile.shape                                   # than cell_px stays its own size
+            canvas[ch, y0 : y0 + th, x0 : x0 + tw] = tile         # corner-place by ACTUAL shape (no
+            #                                    broadcast crash / no divide-by-zero on small fields)
+        filled[y0 : y0 + th, x0 : x0 + tw] = True
         placements.append(
             {
                 "well_id": well_id, "row": row_name, "col": col_name,

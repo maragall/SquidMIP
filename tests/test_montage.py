@@ -248,3 +248,13 @@ def test_build_montage_rejects_bad_cell_px(tmp_path):
     out = _make_plate(tmp_path, images)
     with pytest.raises(ValueError, match="cell_px"):
         build_montage(out, cell_px=0)
+
+
+def test_montage_small_field_no_crash_no_nan(tmp_path):
+    # Audit MED: a field SMALLER than cell_px (128) must corner-place, not broadcast-crash or
+    # divide-by-zero into NaN (which would blacken a whole channel). Square-small + non-square.
+    from PIL import Image
+    imgs = {"B2": _ramp([1, 2], y=40, x=40), "B3": _ramp([1, 2], y=100, x=60)}
+    manifest = build_montage(_make_plate(tmp_path, imgs))   # default cell_px=128 > field -> corner-place
+    arr = np.asarray(Image.open(manifest["montage"]))
+    assert arr.ndim == 3 and int(arr.max()) > 0             # rendered, not crashed / all-black NaN
