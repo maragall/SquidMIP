@@ -99,7 +99,8 @@ def run(params: ProcessParameters) -> dict:
         logger.warning("%d well(s) have >1 FOV — sampling one FOV per well (high-throughput "
                        "stitching not yet implemented).", multi)
     name = Path(params.input_folder).name
-    out_parent = Path(params.output_folder) if params.output_folder else Path(params.input_folder).parent
+    out_parent = (Path(params.output_folder).expanduser() if params.output_folder
+                  else Path(params.input_folder).parent)
     out_dir = out_parent / f"{name}.hcs"
     # Optional plate slice: process only the first N wells (a subset preview that won't cost the
     # whole plate). Order = the reader's region order (deterministic).

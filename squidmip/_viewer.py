@@ -55,7 +55,7 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPalette, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QMainWindow, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
-    QTabBar, QTabWidget, QVBoxLayout, QWidget,
+    QStyleFactory, QTabBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from squidmip._engine import _default_workers
@@ -113,6 +113,11 @@ _BTN_QSS = (
     "QPushButton:disabled{color:#57606a;}"
 )
 _COMBO_QSS = "QComboBox{background:#0d1420;color:#e6edf3;border:1px solid #232b3a;border-radius:6px;padding:5px 8px;}"
+_CHECK_QSS = (   # checkbox with a visible white outline on the box
+    "QCheckBox{color:#e6edf3;spacing:7px;}"
+    "QCheckBox::indicator{width:14px;height:14px;border:1px solid #c9d1d9;border-radius:3px;background:#0d1420;}"
+    "QCheckBox::indicator:checked{background:#58a6ff;border:1px solid #c9d1d9;}"
+)
 _TERM_QSS = ("QPlainTextEdit{background:#05070b;color:#8bffd0;border:none;"
              "font-family:'SF Mono','Menlo',monospace;font-size:12px;padding:10px;}")
 
@@ -160,7 +165,7 @@ class _Terminal(QWidget):
     PTY-backed, so it needs a Unix-y OS; ``build`` falls back to a static command preview elsewhere.
     """
 
-    def __init__(self, cwd: Optional[str], banner: list, parent=None):
+    def __init__(self, cwd: Optional[str], banner: list, setup_cmds: Optional[list] = None, parent=None):
         super().__init__(parent)
         self._pid = None
         self._fd = None
@@ -190,9 +195,9 @@ class _Terminal(QWidget):
         rl.addWidget(tag)
         rl.addWidget(self._in, 1)
         v.addWidget(row)
-        self._start(cwd, banner)
+        self._start(cwd, banner, setup_cmds or [])
 
-    def _start(self, cwd, banner):
+    def _start(self, cwd, banner, setup_cmds):
         import pty
         shell = os.environ.get("SHELL", "/bin/zsh")
         env = dict(os.environ)
@@ -212,12 +217,21 @@ class _Terminal(QWidget):
             except Exception:
                 os._exit(127)
         import fcntl                # PARENT: read the master fd non-blocking, driven by Qt's event loop
+        import struct
+        import termios
+        try:                        # a wide PTY so long commands don't wrap into garbled cursor escapes
+            fcntl.ioctl(self._fd, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 400, 0, 0))
+        except Exception:
+            pass
         fl = fcntl.fcntl(self._fd, fcntl.F_GETFL)
         fcntl.fcntl(self._fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
         self._notifier = QSocketNotifier(self._fd, QSocketNotifier.Read, self)
         self._notifier.activated.connect(self._read)
-        for line in banner:         # seed the how-to as real shell output (echo lines run in the shell)
-            self._write(line + "\n")
+        # Banner is DISPLAY text — print it straight into the pane (NOT echo'd through the shell, which
+        # duplicates + line-wraps it). setup_cmds (e.g. the squidmip alias) run silently in the shell.
+        self._append("\n".join(banner) + "\n")
+        for cmd in setup_cmds:
+            self._write(cmd + "\n")
 
     def _read(self):
         try:
@@ -230,7 +244,11 @@ class _Terminal(QWidget):
             if self._notifier is not None:
                 self._notifier.setEnabled(False)
             return
-        text = _ANSI_RE.sub("", data.decode(errors="replace")).replace("\r", "")
+        self._append(data.decode(errors="replace"))
+
+    def _append(self, text: str):
+        """Append text to the output pane (ANSI escapes + carriage returns stripped), scrolled to end."""
+        text = _ANSI_RE.sub("", text).replace("\r", "")
         cur = self._out.textCursor()
         cur.movePosition(cur.End)
         cur.insertText(text)
@@ -424,7 +442,8 @@ class PlateOverview(QWidget):
         self._nr, self._nc = len(self._rows), len(self._cols)
         self._by_rc: dict[tuple, str] = dict(wells)            # every acquired well (for status + hit-test)
         self._status: dict[tuple, str] = {rc: "empty" for rc in wells}
-        self._tiles: set[tuple] = set()                        # cells that have a MIP tile painted
+        self._tiles: set[tuple] = set()                        # cells that have a tile painted (any layer)
+        self._tiles_by_layer: dict[str, set] = {}              # layer -> cells with an image there
         self._canvas = QImage(self._nc * _CELL, self._nr * _CELL, QImage.Format_RGB888)
         self._canvas.fill(QColor(_BG))
         self._final = None            # crisp global-contrast montage of the ACTIVE layer (or None)
@@ -483,6 +502,7 @@ class PlateOverview(QWidget):
         p.drawImage(ci * _CELL, ri * _CELL, img)
         p.end()
         self._tiles.add((ri, ci))
+        self._tiles_by_layer.setdefault(layer, set()).add((ri, ci))   # per-layer: drives the grey dots
         if layer == self._active:         # only the shown layer needs a repaint / cache rebuild
             self._scaled = None
             self.update()
@@ -594,24 +614,29 @@ class PlateOverview(QWidget):
             self._scaled_cd = cd
         p.drawPixmap(int(ax), int(ay), self._scaled)
 
-        # per-well PROCESSING status = one hue-coded DOT, shown ONLY while an operator is running:
-        # amber = processing, red x = failed. NOTHING for not-processed (raw) or done — a clean plate
-        # shows no dots, and a finished well is just its MIP image. The dot is a readable ABSOLUTE size
-        # — capped so it doesn't balloon on a small plate's big cells. Hover dot below shares this size.
+        # per-well DOT: amber = processing, red x = failed, GREY = no image on the active layer yet
+        # (nothing downsampled to show there). A well that HAS an image on the active layer draws no dot
+        # (the image speaks for itself). So a fully-previewed/processed plate shows no dots; a plate
+        # mid-preview shows grey where the operator has not reached. Dot size is a capped absolute size.
         d = min(max(3.0, cd * 0.36), 15.0)
+        active_tiles = self._tiles_by_layer.get(self._active, set())
         for (ri, ci), state in self._status.items():
-            if state not in ("processing", "failed"):
-                continue                                # not-processed + done draw NO dot
+            has_img = (ri, ci) in active_tiles
             x0, y0 = ax + ci * cd, ay + ri * cd
             ex, ey = int(x0 + (cd - d) / 2), int(y0 + (cd - d) / 2)
-            if state == "failed":                       # red x within the dot box
-                p.setPen(QPen(_STATUS["failed"], max(1.5, min(cd * 0.09, 3.0))))
-                p.drawLine(ex, ey, ex + int(d), ey + int(d))
-                p.drawLine(ex + int(d), ey, ex, ey + int(d))
-            else:                                       # processing = amber dot
+            if state == "processing":                   # amber dot
                 p.setPen(Qt.NoPen)
                 p.setBrush(_STATUS["processing"])
                 p.drawEllipse(ex, ey, int(d), int(d))
+            elif state == "failed":                     # red x within the dot box
+                p.setPen(QPen(_STATUS["failed"], max(1.5, min(cd * 0.09, 3.0))))
+                p.drawLine(ex, ey, ex + int(d), ey + int(d))
+                p.drawLine(ex + int(d), ey, ex, ey + int(d))
+            elif not has_img:                           # grey dot ONLY where no downsampled image
+                p.setPen(Qt.NoPen)
+                p.setBrush(_STATUS["empty"])
+                p.drawEllipse(ex, ey, int(d), int(d))
+            # else: has an image on the active layer -> no dot
         p.setBrush(Qt.NoBrush)
 
         p.setPen(QPen(_GRID, 3))       # black grid lines between wells (room for multi-FOV, IMA-187)
@@ -920,6 +945,14 @@ class PlateWindow(QMainWindow):
         # top-left: the process console (build the home tab first — it owns self._readout, which
         # _make_detail_viewer writes to if ndviewer is unavailable).
         self._left_tabs = QTabWidget()
+        # Dark the tab widget's own canvas (the strip behind/beside the tabs rendered white in macOS
+        # light mode). Scope a Fusion style + dark palette to THIS widget subtree only — NOT the app,
+        # which would bleed into the embedded ndviewer and hide its per-channel colour swatches.
+        self._fusion_style = QStyleFactory.create("Fusion")   # keep a ref: setStyle doesn't own it
+        if self._fusion_style is not None:
+            self._left_tabs.setStyle(self._fusion_style)
+        self._left_tabs.setPalette(_dark_palette())
+        self._left_tabs.setAutoFillBackground(True)
         self._left_tabs.setStyleSheet(_TABS_DARK)
         self._left_tabs.setTabsClosable(True)
         self._left_tabs.tabCloseRequested.connect(self._close_op_tab)
@@ -1042,6 +1075,10 @@ class PlateWindow(QMainWindow):
         scroll.setWidget(stack)
         v.addWidget(scroll, 1)
 
+        raw_btn = QPushButton("⟲  Return to raw view")     # stop previewing -> restore raw downsampled plate
+        raw_btn.setStyleSheet(_BTN_QSS)
+        raw_btn.clicked.connect(self._return_to_raw)
+        v.addWidget(raw_btn)
         layers_btn = QPushButton("▤  Layers")              # toggle/reorder applied operation layers
         layers_btn.setStyleSheet(_BTN_QSS)
         layers_btn.clicked.connect(lambda: self._open_op_tab("layers", "Layers", self._build_layers_tab))
@@ -1143,7 +1180,7 @@ class PlateWindow(QMainWindow):
         spin.setStyleSheet(_COMBO_QSS)
         row.addWidget(spin); row.addWidget(QLabel("wells")); row.addStretch(1)
         v.addLayout(row)
-        save_cb = QCheckBox("Save previews to disk"); save_cb.setStyleSheet("color:#e6edf3;")
+        save_cb = QCheckBox("Save previews to disk"); save_cb.setStyleSheet(_CHECK_QSS)
         v.addWidget(save_cb)
         prev = QPushButton("▷  Preview"); prev.setStyleSheet(_BTN_QSS); prev.setEnabled(False)
 
@@ -1178,7 +1215,7 @@ class PlateWindow(QMainWindow):
         self._rec_fps.addItems(["2", "5", "10", "15"]); self._rec_fps.setCurrentText("5")
         v.addWidget(self._rec_fps)
         self._rec_z = QCheckBox("Record Z focus sweep (instead of time)")  # opt-in; default T
-        self._rec_z.setStyleSheet("color:#e6edf3;")
+        self._rec_z.setStyleSheet(_CHECK_QSS)
         v.addWidget(self._rec_z)
         self._rec_dir = None
         pick = QPushButton("Choose output folder…"); pick.setStyleSheet(_BTN_QSS)
@@ -1308,23 +1345,25 @@ class PlateWindow(QMainWindow):
         aliased to this app's interpreter so it runs regardless of PATH/conda. Falls back to a static
         command preview where a PTY isn't available (e.g. Windows)."""
         acq = str(self._acq_path) if self._acq_path else "<acquisition>"
-        cmds = (
-            "echo '──────────────────────────────────────────────────────────'",
-            "echo ' HCS viewer · batch CLI (IMA-186) — MIP every well, headless'",
-            "echo '──────────────────────────────────────────────────────────'",
-            "echo '# MIP every well -> navigable OME-Zarr + FIJI-openable TIFFs:'",
-            f"echo '#   squidmip \"{acq}\" --tiff'",
-            "echo '# sharpest reference plane per well:'",
-            f"echo '#   squidmip \"{acq}\" --projector reference --tiff'",
-            "echo '# tune throughput (more workers):'",
-            f"echo '#   squidmip \"{acq}\" --workers 8 --tiff'",
-            "echo '# --tiff writes the projected planes as TIFFs so FIJI/ImageJ can open them.'",
-            "echo ''",
-        )
-        banner = [f"alias squidmip='{sys.executable} -m squidmip'", *cmds]
+        banner = [
+            "──────────────────────────────────────────────────────────",
+            " HCS viewer · batch CLI (IMA-186) — MIP every well, headless",
+            "──────────────────────────────────────────────────────────",
+            "# MIP every well -> navigable OME-Zarr + FIJI-openable TIFFs:",
+            f'#   squidmip "{acq}" --tiff',
+            "# sharpest reference plane per well:",
+            f'#   squidmip "{acq}" --projector reference --tiff',
+            "# preview a slice (first N wells) so a test costs neither the whole plate nor the disk:",
+            f'#   squidmip "{acq}" --limit 8 --tiff',
+            "# --tiff writes the projected planes as TIFFs so FIJI/ImageJ can open them.",
+            "",
+        ]
+        # `squidmip` is aliased to this app's interpreter so it runs regardless of PATH/conda. The
+        # banner is DISPLAY text (printed straight to the pane); only the alias runs in the shell.
+        setup = [f"alias squidmip='{sys.executable} -m squidmip'"]
         cwd = str(self._acq_path.parent) if self._acq_path else str(Path.home())
         try:
-            t = _Terminal(cwd, banner)
+            t = _Terminal(cwd, banner, setup_cmds=setup)
             if t._fd is not None:                # PTY came up — use the live terminal
                 return t
         except Exception:
@@ -1457,29 +1496,7 @@ class PlateWindow(QMainWindow):
         self._drop.hide()
         self._left_l.addWidget(self._overview, 1)   # fills the pane and self-fits — no scrollbars
 
-        if self._detail is not None:
-            # push mode over the RAW acquisition: full z (real z-stack) and full frame; the detail
-            # reads the acquisition's own TIFFs (register_image) — nothing copied.
-            h, w = meta["frame_shape"]
-            channels = [c["name"] for c in meta["channels"]]
-            self._detail.start_acquisition(channels, meta["n_z"], h, w, [f"{r}:0" for r in order])
-            # Register EVERY well's raw plane PATHS up front (cheap — paths only, no image I/O) so the
-            # ndviewer FOV slider spans the whole plate and each well shows a real (lazily read + cached)
-            # image the moment it's scrubbed to. Without this, scrubbing to a not-yet-opened well showed
-            # BLACK. One bulk call = one slider update, not tens of thousands of per-plane signals.
-            if hasattr(self._detail, "register_images_bulk"):
-                entries = []
-                for well in order:
-                    w_idx = self._fov_index[well]["idx"]
-                    fov = meta["fovs_per_region"][well][0]
-                    for z_i, z in enumerate(meta["z_levels"]):
-                        for ch in channels:
-                            try:
-                                entries.append((0, w_idx, z_i, ch, str(reader.plane_path(well, fov, ch, z))))
-                            except (KeyError, IndexError, OSError):
-                                continue
-                self._detail.register_images_bulk(entries)
-                self._pushed.update(order)   # every well is registered; double-click just navigates
+        self._setup_raw_detail()
 
         self._enable_operators(True)
 
@@ -1487,9 +1504,7 @@ class PlateWindow(QMainWindow):
         # in the SAME row-major order the operator will later process them in.
         self._preview = _PreviewWorker(reader, meta, self._fov_index, order)
         self._preview.tileReady.connect(self._on_preview_tile)
-        self._preview.start()
-        if order:                     # populate the detail pane right away so ndviewer isn't blank
-            self.activate_well(order[0], 0)
+        self._preview.start()   # (the detail already landed on order[0] via _setup_raw_detail)
         # top-left = LIVE STATUS (what's happening / what's shown); the plate name is the pane title
         # Multi-FOV policy (IMA-191): current scope is one FOV per well (a well = a condition, exactly
         # Nick's "n=1 per condition"). When wells hold >1 FOV we SAMPLE the first and say so — honest
@@ -1497,6 +1512,49 @@ class PlateWindow(QMainWindow):
         multi = sum(1 for r in order if len(meta["fovs_per_region"][r]) > 1)
         note = (f" · {multi} multi-FOV well(s): sampling 1 FOV/well (stitching TBD)" if multi else "")
         self._readout.setText(f"live · {len(self._fov_index)} wells · double-click to open{note}")
+
+    def _setup_raw_detail(self):
+        """Point the detail viewer at the RAW acquisition: full z-stack, full frame, whole-plate FOV
+        slider. Registers every well's raw plane PATHS up front (cheap — paths only, no image I/O) so
+        scrubbing shows a real (lazily read + cached) image per well instead of black. Shared by open
+        (ingest) and 'Return to raw view'."""
+        if self._detail is None or self._reader is None:
+            return
+        meta, reader, order = self._meta, self._reader, self._order
+        h, w = meta["frame_shape"]
+        channels = [c["name"] for c in meta["channels"]]
+        self._detail.start_acquisition(channels, meta["n_z"], h, w, [f"{r}:0" for r in order])
+        self._pushed = set()
+        if hasattr(self._detail, "register_images_bulk"):
+            entries = []
+            for well in order:
+                w_idx = self._fov_index[well]["idx"]
+                fov = meta["fovs_per_region"][well][0]
+                for z_i, z in enumerate(meta["z_levels"]):
+                    for ch in channels:
+                        try:
+                            entries.append((0, w_idx, z_i, ch, str(reader.plane_path(well, fov, ch, z))))
+                        except (KeyError, IndexError, OSError):
+                            continue
+            self._detail.register_images_bulk(entries)
+            self._pushed.update(order)   # every well is registered; double-click just navigates
+        if order:                        # land on the first well so the viewer isn't blank
+            self.activate_well(order[0], 0)
+
+    def _return_to_raw(self):
+        """Stop previewing/processing and restore the raw downsampled view across the whole plate."""
+        if self._reader is None or self._overview is None:
+            return
+        self._stop_worker()
+        self._active_op_key = None
+        self._plate_mode = "raw"
+        self._plate_title.setText(f"{self._acq_name}   ·   raw")
+        self._overview.set_active_layer("raw")
+        for rc in list(self._overview._status):
+            self._overview.set_status(*rc, "empty")
+        self._refresh_layers_tab()
+        self._setup_raw_detail()
+        self._readout.setText("raw view")
 
     # -- run a post-processing operator over the whole plate (persists a navigable OME-Zarr plate) --
     def run_operator(self, key: str, out_parent: Optional[str] = None,
@@ -1719,14 +1777,14 @@ class PlateWindow(QMainWindow):
         super().closeEvent(e)
 
 
-def _apply_dark_palette(app):
-    """Force a dark Fusion palette so no native surface shows through white in macOS LIGHT mode.
+def _dark_palette() -> QPalette:
+    """A dark palette for the Process pane's tab widget ONLY (see PlateWindow.__init__).
 
-    The tab strip's empty area (behind/beside the tabs) is painted by the STYLE using the palette, not
-    by our per-widget stylesheets — so in light mode it rendered white. Fusion + a dark palette fixes
-    that (and every other unstyled surface: combo popups, scrollbars) in one place; it matched already
-    when the OS was in dark mode, which confirmed the palette was the cause."""
-    app.setStyle("Fusion")
+    The tab strip's empty area (behind/beside the tabs) is painted by the STYLE from the palette, not
+    by our stylesheets, so in macOS LIGHT mode it rendered white. We fix it by giving the TAB WIDGET a
+    Fusion style + this dark palette — scoped to that widget subtree, NOT the whole app. Applying it
+    app-wide bled into the embedded ndviewer and hid its per-channel colour swatches (the cmap combo
+    indicators), which is why this is deliberately not global."""
     dark, base, text, mut = QColor(7, 10, 20), QColor(11, 14, 20), QColor(230, 237, 243), QColor(87, 96, 109)
     pal = QPalette()
     pal.setColor(QPalette.Window, dark)
@@ -1744,7 +1802,7 @@ def _apply_dark_palette(app):
         pal.setColor(grp, QPalette.Text, mut)
         pal.setColor(grp, QPalette.ButtonText, mut)
         pal.setColor(grp, QPalette.WindowText, mut)
-    app.setPalette(pal)
+    return pal
 
 
 def _rss_mb() -> tuple:
@@ -1811,7 +1869,6 @@ def _install_footprint_monitor(app, win):
 def main(dataset_path: str = None):
     path = dataset_path or (sys.argv[1] if len(sys.argv) > 1 else None)
     app = QApplication.instance() or QApplication(sys.argv)
-    _apply_dark_palette(app)
     win = PlateWindow(path)
     _install_footprint_monitor(app, win)
     win.show()
