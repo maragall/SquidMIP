@@ -10,6 +10,7 @@ dependencies:
   - python=3.11
   - numpy
   - tifffile
+  - imagecodecs        # tifffile needs this to decode LZW/compressed Squid TIFFs
   - pandas
   - pyyaml
   - pillow
