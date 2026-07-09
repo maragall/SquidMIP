@@ -1,75 +1,70 @@
 # HCS viewer — quick start
 
-A desktop app for browsing a finished Squid well‑plate acquisition and computing a Maximum
-Intensity Projection (MIP) per well — without hand‑tracking which files came from which well or
-round‑tripping through FIJI. Drop an acquisition, click a well to see its z‑stack, and hit
-**Process well‑plates → Maximum Intensity Projection** to MIP the whole plate.
+A desktop app for reviewing a **finished** Squid well-plate acquisition and processing it — MIP,
+best-focus reference plane, or an .mp4 movie — **without** hand-tracking which files came from which
+well or round-tripping through FIJI. It reads your data **read-only** and writes results to a folder
+*you* choose.
 
-> Runs on acquisitions that are already saved to disk (post‑acquisition). It reads your data
-> read‑only and never writes into your acquisition folder.
+> Post-acquisition only: it opens data already saved to disk. It never controls the microscope.
 
 ---
 
 ## 1. Install (one time)
 
-You need Python 3.10+ . In a terminal:
+Python 3.10+. In a terminal:
 
 ```bash
-# 1. get the two packages
-pip install "git+https://github.com/maragall/ndviewer_light"     # the per‑FOV z‑stack viewer
-pip install "squidmip[gui]"                                       # the HCS viewer (this tool)
+pip install "git+https://github.com/maragall/ndviewer_light"   # the embedded z-stack/array viewer
+pip install "squidmip[gui]"                                    # the HCS viewer (this tool)
 ```
 
-That's it — `squidmip[gui]` pulls in the plate viewer and PyQt; `ndviewer_light` is the embedded
-z‑stack detail view.
-
-*(If you were given a folder instead of a package: `cd` into it and run
-`pip install ".[gui]"`.)*
+*(Given a folder instead of a package: `cd` into it and `pip install ".[gui]"`.)*
+A frozen desktop build (Linux AppImage / Windows / macOS) is produced by CI — no Python needed then.
 
 ## 2. Launch
 
 ```bash
-hcs-viewer
+hcs-viewer                     # then drag an acquisition onto the window
+hcs-viewer /path/to/acquisition
 ```
-
-A dark window opens with a drop zone on the left.
 
 ## 3. Use it — step by step
 
-1. **Drop your acquisition folder** onto the left panel (the folder that contains the numbered
-   timepoint folder `0/` and `acquisition parameters.json`). The plate map draws immediately, one
-   circle per acquired well, laid out A, B, C… down and 1, 2, 3… across. Grey = not processed yet.
-2. **Double‑click any well** → its **raw z‑stack** opens in the right panel. Use the **Z** and
-   **channel** sliders to scrub through focus and channels. This is the fast way to check "what did
-   well B7 actually look like?" — the plate map tells you exactly which well you're viewing (red box).
-3. **Compute MIPs** → menu bar **Process well‑plates → Maximum Intensity Projection**. Every well
-   turns **amber** (working), then **blue** as its MIP finishes and a thumbnail appears in the cell.
-   A well that fails is marked with a red ✕. The whole plate fills in as it goes — you don't wait
-   for the end.
-4. **Read the plate at a glance.** Colours are colour‑blind‑safe: grey → amber → blue = not‑started
-   → processing → done. Hover a well to see its ID in the header.
+1. **Drop your acquisition folder** (the one with the numbered timepoint folder `0/` inside). The
+   plate map draws immediately — one dot per acquired well, laid out A,B,C… down and 1,2,3… across.
+   Grey = not processed. Hover shows the well; **double-click** a well to open its raw z-stack on the
+   right.
+2. **Process wells** (top-left console):
+   - **Maximum Intensity Projection** — collapse each well's z-stack to one max image.
+   - **Reference plane** — pick each well's sharpest z (Tenengrad autofocus).
+   - **Record video (.mp4)** — one movie per well (time-lapse if there's a time series, else a focus
+     sweep), at a playback fps you choose.
+   Pick an operator, choose an output folder, run. Wells turn **amber** (working) → **blue** (done),
+   filling in as they go. A well that can't be read is marked red-✕ and **skipped** — one bad file
+   never aborts the run.
+3. **Output.** MIP / Reference write a **navigable multiscale `plate.ome.zarr`** you can re-open here
+   or in any OME-Zarr tool. Record writes `<well>.mp4`.
 
-## 4. What the colours mean
+## 4. Same thing headless (CLI)
 
-| Colour | Meaning |
-|---|---|
-| Grey dot | Well acquired, not yet processed |
-| Amber dot | MIP is computing now |
-| Blue ring + thumbnail | MIP done |
-| Red ✕ | MIP failed for that well |
+```bash
+squidmip /path/to/acquisition                        # MIP every well -> <acq>.hcs/plate.ome.zarr
+squidmip /path/to/acquisition --projector reference  # sharpest-plane per well
+squidmip /path/to/acquisition --workers 8 --tiff     # tune threads + also export per-plane TIFFs
+```
 
 ## 5. Notes
 
-- **Nothing is copied or written into your data folder.** The z‑stack view reads your original
-  TIFFs in place; the plate thumbnails live only in memory while the app is open.
-- Large plates (384/1536) are fully supported — the plate view always fits the window; it is a
-  navigation map, not a full‑resolution image.
-- More operations beyond MIP (e.g. extended depth of focus) will appear under the same
-  **Process well‑plates** menu as they're added.
+- **Nothing is written into your acquisition folder** — outputs go to the folder you pick.
+- **One FOV per well** is the current scope (a well = a condition). Wells with multiple FOVs are
+  reported and **one FOV is sampled** until high-throughput stitching lands.
+- Large plates (384/1536) are supported; the plate view is a navigation map, memory is bounded
+  (it streams from disk — a 1536-well plate uses the same RAM as a 4-well one).
 
 ## 6. If something looks wrong
 
-- *"not a readable Squid acquisition"* — you dropped the wrong folder. Drop the top‑level
-  acquisition folder (the one with `acquisition parameters.json` and a `0/` folder inside).
-- *"ndviewer_light unavailable"* — the z‑stack viewer isn't installed; re‑run the first
-  `pip install` line above.
+- *"not a readable Squid acquisition"* — drop the top-level folder (the one with `0/` and
+  `acquisition.yaml`/`acquisition parameters.json` inside).
+- *"ndviewer_light unavailable"* — re-run the first `pip install` line.
+- *"MIP would persist ~N GB … only M GB free"* — point the output at a disk with room (the full-res
+  multiscale plate is large; the estimate is deliberately conservative).
