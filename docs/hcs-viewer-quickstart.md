@@ -36,6 +36,17 @@ python -m squidmip._viewer /path/to/acquisition  # or open one straight away
 To open an acquisition once the window is up: **drag its folder onto the window**, or pass the path
 as above. An acquisition folder is the one holding the numbered timepoint dirs (`0/`, `1/`, ...).
 
+### Windows: a Desktop shortcut
+
+After the environment exists, make a double-click launcher on the Desktop:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\Install-Desktop-Shortcut.ps1
+```
+
+This adds a **MIP tool** icon to the Desktop that opens the app (drag an acquisition folder onto the
+window). Or just double-click `scripts\mip-tool.bat`.
+
 The window has three panes:
 
 - **Top left, Process wells.** Pick an operator to run. Home tab lists the operators plus an
