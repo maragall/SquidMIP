@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
 import numpy as np
 
-from squidmip.projection import project, project_well, select_fovs
+from squidmip.projection import project, project_reference, project_well, select_fovs
 
 if TYPE_CHECKING:  # avoid import cost / cycle at runtime
     from squidmip.reader import SquidReader
@@ -56,7 +56,7 @@ if TYPE_CHECKING:  # avoid import cost / cycle at runtime
 Projector = Callable[[Iterable[np.ndarray]], np.ndarray]
 
 # name -> z-reduction callable. Selected by name in project_plate; extended via add_projector.
-_PROJECTORS: dict[str, Projector] = {"mip": project}
+_PROJECTORS: dict[str, Projector] = {"mip": project, "reference": project_reference}
 
 
 def _default_workers() -> int:

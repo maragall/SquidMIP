@@ -242,3 +242,19 @@ def test_select_fovs_from_real_reader_metadata(squid_dataset):
     meta = open_reader(root).metadata
     assert select_fovs(meta, n_fovs=1) == {"B2": [0], "B3": [0]}
     assert select_fovs(meta, n_fovs=2) == {"B2": [0, 1], "B3": [0, 1]}
+
+
+def test_project_reference_picks_sharpest_plane():
+    # Reference-plane reduction returns the single sharpest z-plane by Tenengrad focus (streaming,
+    # bounded). A high-gradient plane beats flat/dim ones; the exact plane is returned unchanged.
+    import numpy as np
+    from squidmip.projection import project_reference
+    rng = np.random.default_rng(1)
+    flat = (np.ones((48, 48)) * 800).astype(np.uint16)
+    sharp = rng.integers(0, 4000, (48, 48)).astype(np.uint16)
+    dim = (sharp.astype(np.float32) * 0.25).astype(np.uint16)
+    out = project_reference(iter([flat, dim, sharp]))
+    assert np.array_equal(out, sharp)
+    # registered as a pluggable projector, so the engine/CLI can select it by name
+    import squidmip
+    assert "reference" in squidmip.available_projectors()

@@ -127,6 +127,9 @@ _OPERATIONS = (
     Operation("mip", "Maximum Intensity Projection",
               "Collapse each well's z-stack to one max-intensity image; save a navigable OME-Zarr plate.",
               "_build_mip_tab"),
+    Operation("reference", "Reference plane",
+              "Pick each well's sharpest z-plane (Tenengrad autofocus); save a navigable OME-Zarr plate.",
+              "_build_reference_tab"),
     Operation("record", "Record z-stack",
               "Save raw z-stacks to disk as multi-page TIFFs — no FIJI round-trip.",
               "_build_record_tab"),
@@ -811,32 +814,35 @@ class PlateWindow(QMainWindow):
         return w, v
 
     def _build_mip_tab(self) -> QWidget:
-        w, v = self._op_tab_shell(
-            "Maximum Intensity Projection",
-            "Collapse every well's z-stack to one max-intensity image and save a re-openable, "
-            "navigable multiscale OME-Zarr plate. Pick a destination with room — the output can be large.")
-        self._mip_dir = None
-        pick = QPushButton("Choose output folder…"); pick.setStyleSheet(_BTN_QSS)
-        pick.clicked.connect(self._pick_mip_dir)
-        v.addWidget(pick)
-        self._mip_dir_lbl = QLabel("(no folder chosen)"); self._mip_dir_lbl.setWordWrap(True)
-        self._mip_dir_lbl.setStyleSheet("color:#8b98ad;font-size:12px;")
-        v.addWidget(self._mip_dir_lbl)
-        self._mip_run = QPushButton("▶  Run MIP on the whole plate"); self._mip_run.setStyleSheet(_BTN_QSS)
-        self._mip_run.setEnabled(False)
-        self._mip_run.clicked.connect(lambda: self.run_operator("mip", out_parent=self._mip_dir))
-        v.addWidget(self._mip_run)
-        v.addStretch(1)
-        return w
+        return self._build_run_tab(_OPERATIONS_BY_KEY["mip"])
 
-    def _pick_mip_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Save MIP plate to folder")
-        if not d:
-            return
-        self._mip_dir = d
-        ok, est_gb, _ = self._check_disk(Path(d) / f"{self._acq_name}.hcs")
-        self._mip_dir_lbl.setText(f"{d}\n~{est_gb:.0f} GB needed" + ("" if ok else "  ⚠ not enough free space"))
-        self._mip_run.setEnabled(True)
+    def _build_reference_tab(self) -> QWidget:
+        return self._build_run_tab(_OPERATIONS_BY_KEY["reference"])
+
+    def _build_run_tab(self, op) -> QWidget:
+        """Generic projector-operator tab (MIP, Reference plane, …): pick a destination, run over the
+        whole plate → a navigable OME-Zarr plate. ONE builder for every z-reduction operator — a new
+        one needs no new tab code. Per-tab state lives in a closure (no per-operator instance attrs)."""
+        w, v = self._op_tab_shell(op.label, op.blurb + " Pick a destination with room — output can be large.")
+        state = {"dir": None}
+        dir_lbl = QLabel("(no folder chosen)"); dir_lbl.setWordWrap(True)
+        dir_lbl.setStyleSheet("color:#8b98ad;font-size:12px;")
+        run = QPushButton("▶  Run on the whole plate"); run.setStyleSheet(_BTN_QSS); run.setEnabled(False)
+
+        def pick():
+            d = QFileDialog.getExistingDirectory(self, f"Save {op.label} plate to folder")
+            if not d:
+                return
+            state["dir"] = d
+            ok, est_gb, _ = self._check_disk(Path(d) / f"{self._acq_name}.hcs")
+            dir_lbl.setText(f"{d}\n~{est_gb:.0f} GB needed" + ("" if ok else "  ⚠ not enough free space"))
+            run.setEnabled(True)
+
+        pick_btn = QPushButton("Choose output folder…"); pick_btn.setStyleSheet(_BTN_QSS)
+        pick_btn.clicked.connect(pick)
+        run.clicked.connect(lambda: self.run_operator(op.key, out_parent=state["dir"]))
+        v.addWidget(pick_btn); v.addWidget(dir_lbl); v.addWidget(run); v.addStretch(1)
+        return w
 
     def _build_record_tab(self) -> QWidget:
         w, v = self._op_tab_shell(

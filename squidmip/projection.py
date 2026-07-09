@@ -80,6 +80,42 @@ def project(planes: Iterable[np.ndarray]) -> np.ndarray:
     return acc
 
 
+def _tenengrad(plane: np.ndarray) -> float:
+    """Tenengrad focus measure — sum of squared gradient magnitude. Higher = sharper (more in focus).
+
+    The standard, cheap autofocus metric: a sharp plane has strong edges (large gradients). Computed
+    in float32 on a transient gradient pair (freed each call), so it adds no lasting memory.
+    """
+    gy, gx = np.gradient(plane.astype(np.float32, copy=False))
+    return float(np.square(gx).sum() + np.square(gy).sum())
+
+
+def project_reference(planes: Iterable[np.ndarray]) -> np.ndarray:
+    """Reference-plane reduction: return the single sharpest z-plane by Tenengrad focus.
+
+    In HCS drug discovery you don't scrub Z — you MIP or pick one best-focus reference plane, then
+    work in T. This is that pick, as a z-reduction Strategy (drops in via ``add_projector``). Like
+    :func:`project` it is **streaming + bounded**: it keeps only the best plane seen so far (a copy)
+    plus the current one, never the whole stack. Ties keep the earliest (lowest z).
+    """
+    it = iter(planes)
+    try:
+        best = next(it)
+    except StopIteration:
+        raise ValueError("project_reference requires at least one plane; got an empty iterable.")
+    best = np.array(best, copy=True)          # own buffer; never alias the caller's plane
+    best_score = _tenengrad(best)
+    for plane in it:
+        if plane.shape != best.shape:
+            raise ValueError(f"plane shape {plane.shape} != first plane {best.shape}")
+        if plane.dtype != best.dtype:
+            raise ValueError(f"plane dtype {plane.dtype} != first plane {best.dtype}")
+        score = _tenengrad(plane)
+        if score > best_score:
+            best_score, best = score, np.array(plane, copy=True)
+    return best
+
+
 def project_well(
     reader: "SquidReader",
     region: str,
