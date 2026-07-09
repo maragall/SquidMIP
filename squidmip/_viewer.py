@@ -41,6 +41,8 @@ Design notes:
 
 from __future__ import annotations
 
+import os
+import re
 import sys
 import threading
 from dataclasses import dataclass
@@ -48,12 +50,12 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtCore import Qt, QSocketNotifier, QThread, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPalette, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QMainWindow, QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QTabBar, QTabWidget,
-    QVBoxLayout, QWidget,
+    QLineEdit, QMainWindow, QPlainTextEdit, QPushButton, QScrollArea, QSplitter, QTabBar,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from squidmip._engine import _default_workers
@@ -111,6 +113,167 @@ _BTN_QSS = (
     "QPushButton:disabled{color:#57606a;}"
 )
 _COMBO_QSS = "QComboBox{background:#0d1420;color:#e6edf3;border:1px solid #232b3a;border-radius:6px;padding:5px 8px;}"
+_TERM_QSS = ("QPlainTextEdit{background:#05070b;color:#8bffd0;border:none;"
+             "font-family:'SF Mono','Menlo',monospace;font-size:12px;padding:10px;}")
+# Strip ANSI CSI/OSC escapes + stray control bytes so shell output renders clean in the QPlainTextEdit
+# (we run the shell with TERM=dumb to minimise these, but zsh still emits a few).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\x00-\x08\x0e-\x1f]")
+
+
+class _CmdEdit(QLineEdit):
+    """A command input with up/down history recall (so re-running a `squidmip …` line is one key)."""
+
+    def __init__(self, terminal):
+        super().__init__()
+        self._term = terminal
+
+    def keyPressEvent(self, e):
+        h = self._term._history
+        if e.key() == Qt.Key_Up and h:
+            self._term._hpos = max(0, self._term._hpos - 1)
+            self.setText(h[self._term._hpos])
+        elif e.key() == Qt.Key_Down and h:
+            self._term._hpos = min(len(h), self._term._hpos + 1)
+            self.setText(h[self._term._hpos] if self._term._hpos < len(h) else "")
+        else:
+            super().keyPressEvent(e)
+
+
+class _Terminal(QWidget):
+    """A real, interactive shell embedded in the Process-wells pane — IMA-186's `squidmip` CLI, live.
+
+    A login shell on a pseudo-terminal (so it echoes input and behaves like a real terminal): type a
+    command, press Enter, see its output. `squidmip` is aliased to THIS app's interpreter, so the batch
+    MIP command runs here even though the console script isn't pip-installed. Pre-seeded with a how-to
+    banner (MIP every well; `--tiff` writes FIJI-openable TIFFs). Scrollback is capped (bounded RAM),
+    and the shell is killed when the tab or the window closes (no orphan process).
+
+    PTY-backed, so it needs a Unix-y OS; ``build`` falls back to a static command preview elsewhere.
+    """
+
+    def __init__(self, cwd: Optional[str], banner: list, parent=None):
+        super().__init__(parent)
+        self._pid = None
+        self._fd = None
+        self._notifier = None
+        self._history: list[str] = []
+        self._hpos = 0
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        self._out = QPlainTextEdit()
+        self._out.setReadOnly(True)
+        self._out.setMaximumBlockCount(4000)   # capped scrollback — output can never grow unbounded
+        self._out.setStyleSheet(_TERM_QSS)
+        v.addWidget(self._out, 1)
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(8, 6, 8, 8)
+        rl.setSpacing(6)
+        tag = QLabel("$")
+        tag.setStyleSheet("color:#58a6ff;font-weight:800;font-family:'SF Mono','Menlo',monospace;")
+        self._in = _CmdEdit(self)
+        self._in.setStyleSheet(
+            "QLineEdit{background:#05070b;color:#e6edf3;border:1px solid #232b3a;border-radius:6px;"
+            "padding:6px 8px;font-family:'SF Mono','Menlo',monospace;font-size:12px;}")
+        self._in.setPlaceholderText("type a command and press Enter  (e.g. squidmip … --tiff)")
+        self._in.returnPressed.connect(self._send)
+        rl.addWidget(tag)
+        rl.addWidget(self._in, 1)
+        v.addWidget(row)
+        self._start(cwd, banner)
+
+    def _start(self, cwd, banner):
+        import pty
+        shell = os.environ.get("SHELL", "/bin/zsh")
+        env = dict(os.environ)
+        env["TERM"] = "dumb"        # minimise escape sequences; still a real interactive shell
+        env["PS1"] = "$ "
+        try:
+            self._pid, self._fd = pty.fork()
+        except Exception as e:      # no PTY (e.g. Windows) — degrade to a disabled, informative pane
+            self._out.setPlainText(f"(embedded terminal unavailable on this platform: {e})")
+            self._in.setEnabled(False)
+            return
+        if self._pid == 0:          # CHILD → becomes the shell (only chdir/exec between fork and exec)
+            try:
+                if cwd and os.path.isdir(cwd):
+                    os.chdir(cwd)
+                os.execvpe(shell, [shell, "-i"], env)
+            except Exception:
+                os._exit(127)
+        import fcntl                # PARENT: read the master fd non-blocking, driven by Qt's event loop
+        fl = fcntl.fcntl(self._fd, fcntl.F_GETFL)
+        fcntl.fcntl(self._fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        self._notifier = QSocketNotifier(self._fd, QSocketNotifier.Read, self)
+        self._notifier.activated.connect(self._read)
+        for line in banner:         # seed the how-to as real shell output (echo lines run in the shell)
+            self._write(line + "\n")
+
+    def _read(self):
+        try:
+            data = os.read(self._fd, 8192)
+        except BlockingIOError:
+            return                       # notifier fired but no data ready yet — keep listening
+        except (OSError, TypeError):
+            data = b""                   # EIO / fd closed -> the child shell is gone
+        if not data:
+            if self._notifier is not None:
+                self._notifier.setEnabled(False)
+            return
+        text = _ANSI_RE.sub("", data.decode(errors="replace")).replace("\r", "")
+        cur = self._out.textCursor()
+        cur.movePosition(cur.End)
+        cur.insertText(text)
+        self._out.setTextCursor(cur)
+        self._out.ensureCursorVisible()
+
+    def _write(self, s: str):
+        if self._fd is not None:
+            try:
+                os.write(self._fd, s.encode())
+            except OSError:
+                pass
+
+    def _send(self):
+        cmd = self._in.text()
+        self._in.clear()
+        if cmd.strip():
+            self._history.append(cmd)
+        self._hpos = len(self._history)
+        self._write(cmd + "\n")     # the PTY echoes it back, so it appears after the shell prompt
+
+    def shutdown(self):
+        """Kill the shell (and its group) and release the fd. Idempotent; safe to call on tab/window close."""
+        if self._notifier is not None:
+            self._notifier.setEnabled(False)
+            self._notifier = None
+        if self._pid:
+            import signal
+            for killer in (lambda: os.killpg(os.getpgid(self._pid), signal.SIGTERM),
+                           lambda: os.kill(self._pid, signal.SIGTERM)):
+                try:
+                    killer()
+                    break
+                except OSError:
+                    continue
+            try:
+                os.waitpid(self._pid, os.WNOHANG)
+            except OSError:
+                pass
+            self._pid = None
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+    def closeEvent(self, e):
+        self.shutdown()
+        super().closeEvent(e)
+
+
 @dataclass(frozen=True)
 class Operation:
     """One post-processing operator declared in ONE place — the 'operation template'. Adding a feature
@@ -634,6 +797,46 @@ class _PreviewWorker(QThread):
             pass   # preview is best-effort; the operator run is the authoritative result
 
 
+class _RecordWorker(QThread):
+    """Encodes each well's .mp4 on a BACKGROUND thread so the GUI never freezes during an export.
+
+    imageio/ffmpeg encoding is CPU-bound; running it on the GUI thread (with processEvents only
+    BETWEEN wells) froze the window for the whole of each well's encode — the exact bug this fixes.
+    One movie per well, streamed frame-by-frame (bounded to one frame in RAM). Post-acquisition: it
+    reads existing frames off disk. Stops cleanly between wells when the window closes / re-opens.
+    """
+
+    progress = pyqtSignal(int, int, str)   # (done, total, well just written)
+    finished_ok = pyqtSignal(int, str)     # (count written, output dir)
+    failed = pyqtSignal(str)
+
+    def __init__(self, reader, meta, wells: list, out: str, fps: int, record_z: bool):
+        super().__init__()
+        self._reader, self._meta = reader, meta
+        self._wells, self._out, self._fps, self._record_z = list(wells), out, fps, record_z
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        try:
+            from squidmip._video import default_axis, well_movie_frames, write_mp4
+            axis = default_axis(self._meta, self._record_z)
+            n = len(self._wells)
+            for i, well in enumerate(self._wells, 1):
+                if self._stop.is_set():
+                    return
+                fov = self._meta["fovs_per_region"][well][0]
+                write_mp4(well_movie_frames(self._reader, well, fov, axis=axis),
+                          Path(self._out) / f"{well}.mp4", self._fps)
+                self.progress.emit(i, n, well)
+            if not self._stop.is_set():
+                self.finished_ok.emit(n, str(self._out))
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 # --- main window: plate overview | embedded ndviewer ----------------------------------------
 
 class PlateWindow(QMainWindow):
@@ -643,6 +846,7 @@ class PlateWindow(QMainWindow):
         self.resize(1600, 950)
         self._worker = None           # the operator (MIP) run
         self._preview = None          # the raw preview fill on open
+        self._rec_worker = None       # the video (.mp4) export run — off the GUI thread
         self._retired = []            # workers asked to stop; kept alive until they actually finish
         self._overview = None
         self._reader = None
@@ -663,7 +867,6 @@ class PlateWindow(QMainWindow):
 
         self._acq_name = ""           # acquisition folder name, shown as the Process-pane title
         self._current_well = None     # the well currently shown in the detail viewer (for Record)
-        self._recording = False       # guards _run_record against re-entry during its processEvents
         self._acq_path = None         # the opened acquisition dir (persist writes next to it)
         self._processed_plate = None  # path of the written plate.ome.zarr once an operator persists it
         self._plate_mode = "raw"      # what the plate view is showing — shown in the plate-pane title
@@ -836,6 +1039,8 @@ class PlateWindow(QMainWindow):
         if w is self._layers_tab:                          # drop the stale ref so refresh no-ops
             self._layers_tab = None
             self._layers_box = None
+        if hasattr(w, "shutdown"):                         # a live terminal — kill its shell first
+            w.shutdown()
         w.deleteLater()
 
     def _activate_operator(self, key: str):
@@ -927,6 +1132,8 @@ class PlateWindow(QMainWindow):
             self._rec_dir = d; self._rec_dir_lbl.setText(d); self._rec_run.setEnabled(True)
 
     def _record_run(self):
+        if self._reader is None or (self._rec_worker is not None and self._rec_worker.isRunning()):
+            return                                    # already recording — ignore re-click
         if self._rec_scope.currentIndex() == 1:
             wells = list(self._fov_index)
         elif self._current_well is not None:
@@ -936,6 +1143,47 @@ class PlateWindow(QMainWindow):
             return
         self._run_record(wells, self._rec_dir, int(self._rec_fps.currentText()),
                          record_z=self._rec_z.isChecked())
+
+    def _run_record(self, wells, out, fps, record_z=False):
+        """Launch the .mp4 export on a background thread so the GUI stays responsive (the freeze fix).
+
+        The heavy per-well encode runs in _RecordWorker; here we just wire its signals to the status
+        line and disable the button for the duration. Inputs are passed by value to the worker, so a
+        re-drop that nulls self._reader mid-export can't corrupt an in-flight run."""
+        if self._reader is None:
+            return
+        self._stop_record()                            # never two exports at once
+        self._rec_button(False)
+        self._rec_worker = _RecordWorker(self._reader, self._meta, wells, out, fps, record_z)
+        self._rec_worker.progress.connect(
+            lambda i, n, well: self._readout.setText(f"● recording {i}/{n} · {well}.mp4 …"))
+        self._rec_worker.finished_ok.connect(
+            lambda n, d: (self._readout.setText(f"✓ recorded {n} .mp4(s) → {d}"), self._rec_button(True)))
+        self._rec_worker.failed.connect(
+            lambda msg: (self._readout.setText(f"record failed: {msg}"), self._rec_button(True)))
+        self._rec_worker.start()
+
+    def _rec_button(self, enabled: bool):
+        """Enable/disable the Record button if its tab is open (a no-op if it was never built)."""
+        btn = getattr(self, "_rec_run", None)
+        if btn is not None:
+            btn.setEnabled(enabled)
+
+    def _stop_record(self):
+        """Stop an in-flight export cleanly (it drops out between wells) and retire the thread."""
+        w = self._rec_worker
+        self._rec_worker = None
+        if w is None:
+            return
+        for name in ("progress", "finished_ok", "failed"):
+            try:
+                getattr(w, name).disconnect()
+            except TypeError:
+                pass
+        if w.isRunning():
+            w.stop()
+            self._retired.append(w)
+            w.finished.connect(lambda: self._retired.remove(w) if w in self._retired else None)
 
     def _build_layers_tab(self) -> QWidget:
         """The Layers tab: the OperationStack as a list of toggleable, reorderable layers. The topmost
@@ -988,46 +1236,42 @@ class PlateWindow(QMainWindow):
             self._plate_title.setText(f"{self._acq_name}   ·   {self._plate_mode}")
 
     def _build_cli_tab(self) -> QWidget:
-        """The headless-CLI stub as a tab (IMA-186 wires it; this shows the equivalent commands)."""
-        term = QPlainTextEdit(); term.setReadOnly(True)
-        term.setStyleSheet("QPlainTextEdit{background:#05070b;color:#8bffd0;border:none;"
-                           "font-family:'SF Mono','Menlo',monospace;font-size:12px;padding:12px;}")
-        name = self._acq_name or "<acquisition>"
-        term.setPlainText(
-            "HCS viewer — CLI  (preview)\n"
-            "──────────────────────────────\n"
-            "The same operators, run headlessly (IMA-186 — the `squidmip` command):\n\n"
-            f"  $ squidmip \"{name}\"                        # MIP every well -> navigable OME-zarr\n"
-            f"  $ squidmip \"{name}\" --projector reference  # sharpest-plane per well\n"
-            f"  $ squidmip \"{name}\" --workers 8 --tiff     # tune + also export TIFFs\n\n"
-            "# this tab is a preview; run the command in a terminal.\n")
-        return term
-
-    def _run_record(self, wells, out, fps, record_z=False):
-        """Record each well's video → ``<out>/<well>.mp4`` (time-lapse if there's a T series, else a
-        Z focus-sweep), composited by display colour at *fps*. Post-acquisition: reads existing frames.
-
-        Snapshot the inputs before the loop: it pumps processEvents (to update status), which can
-        deliver a re-drop -> ingest() that nulls self._reader/_meta mid-loop. Iterating over locals
-        means a concurrent open can't corrupt an in-flight record; _recording blocks re-entry."""
-        if self._reader is None or self._recording:
-            return
-        from squidmip._video import default_axis, well_movie_frames, write_mp4
-        reader, meta = self._reader, self._meta       # `out`, `wells`, `fps` are local args
-        axis = default_axis(meta, record_z)
-        self._recording = True
+        """A LIVE, interactive shell in the pane: run the `squidmip` batch CLI (IMA-186) right here.
+        Pre-seeded with the how-to (MIP every well; `--tiff` -> FIJI-openable TIFFs). `squidmip` is
+        aliased to this app's interpreter so it runs regardless of PATH/conda. Falls back to a static
+        command preview where a PTY isn't available (e.g. Windows)."""
+        acq = str(self._acq_path) if self._acq_path else "<acquisition>"
+        cmds = (
+            "echo '──────────────────────────────────────────────────────────'",
+            "echo ' HCS viewer · batch CLI (IMA-186) — MIP every well, headless'",
+            "echo '──────────────────────────────────────────────────────────'",
+            "echo '# MIP every well -> navigable OME-Zarr + FIJI-openable TIFFs:'",
+            f"echo '#   squidmip \"{acq}\" --tiff'",
+            "echo '# sharpest reference plane per well:'",
+            f"echo '#   squidmip \"{acq}\" --projector reference --tiff'",
+            "echo '# tune throughput (more workers):'",
+            f"echo '#   squidmip \"{acq}\" --workers 8 --tiff'",
+            "echo '# --tiff writes the projected planes as TIFFs so FIJI/ImageJ can open them.'",
+            "echo ''",
+        )
+        banner = [f"alias squidmip='{sys.executable} -m squidmip'", *cmds]
+        cwd = str(self._acq_path.parent) if self._acq_path else str(Path.home())
         try:
-            for i, well in enumerate(wells, 1):
-                fov = meta["fovs_per_region"][well][0]
-                write_mp4(well_movie_frames(reader, well, fov, axis=axis),
-                          Path(out) / f"{well}.mp4", fps)
-                self._readout.setText(f"recording {i}/{len(wells)} · {well}.mp4 …")
-                QApplication.processEvents()
-            self._readout.setText(f"✓ recorded {len(wells)} .mp4(s) → {out}")
-        except Exception as e:
-            self._readout.setText(f"record failed: {e}")
-        finally:
-            self._recording = False
+            t = _Terminal(cwd, banner)
+            if t._fd is not None:                # PTY came up — use the live terminal
+                return t
+        except Exception:
+            pass
+        term = QPlainTextEdit(); term.setReadOnly(True)   # fallback: static command preview
+        term.setStyleSheet(_TERM_QSS)
+        term.setPlainText(
+            "HCS viewer — CLI  (preview; no terminal on this platform)\n"
+            "──────────────────────────────\n"
+            "Run headlessly (IMA-186 — the `squidmip` command):\n\n"
+            f"  $ squidmip \"{acq}\" --tiff               # MIP every well -> OME-zarr + FIJI TIFFs\n"
+            f"  $ squidmip \"{acq}\" --projector reference --tiff\n"
+            f"  $ squidmip \"{acq}\" --workers 8 --tiff\n")
+        return term
 
     def _enable_operators(self, flag: bool):
         for a in self._op_actions.values():
@@ -1076,6 +1320,7 @@ class PlateWindow(QMainWindow):
         # stop any in-flight run/preview and clear prior state before opening a new acquisition
         self._stop_worker()
         self._stop_preview()
+        self._stop_record()
         self._reader = self._meta = None
         self._fov_index = {}
         self._pushed = set()
@@ -1363,14 +1608,47 @@ class PlateWindow(QMainWindow):
     def closeEvent(self, e):
         self._stop_worker()          # stop the run cleanly; nothing on disk to clean up (no cache)
         self._stop_preview()
+        self._stop_record()          # stop an in-flight video export
+        for w in list(self._op_tabs.values()):
+            if hasattr(w, "shutdown"):
+                w.shutdown()         # kill any live embedded terminal's shell
         for w in list(self._retired):
             w.wait()                 # join before exit — never leave a QThread running at teardown
         super().closeEvent(e)
 
 
+def _apply_dark_palette(app):
+    """Force a dark Fusion palette so no native surface shows through white in macOS LIGHT mode.
+
+    The tab strip's empty area (behind/beside the tabs) is painted by the STYLE using the palette, not
+    by our per-widget stylesheets — so in light mode it rendered white. Fusion + a dark palette fixes
+    that (and every other unstyled surface: combo popups, scrollbars) in one place; it matched already
+    when the OS was in dark mode, which confirmed the palette was the cause."""
+    app.setStyle("Fusion")
+    dark, base, text, mut = QColor(7, 10, 20), QColor(11, 14, 20), QColor(230, 237, 243), QColor(87, 96, 109)
+    pal = QPalette()
+    pal.setColor(QPalette.Window, dark)
+    pal.setColor(QPalette.WindowText, text)
+    pal.setColor(QPalette.Base, base)
+    pal.setColor(QPalette.AlternateBase, dark)
+    pal.setColor(QPalette.Text, text)
+    pal.setColor(QPalette.Button, QColor(19, 24, 36))
+    pal.setColor(QPalette.ButtonText, text)
+    pal.setColor(QPalette.ToolTipBase, base)
+    pal.setColor(QPalette.ToolTipText, text)
+    pal.setColor(QPalette.Highlight, QColor(88, 166, 255))
+    pal.setColor(QPalette.HighlightedText, dark)
+    for grp in (QPalette.Disabled,):
+        pal.setColor(grp, QPalette.Text, mut)
+        pal.setColor(grp, QPalette.ButtonText, mut)
+        pal.setColor(grp, QPalette.WindowText, mut)
+    app.setPalette(pal)
+
+
 def main(dataset_path: str = None):
     path = dataset_path or (sys.argv[1] if len(sys.argv) > 1 else None)
     app = QApplication.instance() or QApplication(sys.argv)
+    _apply_dark_palette(app)
     win = PlateWindow(path)
     win.show()
     if not app.property("_squidmip_test"):
