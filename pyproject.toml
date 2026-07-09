@@ -18,7 +18,6 @@ dependencies = [
     "tensorstore>=0.1.45",
     "pillow>=10.0",
     "pydantic-settings>=2.3",   # declarative CLI (IMA-186), same pattern as the stitcher
-    "imageio[ffmpeg]>=2.31",    # .mp4 video export (Record); bundled ffmpeg, no system install
 ]
 
 # No tilefusion dependency: IMA-189 ingest is self-contained (see docs/ima-189-eng-review.md).
@@ -30,15 +29,16 @@ dependencies = [
 # ome-zarr-models: official OME-NGFF v0.5 pydantic schema — validates written plate metadata
 # in tests (test-time only; the runtime writer stays lean, no extra runtime dep).
 test = ["pytest>=7.0", "ome-zarr-models>=1.7"]
-# gui: the HCS viewer (hcs-viewer). PyQt5 is OPTIONAL — the headless pipeline
-# (reader/projection/engine/output/montage) never imports it. ndviewer_light is an optional
-# runtime companion for the embedded detail view (imported lazily; the GUI degrades without it).
-gui = ["PyQt5>=5.15"]
+# gui: the MIP tool desktop app. PyQt5 + ndviewer_light (the embedded detail viewer). The headless
+# pipeline (reader/projection/engine/output) never imports these, so the CLI installs without them.
+gui = [
+    "PyQt5>=5.15",
+    "ndviewer_light @ git+https://github.com/maragall/ndviewer_light@main",
+]
 
 [project.scripts]
-squidmip = "squidmip._cli:main"           # headless CLI (IMA-186): run an operator over an HCS plate
-hcs-viewer = "squidmip._viewer:main"
-squidmip-view = "squidmip._viewer:main"   # legacy alias for the same entry point
+squidmip = "squidmip._cli:main"           # headless CLI (IMA-186): MIP a plate from the terminal
+squidmip-view = "squidmip._viewer:main"   # the MIP tool desktop app
 
 [tool.hatch.build.targets.wheel]
 packages = ["squidmip"]

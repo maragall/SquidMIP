@@ -1,0 +1,22 @@
+# One-command setup for the MIP tool (GUI + CLI).
+#   conda env create -f environment.yml
+#   conda activate squidmip
+# then run:  squidmip-view <acquisition>      (desktop app)
+#       or:  squidmip <acquisition> --tiff    (headless CLI)
+name: squidmip
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - tifffile
+  - pandas
+  - pyyaml
+  - pillow
+  - pip
+  - pip:
+      - tensorstore
+      - pydantic-settings
+      - PyQt5
+      - "git+https://github.com/maragall/ndviewer_light@main"
+      - "."          # squidmip itself (run `conda env create` from the repo root)
