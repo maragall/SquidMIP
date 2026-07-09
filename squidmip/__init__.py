@@ -13,7 +13,7 @@ The public surface is intentionally tiny::
     for region, fov, image in project_plate(reader, workers=8):   # whole plate, parallel + streamed
         ...                                              # (T, C, 1, Y, X) per well, bounded memory
 
-    write_plate(reader, "/path/out")          # canonical OME-zarr plate + individual-TIFF export
+    write_plate(reader, "/path/out")          # canonical multiscale OME-zarr plate (tiff=True adds TIFFs)
     build_montage("/path/out")                # static plate montage PNG + region-jump sidecar + hover viewer
 """
 

@@ -28,9 +28,9 @@ Flow (single streaming pass — peak memory is the montage canvas + ONE well, ne
                                  +  plate_montage.html (zero-dep viewer: hover a cell -> well id)
 
 Why global-per-channel contrast: a montage is for comparing wells at a glance; a per-well
-window would make a dim well and a bright well look identical. Why downsample ``array 0``
-(not a pyramid level): IMA-184 writes a single resolution level — the per-FOV pyramid is
-deferred to IMA-193 — so the montage downsamples the full-res array itself.
+window would make a dim well and a bright well look identical. The montage downsamples
+``array 0`` (full-res) directly; the writer now also emits per-FOV pyramid levels, but the
+montage reads level 0 to stay independent of the pyramid's level choices.
 
 Fail loud: a path that is not an HCS plate, a well whose field array is missing, or a
 channel with no resolvable color is refused, never rendered as a silent blank/black.

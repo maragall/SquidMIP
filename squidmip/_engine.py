@@ -134,6 +134,7 @@ def project_plate(
     n_fovs: int = 1,
     workers: int | None = None,
     projector: str = "mip",
+    on_error=None,
 ) -> Iterator[tuple[str, int, np.ndarray]]:
     """Project every selected well of a plate in parallel, streaming results well-by-well.
 
@@ -172,8 +173,15 @@ def project_plate(
         If *projector* names a projector that is not in the table.
     Exception
         Any error from a well (e.g. a corrupt/missing plane raised by ``reader.read``) is
-        propagated LOUD, aborting the stream. Skip/manifest/resume resilience is IMA-186's
-        concern, deliberately not this engine's (fail-fast producer).
+        propagated LOUD, aborting the stream — UNLESS *on_error* is given (see below).
+
+    Other Parameters
+    ----------------
+    on_error:
+        Opt-in per-well fault isolation for high-throughput/unattended runs (IMA-186). When set to a
+        callable ``on_error(region, fov, exc)``, a well whose projection raises is passed to it and
+        then SKIPPED — the stream keeps going instead of aborting the whole plate on one corrupt
+        file. ``None`` (default) keeps the fail-fast contract exactly. Peak-memory bound is unchanged.
 
     Notes
     -----
@@ -217,6 +225,12 @@ def project_plate(
             done, _pending = wait(in_flight, return_when=FIRST_COMPLETED)
             for future in done:
                 region, fov = in_flight.pop(future)
-                image = future.result()  # raises here → propagate loud (fail-fast)
-                _submit_next()  # slide the window forward before handing the result on
+                _submit_next()  # slide the window forward first, so a SKIPPED well still refills it
+                try:
+                    image = future.result()
+                except Exception as exc:
+                    if on_error is None:
+                        raise                       # default: fail-fast (unchanged contract)
+                    on_error(region, fov, exc)      # opt-in: record + SKIP this well, keep going
+                    continue
                 yield region, fov, image

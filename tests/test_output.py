@@ -126,6 +126,28 @@ def test_write_from_stream_layout_and_pixels(tmp_path):
     assert_valid_ngff_plate(plate)
 
 
+def test_large_field_writes_pyramid(tmp_path):
+    # A field larger than the pyramid floor (256 px) gets downsample LEVELS: 600 -> 300 -> 150.
+    # Level 0 stays full-res pixel-exact; coarser levels are half-size area-averages. Small fields
+    # (the other tests, 8x8) collapse to level 0 alone — canonical single-level output unchanged.
+    big = {r: _image(i, y=600, x=600) for i, r in enumerate(REGIONS)}
+    manifest = write_from_stream(_meta(), _stream(big), tmp_path, n_fovs=1, tiff=False)
+    assert manifest["levels"] == 3
+
+    field = Path(manifest["plate"]) / "B" / "2" / "0"
+    ds_paths = [d["path"] for d in
+                json.loads((field / "zarr.json").read_text())["attributes"]["ome"]["multiscales"][0]["datasets"]]
+    assert ds_paths == ["0", "1", "2"]
+    assert np.array_equal(_read_array(field / "0"), big["B2"])          # level 0 pixel-exact
+    assert _read_array(field / "1").shape == (1, 2, 1, 300, 300)        # half-size
+    assert _read_array(field / "2").shape == (1, 2, 1, 150, 150)
+    # coarse-level scale reflects the real downsample factor (2x, 4x) in Y,X
+    scales = [d["coordinateTransformations"][0]["scale"] for d in
+              json.loads((field / "zarr.json").read_text())["attributes"]["ome"]["multiscales"][0]["datasets"]]
+    assert scales[1][-2:] == [0.325 * 2, 0.325 * 2]
+    assert scales[2][-2:] == [0.325 * 4, 0.325 * 4]
+
+
 def test_write_from_stream_individual_tiffs(tmp_path):
     images = {r: _image(i) for i, r in enumerate(REGIONS)}
     write_from_stream(_meta(), _stream(images), tmp_path, n_fovs=1, tiff=True)

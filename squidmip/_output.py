@@ -4,16 +4,19 @@ Consumes IMA-188's ``project_plate`` stream (single-thread — the engine parall
 projection internally and hands results back one at a time, so the writer needs no locking)
 and writes each well as it arrives. Two outputs from one pass:
 
-  1. ``<out>/plate.ome.zarr``  — OME-NGFF v0.5 HCS *plate* (zarr v3), matching Squid's canonical
-     ``control/core/zarr_writer.py`` (single resolution level, no pyramid — a per-FOV pyramid is
-     pointless for one small field; plate-view thumbnails are IMA-193's, not this writer's):
+  1. ``<out>/plate.ome.zarr``  — OME-NGFF v0.5 HCS *plate* (zarr v3), Squid's canonical
+     ``control/core/zarr_writer.py`` layout EXTENDED with a per-FOV pyramid (levels 0..L, each a 2x
+     block-mean of the previous) so a pyramid-aware reader / plate navigator can show a field without
+     pulling full-res. Level 0 stays full-res and pixel-exact, so canonical single-level consumers are
+     unchanged; fields <= 256 px keep just level 0:
         plate.ome.zarr/                     zarr.json  = plate group (rows/columns/wells)
           {row}/                            zarr.json  = row group (bare)
             {col}/                          zarr.json  = well group (images -> raw fov ids)
               {fov}/                        zarr.json  = image group (multiscales + omero)
                 0/                          array: full-res (T, C, 1, Y, X), native dtype
-     Opens in ndviewer_light (directory-walk -> array ``0`` + ``omero`` colors) AND validates as
-     a spec plate (plate/well group metadata) under an independent reader (zarr-python).
+                1/ 2/ ...                   array: 2x-downsampled pyramid levels (native dtype)
+     Opens in ndviewer_light (directory-walk -> array ``0`` + ``omero`` colors; it reads only level 0)
+     AND validates as a spec plate (plate/well group metadata) under an independent reader (zarr-python).
 
   2. ``<out>/tiff/{t}/{region}_{fov}_0_{channel}.tiff`` — individual per-plane TIFFs in Squid's
      filename convention, z collapsed to ``0`` (the projection), native dtype. You Yan's
@@ -45,12 +48,24 @@ from typing import Iterable, Iterator, Optional
 import numpy as np
 import tifffile
 
-from squidmip._engine import project_plate
+from squidmip._engine import _default_workers, project_plate
 from squidmip._zarr_store import create_array, write_array, write_group
 from squidmip.projection import select_fovs
 
 _NGFF_VERSION = "0.5"
 _WAVELENGTH_RE = re.compile(r"(?<!\d)(\d{3,4})(?!\d)")  # a standalone 3-4 digit nm in a channel name
+
+# Pyramid: halve (Y, X) per level until the coarsest level fits in a screen-sized tile, capped at a
+# few levels. A per-FOV pyramid IS worthwhile at HCS scale (4168x4168 fields): the coarse levels let
+# a plate navigator / pyramid-aware reader (napari, a future LOD viewer) show a well without pulling
+# the full-res plane. Small fields (<= _PYRAMID_MIN_YX, e.g. test frames) collapse to level 0 alone,
+# so the canonical single-level output is unchanged for them.
+_PYRAMID_MIN_YX = 256
+_PYRAMID_MAX_LEVELS = 6
+_WRITE_WORKERS = min(4, _default_workers())   # bounded writer pool overlapping pyramid-build + zstd
+#                            (~75% of end-to-end wall time when serial) with projection. Adapt to the
+#                            machine like the engine (never more writer threads than usable cores);
+#                            4 is plenty — the write stage is I/O + compress bound, not CPU-scaling.
 
 
 # --- well id <-> row/col --------------------------------------------------------------------
@@ -113,14 +128,56 @@ def plate_metadata(regions: Iterable[str], field_count: int, name: str = "plate"
     }
 
 
-def _multiscales(pixel_size_um: Optional[float], dz_um: Optional[float] = None) -> dict:
-    """Single-level multiscales metadata (Squid canonical: one dataset ``0``, no pyramid).
+def _downsample_yx(image: np.ndarray) -> np.ndarray:
+    """Halve a ``(T, C, Z, Y, X)`` field in Y and X by 2x2 block-mean, native dtype kept.
 
-    A per-FOV pyramid is pointless for one small field; plate-view thumbnails are a navigator
-    concern (IMA-193), not this writer's. Scale/axes mirror Squid's zarr_writer exactly.
+    Each spatial axis is halved only when it has >= 2 px — a size-1 axis is left intact, so a narrow
+    strip never collapses to a zero-width level (which would divide-by-zero in ``_multiscales``). Odd
+    axes are cropped by one before halving. Vectorised reshape+mean over the whole 5-D field is ~3x
+    faster than looping ``_area_downsample`` per plane (measured 250ms vs 670ms for a 4168x4168x4ch
+    field), which matters because every written well pays this per level. Rounded back to the source
+    dtype (clamped for integers). mean in float32 (not float64) halves the transient and is exact for
+    a 2x2 mean of uint16 (max sum 4*65535 is within float32's integer range).
+    """
+    fy = 2 if image.shape[-2] >= 2 else 1
+    fx = 2 if image.shape[-1] >= 2 else 1
+    y = (image.shape[-2] // fy) * fy                       # crop to a multiple of the axis factor
+    x = (image.shape[-1] // fx) * fx
+    cropped = image[..., :y, :x]
+    ds = cropped.reshape(*cropped.shape[:-2], y // fy, fy, x // fx, fx).mean(axis=(-3, -1), dtype=np.float32)
+    if np.issubdtype(image.dtype, np.integer):
+        info = np.iinfo(image.dtype)
+        np.rint(ds, out=ds)                       # round + clip IN PLACE — no extra float buffers
+        np.clip(ds, info.min, info.max, out=ds)
+    return ds.astype(image.dtype)
+
+
+def _pyramid(image: np.ndarray) -> list[np.ndarray]:
+    """Level list ``[full-res, /2, /4, ...]`` — halving until the coarsest fits _PYRAMID_MIN_YX
+    (or _PYRAMID_MAX_LEVELS). A field already <= the floor yields just ``[image]`` (level 0)."""
+    levels = [image]
+    while (max(levels[-1].shape[-2:]) > _PYRAMID_MIN_YX
+           and len(levels) < _PYRAMID_MAX_LEVELS):
+        levels.append(_downsample_yx(levels[-1]))
+    return levels
+
+
+def _multiscales(level_shapes: list[tuple], pixel_size_um: Optional[float], dz_um: Optional[float] = None) -> dict:
+    """multiscales metadata for a per-FOV pyramid: one ``datasets`` entry per level, its scale the
+    real downsample factor (level 0's Y,X over this level's Y,X) so physical coordinates stay true.
+
+    ``level_shapes`` is the (Y, X) of each written level, level 0 first. A single-element list gives
+    the canonical single-dataset ``0`` output (unchanged for small fields). Axes mirror Squid's
+    zarr_writer.
     """
     p = float(pixel_size_um) if pixel_size_um else 1.0
     dz = float(dz_um) if dz_um else 1.0
+    y0, x0 = level_shapes[0]
+    datasets = []
+    for i, (y, x) in enumerate(level_shapes):
+        sy, sx = p * (y0 / y), p * (x0 / x)   # coarse levels have a larger physical pixel
+        datasets.append({"path": str(i),
+                         "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0, dz, sy, sx]}]})
     return {
         "version": _NGFF_VERSION,
         "name": "0",
@@ -131,9 +188,7 @@ def _multiscales(pixel_size_um: Optional[float], dz_um: Optional[float] = None) 
             {"name": "y", "type": "space", "unit": "micrometer"},
             {"name": "x", "type": "space", "unit": "micrometer"},
         ],
-        "datasets": [
-            {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0, dz, p, p]}]}
-        ],
+        "datasets": datasets,
     }
 
 
@@ -177,19 +232,25 @@ def _validate_image(image: np.ndarray, channels: list[dict]) -> None:
         )
 
 
-def _write_field(field_dir: Path, image: np.ndarray, channels: list[dict], pixel_size_um, dz_um=None) -> None:
-    """Write one field: the single full-res array ``0`` + image-group multiscales + omero."""
+def _write_field(field_dir: Path, image: np.ndarray, channels: list[dict], pixel_size_um, dz_um=None) -> int:
+    """Write one field: pyramid levels ``0..L`` (0 = full-res, pixel-exact) + multiscales + omero.
+
+    Returns the number of levels written (1 for a small field with no pyramid)."""
     _validate_image(image, channels)
-    store = create_array(field_dir / "0", image.shape, image.dtype)
-    write_array(store, image)
+    levels = _pyramid(image)
+    for i, lvl in enumerate(levels):
+        store = create_array(field_dir / str(i), lvl.shape, lvl.dtype)
+        write_array(store, lvl)
+    level_shapes = [(int(lvl.shape[-2]), int(lvl.shape[-1])) for lvl in levels]
     write_group(
         field_dir,
         {
             "version": _NGFF_VERSION,
-            "multiscales": [_multiscales(pixel_size_um, dz_um)],
+            "multiscales": [_multiscales(level_shapes, pixel_size_um, dz_um)],
             "omero": _omero(channels, image.dtype),
         },
     )
+    return len(levels)
 
 
 def _write_tiffs(tiff_root: Path, region: str, fov: int, image: np.ndarray, channel_names: list[str]) -> None:
@@ -211,18 +272,30 @@ def write_from_stream(
     out_dir,
     *,
     n_fovs: int = 1,
-    tiff: bool = True,
+    tiff: bool = False,
     on_well=None,
+    write_workers: int = _WRITE_WORKERS,
+    stop=None,
 ) -> dict:
-    """Write the plate + TIFFs from a ``(region, fov, image)`` stream and *metadata*.
+    """Write the plate + (optionally) TIFFs from a ``(region, fov, image)`` stream and *metadata*.
 
     The core of :func:`write_plate`, split out so it can be driven clean-room in tests with a
     fabricated metadata dict + a hand-built stream (no reader, no data on disk).
 
-    ``on_well(region, fov, image)`` is an optional callback invoked after each well is written
-    (field + TIFFs). It lets a live consumer (the plate viewer) render each well's tile and push
-    it into the embedded viewer as MIP completes — the canonical output is unchanged.
+    Each projected well is handed to a bounded writer POOL (``write_workers`` threads) so the disk
+    write — pyramid build + zstd compress, ~75% of end-to-end wall time when serial — overlaps the
+    projection engine instead of starving it. Wells write to disjoint directories, so parallel
+    writes never contend; at most ~``write_workers`` wells are in flight, so peak memory stays
+    O(engine workers + write_workers), never the whole plate.
+
+    ``on_well(region, fov, image)`` is an optional callback invoked after each well is written.
+    NOTE: it runs on a WRITER THREAD and several may overlap — it MUST be thread-safe (the plate
+    viewer guards its shared contrast/tiles with a lock). ``stop()`` is an optional predicate polled
+    before each submit; when it returns True the stream is abandoned and in-flight writes are drained
+    — a clean partial-plate stop for a cancelled GUI run.
     """
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
     out_dir = Path(out_dir)
     plate_dir = out_dir / "plate.ome.zarr"
     tiff_root = out_dir / "tiff"
@@ -246,22 +319,40 @@ def write_from_stream(
     pixel_size_um = metadata.get("pixel_size_um")
     dz_um = metadata.get("dz_um")
 
-    n_written = 0
-    for region, fov, image in stream:
+    def _write_one(region, fov, image):
         row, col = parse_well_id(region)
         # field directory is the RAW fov id (Squid convention), digit-named for ndviewer.
-        _write_field(plate_dir / row / col / str(fov), image, channels, pixel_size_um, dz_um)
+        levels = _write_field(plate_dir / row / col / str(fov), image, channels, pixel_size_um, dz_um)
         if tiff:
             _write_tiffs(tiff_root, region, fov, image, channel_names)
-        n_written += 1
         if on_well is not None:  # live consumer (plate viewer): render tile + push to ndviewer
             on_well(region, fov, image)
+        return levels
+
+    n_written = 0
+    n_levels = 1
+    n_writers = max(1, int(write_workers))
+    with ThreadPoolExecutor(max_workers=n_writers, thread_name_prefix="squidmip-write") as ex:
+        pending: set = set()
+        for region, fov, image in stream:
+            if stop is not None and stop():
+                break
+            pending.add(ex.submit(_write_one, region, fov, image))
+            if len(pending) >= n_writers:        # keep <= n_writers wells in flight (bounded memory)
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for f in done:
+                    n_levels = f.result()        # re-raises a writer-thread exception here
+                    n_written += 1
+        for f in pending:                         # drain the tail (and any in-flight after a stop)
+            n_levels = f.result()
+            n_written += 1
 
     return {
         "plate": str(plate_dir),
         "tiff": str(tiff_root) if tiff else None,
         "n_wells": len(wells),
         "n_fields_written": n_written,
+        "levels": n_levels,
     }
 
 
@@ -272,8 +363,11 @@ def write_plate(
     n_fovs: int = 1,
     workers: Optional[int] = None,
     projector: str = "mip",
-    tiff: bool = True,
+    tiff: bool = False,
     on_well=None,
+    write_workers: int = _WRITE_WORKERS,
+    stop=None,
+    on_error=None,
 ) -> dict:
     """Project a plate (IMA-188) and write the canonical OME-zarr + individual TIFFs.
 
@@ -289,7 +383,10 @@ def write_plate(
     n_fovs, workers, projector:
         Passed straight to :func:`squidmip.project_plate`.
     tiff:
-        Also write the individual per-plane TIFF export (default True).
+        Also write the individual per-plane TIFF export (default False — opt in). This is a SECOND,
+        UNCOMPRESSED copy of the output in Squid's ``{region}_{fov}_0_{channel}.tiff`` filename
+        convention (You Yan's "individual tiff output"), for tools that read Squid TIFFs directly and
+        can't open OME-Zarr. It roughly DOUBLES on-disk size, so it's off unless a caller asks for it.
 
     Returns
     -------
@@ -297,5 +394,6 @@ def write_plate(
         Manifest: output paths, well/field counts, pyramid level count.
     """
     metadata = reader.metadata
-    stream = project_plate(reader, n_fovs=n_fovs, workers=workers, projector=projector)
-    return write_from_stream(metadata, stream, out_dir, n_fovs=n_fovs, tiff=tiff, on_well=on_well)
+    stream = project_plate(reader, n_fovs=n_fovs, workers=workers, projector=projector, on_error=on_error)
+    return write_from_stream(metadata, stream, out_dir, n_fovs=n_fovs, tiff=tiff, on_well=on_well,
+                             write_workers=write_workers, stop=stop)
