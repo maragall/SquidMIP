@@ -97,10 +97,14 @@ def open_reader(path) -> "SquidReader":
         raise NotImplementedError(
             f"{path!s} is not a directory. Point open_reader at a Squid acquisition folder."
         )
-    if (path / "ome_tiff").is_dir():
+    ome = path / "ome_tiff"
+    # Only OME-TIFF if that folder actually CONTAINS .ome.tiff files. Squid often leaves an EMPTY
+    # ome_tiff/ placeholder next to an individual-TIFF acquisition — an empty (or file-less) one must
+    # NOT block the individual-TIFF reader (that spurious empty folder was rejecting real data).
+    if ome.is_dir() and any(ome.rglob("*.ome.tif*")):
         raise NotImplementedError(
-            "OME-TIFF tiles layout detected (ome_tiff/). Not implemented in IMA-189 "
-            "(individual TIFFs only); this is the format-dispatch seam for a future reader."
+            "OME-TIFF acquisition detected (ome_tiff/ contains .ome.tiff files). Not implemented yet "
+            "— this build reads Squid individual TIFFs. Send Julio a sample and it'll be added."
         )
     if (path / "zarr.json").exists() or any(path.glob("*.zarr")):
         raise NotImplementedError(
