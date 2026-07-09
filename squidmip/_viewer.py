@@ -62,6 +62,7 @@ from squidmip._montage import _area_downsample, _hex_to_rgb01, _window
 from squidmip._output import parse_well_id
 
 _CELL = 88                 # per-well px in the low-res overview (1536wp -> ~4224x2816)
+_PUSH_PX = 512             # per-well px pushed to the ndviewer scan-slider (downsampled -> bounded RAM)
 _HDR, _COLH = 46, 30       # left / top label margins (px)
 _PAD = 16                  # breathing room around the plate
 _VIEWER_WORKERS = min(6, _default_workers())   # adapt to the machine, but CAP at 6: the producer's
@@ -501,6 +502,7 @@ class _OperatorWorker(QThread):
     finalReady = pyqtSignal(object)                 # final global-contrast montage (H, W, 3) uint8
     writtenReady = pyqtSignal(str)                  # path of the written plate.ome.zarr
     wellFailed = pyqtSignal(int, int)               # (ri, ci) of a well SKIPPED on a read error
+    pushReady = pyqtSignal(int, object)             # (fov_idx, [per-channel ~512px plane]) for the slider
     failed = pyqtSignal(str)                        # whole-run failure (not a per-well skip)
     finished_ok = pyqtSignal()
 
@@ -542,6 +544,11 @@ class _OperatorWorker(QThread):
             done = self._done
         self.tileReady.emit(ri, ci, well_id, (np.clip(rgb, 0, 1) * 255).astype(np.uint8))
         self.progress.emit(done, len(self._meta["regions"]))
+        # feed the ndviewer growing slider: one ~512px plane per channel, in memory (register_array),
+        # so scrubbing the processed wells is instant and z-collapsed (nz=1). Downsampled -> bounded.
+        push = [_area_downsample(well[c_i], _PUSH_PX, _PUSH_PX).astype(self._dtype)
+                for c_i in range(len(self._channels))]
+        self.pushReady.emit(info["idx"], push)
 
     def _on_error(self, region, fov, exc):
         """A well's projection failed (corrupt/missing plane): SKIP it, mark its dot failed, keep the
@@ -663,6 +670,7 @@ class PlateWindow(QMainWindow):
         self._op_stack = OperationStack()   # the toggleable layer stack (base + applied operators)
         self._active_op_key = None    # operator whose tiles are streaming into its layer right now
         self._layers_tab = None       # the Layers tab widget, once opened
+        self._order = []              # well order = the detail's FOV-slider order
         self._op_tabs = {}            # key -> operator-UI widget currently open as a tab in _left_tabs
 
         # THREE-PANE layout. Tabs live ONLY inside the top-left pane (their bar sits at the pane's top,
@@ -1127,6 +1135,7 @@ class PlateWindow(QMainWindow):
             self._fov_index[region] = {"idx": idx, "well_id": region, "rc": rc}
             wells[rc] = region
 
+        self._order = order                          # well order = the detail's FOV-slider order
         self._overview = PlateOverview(rows, cols, wells)
         self._overview.hovered.connect(self._on_hover)
         self._overview.wellActivated.connect(self.activate_well)
@@ -1190,9 +1199,15 @@ class PlateWindow(QMainWindow):
         self._op_stack.add(key, label)                       # push the operator layer onto the stack
         self._overview.set_active_layer(key)                 # show it
         self._refresh_layers_tab()
+        # switch the detail to processed mode: z collapsed (nz=1 -> ndv drops the z-slider), frames at
+        # the push size, same well order. Each computed well is pushed into the growing slider below.
+        if self._detail is not None:
+            self._detail.start_acquisition([c["name"] for c in self._meta["channels"]], 1,
+                                           _PUSH_PX, _PUSH_PX, [f"{r}:0" for r in self._order])
         self._worker = _OperatorWorker(key, self._reader, self._meta, self._fov_index,
                                        self._overview._nr, self._overview._nc, str(out_dir))
         self._worker.tileReady.connect(self._on_tile)
+        self._worker.pushReady.connect(self._on_push)
         self._worker.progress.connect(
             lambda d, t: self._readout.setText(f"● {label} · {d}/{t} wells → {out_dir.name} (~{est_gb:.0f} GB)"))
         self._worker.finalReady.connect(self._set_final)
@@ -1240,6 +1255,18 @@ class PlateWindow(QMainWindow):
         self._overview.add_tile(ri, ci, well_id, rgb, layer=self._active_op_key or "raw")
         self._overview.set_status(ri, ci, "done")           # blue
 
+    def _on_push(self, fov_idx, planes):
+        """A computed well's ~512px channels -> the ndviewer growing slider (in-memory register_array,
+        LRU bounded). z collapsed (nz=1). No-op if the detail has no register_array (older ndv / stub)."""
+        if self._detail is None or not hasattr(self._detail, "register_array"):
+            return
+        channels = [c["name"] for c in self._meta["channels"]]
+        for c_i, plane in enumerate(planes):
+            try:
+                self._detail.register_array(0, fov_idx, 0, channels[c_i], plane)
+            except Exception:
+                pass   # one bad push must not break the run
+
     def _on_failed(self, msg):
         if self._overview is not None:
             for rc, state in list(self._overview._status.items()):
@@ -1263,14 +1290,22 @@ class PlateWindow(QMainWindow):
         self._plate_title.setText(f"{base}   ·   {text}" if text else base)
 
     def activate_well(self, well_id: str, fov_index: int):
-        """Double-click -> open the well's RAW z-stack in the embedded ndviewer. Registers the raw
-        TIFF paths lazily (once per well): the detail is the true z-stack, zero bytes copied."""
+        """Double-click -> show the well in the ndviewer. In RAW mode (no operator run yet) push the
+        well's raw z-stack lazily (the true z-stack, zero bytes copied). In PROCESSED mode (an operator
+        has run, the slider already holds the results) just navigate the slider to that well."""
         if self._detail is None or self._reader is None or well_id not in self._fov_index:
             return
         self._current_well = well_id
         if self._overview is not None:                 # current well at view = the red BOX
             self._overview.select(*self._fov_index[well_id]["rc"])
         idx = self._fov_index[well_id]["idx"]
+        if self._active_op_key is not None:            # processed mode: the result is already pushed
+            try:
+                row, col = parse_well_id(well_id)
+                self._detail.go_to_well_fov(f"{row}{col}", fov_index)
+            except Exception:
+                pass
+            return
         if well_id not in self._pushed:
             fov = self._meta["fovs_per_region"][well_id][0]
             for z_i, z in enumerate(self._meta["z_levels"]):
@@ -1305,7 +1340,7 @@ class PlateWindow(QMainWindow):
         alive until it actually finishes (stop() returns after the current item, which is bounded)."""
         if w is None:
             return
-        for name in ("tileReady", "progress", "finalReady", "writtenReady", "wellFailed", "failed", "finished_ok"):
+        for name in ("tileReady", "progress", "finalReady", "writtenReady", "wellFailed", "pushReady", "failed", "finished_ok"):
             sig = getattr(w, name, None)
             if sig is not None:
                 try:
