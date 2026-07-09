@@ -63,6 +63,7 @@ from squidmip._layers import OperationStack
 from squidmip._montage import _area_downsample, _hex_to_rgb01, _window
 from squidmip._output import parse_well_id
 
+_SUPPORTED_PLATES = ("384", "1536")   # well-plate formats the tool currently accepts (no stitching yet)
 _CELL = 88                 # per-well px in the low-res overview (1536wp -> ~4224x2816)
 _PUSH_PX = 512             # per-well px pushed to the ndviewer scan-slider (downsampled -> bounded RAM)
 _HDR, _COLH = 46, 30       # left / top label margins (px)
@@ -1395,8 +1396,8 @@ class PlateWindow(QMainWindow):
             self._drop.show()
             return
         fmt = str(meta.get("wellplate_format", ""))
-        if "1536" not in fmt:    # scope guard: 1536-well plates only for now (not a general product yet)
-            self._readout.setText(f"only 1536-well plates are supported right now — this is a {fmt or 'non-1536'}")
+        if not any(s in fmt for s in _SUPPORTED_PLATES):   # scope guard: supported formats only
+            self._readout.setText(f"only 384- and 1536-well plates are supported right now — this is a {fmt or 'other'}")
             self._drop.show()
             return
         self._reader, self._meta = reader, meta

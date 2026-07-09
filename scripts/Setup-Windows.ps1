@@ -49,7 +49,9 @@ if (-not (Test-Path $vpy)) {
 # 3. Install the app + GUI deps. First run downloads a few packages.
 Write-Host "Installing the MIP tool and its dependencies (first time takes a few minutes) ..."
 & $vpy -m pip install --upgrade pip
-& $vpy -m pip install ($repo + "[gui]")
+# EDITABLE install of the app: after this, a `git pull` in the repo takes effect on the next launch
+# with no reinstall (only the pinned deps below are a fixed snapshot).
+& $vpy -m pip install -e ($repo + "[gui]")
 if ($LASTEXITCODE -ne 0) {
     Die "pip install failed (see the errors above). This usually means a package has no wheel for this Python version; tell Julio the error and we'll pin a version."
 }
