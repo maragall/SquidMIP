@@ -52,7 +52,7 @@ objective:
   magnification: 20.0
   sensor_pixel_size_um: 3.76
 sample:
-  wellplate_format: 24 well plate
+  wellplate_format: 1536 well plate
 z_stack:
   nz: 2
   delta_z_mm: 0.0015

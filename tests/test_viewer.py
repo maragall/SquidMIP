@@ -152,7 +152,7 @@ def test_ingest_readable_non_wellplate_reports_not_crashes(qapp, stub_detail, tm
         "  camera_settings:\n    '1':\n      display_color: '#FF0000'\n      exposure_time_ms: 50.0\n")
     (root / "acquisition.yaml").write_text(
         "objective:\n  pixel_size_um: 0.325\n  magnification: 20.0\n  sensor_pixel_size_um: 3.76\n"
-        "sample:\n  wellplate_format: 24 well plate\nz_stack:\n  nz: 2\n  delta_z_mm: 0.0015\n"
+        "sample:\n  wellplate_format: 1536 well plate\nz_stack:\n  nz: 2\n  delta_z_mm: 0.0015\n"
         "time_series:\n  nt: 1\n")
 
     win = V.PlateWindow(None)

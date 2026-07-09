@@ -23,7 +23,7 @@ def test_metadata_discovery(squid_dataset):
     # 0.325 is the stored acquisition.yaml value, NOT the recomputed 3.76/20=0.188 -> proves
     # we read the authoritative pixel size rather than recomputing it.
     assert meta["pixel_size_um"] == 0.325
-    assert meta["wellplate_format"] == "24 well plate"
+    assert meta["wellplate_format"] == "1536 well plate"
 
 
 def test_metadata_no_dead_attributes(squid_dataset):

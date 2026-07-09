@@ -319,12 +319,6 @@ _OPERATIONS = (
     Operation("mip", "Maximum Intensity Projection",
               "Collapse each well's z-stack to one max-intensity image; save a navigable OME-Zarr plate.",
               "_build_mip_tab"),
-    Operation("reference", "Reference plane",
-              "Pick each well's sharpest z-plane (Tenengrad autofocus); save a navigable OME-Zarr plate.",
-              "_build_reference_tab"),
-    Operation("record", "Record z-stack",
-              "Save raw z-stacks to disk as multi-page TIFFs — no FIJI round-trip.",
-              "_build_record_tab"),
 )
 _OPERATIONS_BY_KEY = {op.key: op for op in _OPERATIONS}
 
@@ -855,42 +849,57 @@ class _PreviewWorker(QThread):
             pass   # preview is best-effort; the operator run is the authoritative result
 
 
-class _RecordWorker(QThread):
-    """Encodes each well's .mp4 on a BACKGROUND thread so the GUI never freezes during an export.
+class _ComputedPlateWorker(QThread):
+    """Read a previously-written OME-Zarr plate back into the viewer (no recompute).
 
-    imageio/ffmpeg encoding is CPU-bound; running it on the GUI thread (with processEvents only
-    BETWEEN wells) froze the window for the whole of each well's encode — the exact bug this fixes.
-    One movie per well, streamed frame-by-frame (bounded to one frame in RAM). Post-acquisition: it
-    reads existing frames off disk. Stops cleanly between wells when the window closes / re-opens.
-    """
+    Streams each well from disk: a coarse pyramid level -> the plate thumbnail, and a ~512px level ->
+    the ndviewer slider (register_array). Bounded (one well in flight); reads via tensorstore off the
+    GUI thread so opening a big computed plate never freezes the window."""
 
-    progress = pyqtSignal(int, int, str)   # (done, total, well just written)
-    finished_ok = pyqtSignal(int, str)     # (count written, output dir)
+    tileReady = pyqtSignal(int, int, str, object)   # (ri, ci, well_id, rgb tile)
+    pushReady = pyqtSignal(int, object)             # (fov_idx, [per-channel ~512px plane])
+    progress = pyqtSignal(int, int)
+    finished_ok = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def __init__(self, reader, meta, wells: list, out: str, fps: int, record_z: bool):
+    def __init__(self, base, wells, colors, coarse_lvl, push_lvl, dtype):
         super().__init__()
-        self._reader, self._meta = reader, meta
-        self._wells, self._out, self._fps, self._record_z = list(wells), out, fps, record_z
+        self._base = base                 # plate.ome.zarr path
+        self._wells = wells               # [(well_id, wellpath, fov, ri, ci, flat_idx)]
+        self._colors = colors             # (C, 3) float RGB
+        self._coarse, self._push = coarse_lvl, push_lvl
+        self._dtype = dtype
         self._stop = threading.Event()
 
     def stop(self):
         self._stop.set()
 
+    def _read(self, wellpath, fov, level):
+        import tensorstore as ts
+        path = f"{self._base}/{wellpath}/{fov}/{level}"
+        arr = ts.open({"driver": "zarr3", "kvstore": {"driver": "file", "path": path}}).result()
+        return np.asarray(arr[0, :, 0].read().result())   # (C, y, x) at t=0, z=0
+
     def run(self):
         try:
-            from squidmip._video import default_axis, well_movie_frames, write_mp4
-            axis = default_axis(self._meta, self._record_z)
             n = len(self._wells)
-            for i, well in enumerate(self._wells, 1):
+            for i, (wid, wpath, fov, ri, ci, idx) in enumerate(self._wells, 1):
                 if self._stop.is_set():
                     return
-                fov = self._meta["fovs_per_region"][well][0]
-                write_mp4(well_movie_frames(self._reader, well, fov, axis=axis),
-                          Path(self._out) / f"{well}.mp4", self._fps)
-                self.progress.emit(i, n, well)
+                coarse = self._read(wpath, fov, self._coarse)             # thumbnail source (C,y,x)
+                rgb = np.zeros((_CELL, _CELL, 3), np.float32)
+                for c_i, plane in enumerate(coarse):
+                    ds = _fit_cell(plane.astype(np.float32))
+                    lo, hi = float(np.percentile(ds, 1.0)), float(np.percentile(ds, 99.8))
+                    rgb += _window(ds, lo, hi if hi > lo else lo + 1)[:, :, None] * self._colors[c_i][None, None, :]
+                self.tileReady.emit(ri, ci, wid, (np.clip(rgb, 0, 1) * 255).astype(np.uint8))
+                push_src = self._read(wpath, fov, self._push)             # detail-slider source (C,Y,X)
+                push = [_area_downsample(push_src[c], _PUSH_PX, _PUSH_PX).astype(self._dtype)
+                        for c in range(push_src.shape[0])]
+                self.pushReady.emit(idx, push)
+                self.progress.emit(i, n)
             if not self._stop.is_set():
-                self.finished_ok.emit(n, str(self._out))
+                self.finished_ok.emit()
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
 
@@ -904,7 +913,6 @@ class PlateWindow(QMainWindow):
         self.resize(1600, 950)
         self._worker = None           # the operator (MIP) run
         self._preview = None          # the raw preview fill on open
-        self._rec_worker = None       # the video (.mp4) export run — off the GUI thread
         self._retired = []            # workers asked to stop; kept alive until they actually finish
         self._overview = None
         self._reader = None
@@ -1005,7 +1013,21 @@ class PlateWindow(QMainWindow):
         rfl = QVBoxLayout(right_frame)
         rfl.setContentsMargins(1, 1, 1, 1)
         rfl.setSpacing(0)
-        rfl.addWidget(self._right_widget)
+        rfl.addWidget(self._right_widget, 1)
+        # A small control bar UNDER the detail viewer (below its FOV slider): "focus reference plane"
+        # jumps the z-slider to the current FOV's sharpest plane (Tenengrad) — a per-FOV autofocus, not
+        # a plate-wide save.
+        detail_bar = QWidget()
+        detail_bar.setStyleSheet(f"background:{_BG};")
+        dbl = QHBoxLayout(detail_bar)
+        dbl.setContentsMargins(8, 5, 8, 5)
+        self._focus_btn = QPushButton("⊚  Focus reference plane")
+        self._focus_btn.setStyleSheet(_BTN_QSS)
+        self._focus_btn.setToolTip("Jump the z-slider to the sharpest plane of the FOV in view")
+        self._focus_btn.clicked.connect(self._focus_reference_plane)
+        dbl.addWidget(self._focus_btn)
+        dbl.addStretch(1)
+        rfl.addWidget(detail_bar)
 
         outer = QSplitter(Qt.Horizontal)
         outer.setStyleSheet("QSplitter::handle{background:#232b3a;width:1px;}")
@@ -1075,18 +1097,22 @@ class PlateWindow(QMainWindow):
         scroll.setWidget(stack)
         v.addWidget(scroll, 1)
 
+        open_btn = QPushButton("📂  Open a computed MIP…")  # load a previously written .hcs plate
+        open_btn.setStyleSheet(_BTN_QSS)
+        open_btn.clicked.connect(self._open_computed)
+        v.addWidget(open_btn)
         raw_btn = QPushButton("⟲  Return to raw view")     # stop previewing -> restore raw downsampled plate
         raw_btn.setStyleSheet(_BTN_QSS)
         raw_btn.clicked.connect(self._return_to_raw)
         v.addWidget(raw_btn)
+        cli_btn = QPushButton("⌨  Open CLI")               # opens a CLI tab within this pane (ABOVE Layers)
+        cli_btn.setStyleSheet(_BTN_QSS)
+        cli_btn.clicked.connect(lambda: self._open_op_tab("cli", "CLI", self._build_cli_tab))
+        v.addWidget(cli_btn)
         layers_btn = QPushButton("▤  Layers")              # toggle/reorder applied operation layers
         layers_btn.setStyleSheet(_BTN_QSS)
         layers_btn.clicked.connect(lambda: self._open_op_tab("layers", "Layers", self._build_layers_tab))
         v.addWidget(layers_btn)
-        cli_btn = QPushButton("⌨  Open CLI")               # opens a CLI tab within this pane
-        cli_btn.setStyleSheet(_BTN_QSS)
-        cli_btn.clicked.connect(lambda: self._open_op_tab("cli", "CLI", self._build_cli_tab))
-        v.addWidget(cli_btn)
         return pane
 
     # -- operator UIs live as tabs INSIDE the top-left pane (home tab + one per opened operator) ----
@@ -1140,13 +1166,10 @@ class PlateWindow(QMainWindow):
     def _build_mip_tab(self) -> QWidget:
         return self._build_run_tab(_OPERATIONS_BY_KEY["mip"])
 
-    def _build_reference_tab(self) -> QWidget:
-        return self._build_run_tab(_OPERATIONS_BY_KEY["reference"])
-
     def _build_run_tab(self, op) -> QWidget:
-        """Generic projector-operator tab (MIP, Reference plane, …): pick a destination, run over the
-        whole plate → a navigable OME-Zarr plate. ONE builder for every z-reduction operator — a new
-        one needs no new tab code. Per-tab state lives in a closure (no per-operator instance attrs)."""
+        """Generic projector-operator tab (MIP, …): pick a destination, run over the whole plate → a
+        navigable OME-Zarr plate. ONE builder for every z-reduction operator — a new one needs no new
+        tab code. Per-tab state lives in a closure (no per-operator instance attrs)."""
         w, v = self._op_tab_shell(op.label, op.blurb + " Pick a destination with room — output can be large.")
         state = {"dir": None}
         dir_lbl = QLabel("(no folder chosen)"); dir_lbl.setWordWrap(True)
@@ -1200,94 +1223,6 @@ class PlateWindow(QMainWindow):
         for b in (run, prev):
             b.setEnabled(self._reader is not None)
         return w
-
-    def _build_record_tab(self) -> QWidget:
-        axis = "time-lapse (T)" if (self._meta and self._meta.get("n_t", 1) > 1) else "focus sweep (Z)"
-        w, v = self._op_tab_shell(
-            "Record video (.mp4)",
-            f"Assemble each well's {axis} into an .mp4 — post-acquisition, no FIJI. One movie per well.")
-        v.addWidget(QLabel("Scope"))
-        self._rec_scope = QComboBox(); self._rec_scope.setStyleSheet(_COMBO_QSS)
-        self._rec_scope.addItems(["Current well only", "Every well on the plate"])
-        v.addWidget(self._rec_scope)
-        v.addWidget(QLabel("Playback fps"))
-        self._rec_fps = QComboBox(); self._rec_fps.setStyleSheet(_COMBO_QSS)
-        self._rec_fps.addItems(["2", "5", "10", "15"]); self._rec_fps.setCurrentText("5")
-        v.addWidget(self._rec_fps)
-        self._rec_z = QCheckBox("Record Z focus sweep (instead of time)")  # opt-in; default T
-        self._rec_z.setStyleSheet(_CHECK_QSS)
-        v.addWidget(self._rec_z)
-        self._rec_dir = None
-        pick = QPushButton("Choose output folder…"); pick.setStyleSheet(_BTN_QSS)
-        pick.clicked.connect(self._pick_rec_dir)
-        v.addWidget(pick)
-        self._rec_dir_lbl = QLabel("(no folder chosen)"); self._rec_dir_lbl.setWordWrap(True)
-        self._rec_dir_lbl.setStyleSheet("color:#8b98ad;font-size:12px;")
-        v.addWidget(self._rec_dir_lbl)
-        self._rec_run = QPushButton("⏺  Record .mp4"); self._rec_run.setStyleSheet(_BTN_QSS)
-        self._rec_run.setEnabled(False); self._rec_run.clicked.connect(self._record_run)
-        v.addWidget(self._rec_run)
-        v.addStretch(1)
-        return w
-
-    def _pick_rec_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Save .mp4(s) to folder")
-        if d:
-            self._rec_dir = d; self._rec_dir_lbl.setText(d); self._rec_run.setEnabled(True)
-
-    def _record_run(self):
-        if self._reader is None or (self._rec_worker is not None and self._rec_worker.isRunning()):
-            return                                    # already recording — ignore re-click
-        if self._rec_scope.currentIndex() == 1:
-            wells = list(self._fov_index)
-        elif self._current_well is not None:
-            wells = [self._current_well]
-        else:
-            self._readout.setText("double-click a well first, or choose 'Every well on the plate'")
-            return
-        self._run_record(wells, self._rec_dir, int(self._rec_fps.currentText()),
-                         record_z=self._rec_z.isChecked())
-
-    def _run_record(self, wells, out, fps, record_z=False):
-        """Launch the .mp4 export on a background thread so the GUI stays responsive (the freeze fix).
-
-        The heavy per-well encode runs in _RecordWorker; here we just wire its signals to the status
-        line and disable the button for the duration. Inputs are passed by value to the worker, so a
-        re-drop that nulls self._reader mid-export can't corrupt an in-flight run."""
-        if self._reader is None:
-            return
-        self._stop_record()                            # never two exports at once
-        self._rec_button(False)
-        self._rec_worker = _RecordWorker(self._reader, self._meta, wells, out, fps, record_z)
-        self._rec_worker.progress.connect(
-            lambda i, n, well: self._readout.setText(f"● recording {i}/{n} · {well}.mp4 …"))
-        self._rec_worker.finished_ok.connect(
-            lambda n, d: (self._readout.setText(f"✓ recorded {n} .mp4(s) → {d}"), self._rec_button(True)))
-        self._rec_worker.failed.connect(
-            lambda msg: (self._readout.setText(f"record failed: {msg}"), self._rec_button(True)))
-        self._rec_worker.start()
-
-    def _rec_button(self, enabled: bool):
-        """Enable/disable the Record button if its tab is open (a no-op if it was never built)."""
-        btn = getattr(self, "_rec_run", None)
-        if btn is not None:
-            btn.setEnabled(enabled)
-
-    def _stop_record(self):
-        """Stop an in-flight export cleanly (it drops out between wells) and retire the thread."""
-        w = self._rec_worker
-        self._rec_worker = None
-        if w is None:
-            return
-        for name in ("progress", "finished_ok", "failed"):
-            try:
-                getattr(w, name).disconnect()
-            except TypeError:
-                pass
-        if w.isRunning():
-            w.stop()
-            self._retired.append(w)
-            w.finished.connect(lambda: self._retired.remove(w) if w in self._retired else None)
 
     def _build_layers_tab(self) -> QWidget:
         """The Layers tab: the OperationStack as a list of toggleable, reorderable layers. The topmost
@@ -1424,7 +1359,6 @@ class PlateWindow(QMainWindow):
         # stop any in-flight run/preview and clear prior state before opening a new acquisition
         self._stop_worker()
         self._stop_preview()
-        self._stop_record()
         self._reader = self._meta = None
         self._fov_index = {}
         self._pushed = set()
@@ -1442,6 +1376,11 @@ class PlateWindow(QMainWindow):
             meta = reader.metadata
         except Exception as e:   # not a Squid acquisition / unreadable -> report, don't crash the app
             self._readout.setText(f"not a readable Squid acquisition: {e}")
+            self._drop.show()
+            return
+        fmt = str(meta.get("wellplate_format", ""))
+        if "1536" not in fmt:    # scope guard: 1536-well plates only for now (not a general product yet)
+            self._readout.setText(f"only 1536-well plates are supported right now — this is a {fmt or 'non-1536'}")
             self._drop.show()
             return
         self._reader, self._meta = reader, meta
@@ -1555,6 +1494,90 @@ class PlateWindow(QMainWindow):
         self._refresh_layers_tab()
         self._setup_raw_detail()
         self._readout.setText("raw view")
+
+    def _open_computed(self):
+        """Open a previously-written .hcs plate (OME-Zarr) and VISUALISE it — no recompute.
+
+        Reads the plate/well/image OME metadata, lays out the plate, and streams each well from disk
+        (a coarse pyramid level -> plate thumbnail, a ~512px level -> the ndviewer slider). Read-only."""
+        import json
+        d = QFileDialog.getExistingDirectory(self, "Open a computed .hcs plate")
+        if not d:
+            return
+        base = Path(d)
+        zroot = base / "plate.ome.zarr"
+        if not (zroot / "zarr.json").exists():
+            zroot = base if (base / "zarr.json").exists() and base.name.endswith(".zarr") else zroot
+        if not (zroot / "zarr.json").exists():
+            self._readout.setText("not an .hcs plate — pick a folder containing plate.ome.zarr")
+            return
+        try:
+            plate = json.loads((zroot / "zarr.json").read_text())["attributes"]["ome"]["plate"]
+            rows = [r["name"] for r in plate["rows"]]
+            cols = [c["name"] for c in plate["columns"]]
+            wells_meta = sorted(plate["wells"], key=lambda w: (w["rowIndex"], w["columnIndex"]))
+            w0 = wells_meta[0]["path"]
+            fov0 = json.loads((zroot / w0 / "zarr.json").read_text())["attributes"]["ome"]["well"]["images"][0]["path"]
+            ome0 = json.loads((zroot / w0 / fov0 / "zarr.json").read_text())["attributes"]["ome"]
+            levels = [ds["path"] for ds in ome0["multiscales"][0]["datasets"]]
+            chans = ome0.get("omero", {}).get("channels", [])
+            channels = [{"name": c.get("label", f"ch{i}"), "display_color": "#" + c["color"].lstrip("#")}
+                        for i, c in enumerate(chans)]
+        except Exception as e:
+            self._readout.setText(f"could not read plate metadata: {e}")
+            return
+        if not channels:
+            self._readout.setText("plate has no channel metadata (omero) — cannot open")
+            return
+
+        self._stop_worker()
+        self._stop_preview()
+        self._acq_name, self._acq_path = base.name, base
+        self._processed_plate = str(zroot)
+        self._reader = None                       # a computed plate has no raw reader
+        self._meta = {"channels": channels, "z_levels": [0], "n_z": 1, "n_t": 1,
+                      "regions": [f"{rows[w['rowIndex']]}{cols[w['columnIndex']]}" for w in wells_meta]}
+        wells_rc, self._fov_index, self._order, worker_wells = {}, {}, [], []
+        for idx, w in enumerate(wells_meta):
+            ri, ci = w["rowIndex"], w["columnIndex"]
+            wid = f"{rows[ri]}{cols[ci]}"
+            wells_rc[(ri, ci)] = wid
+            self._fov_index[wid] = {"rc": (ri, ci), "idx": idx, "well_id": wid}
+            self._order.append(wid)
+            worker_wells.append((wid, w["path"], fov0, ri, ci, idx))
+
+        if self._overview is not None:
+            self._overview.setParent(None); self._overview.deleteLater()
+        self._overview = PlateOverview(rows, cols, wells_rc)
+        self._overview.hovered.connect(self._on_hover)
+        self._overview.wellActivated.connect(self.activate_well)
+        self._active_op_key = "computed"
+        self._plate_mode = "computed MIP"
+        self._plate_title.setText(f"{self._acq_name}   ·   computed MIP")
+        self._op_stack.reset(); self._op_stack.add("computed", "computed MIP")
+        self._overview.set_active_layer("computed")
+        self._refresh_layers_tab()
+        self._drop.hide()
+        self._left_l.addWidget(self._overview, 1)
+        self._enable_operators(False)             # no raw data -> operators stay disabled
+
+        if self._detail is not None:
+            self._detail.start_acquisition([c["name"] for c in channels], 1, _PUSH_PX, _PUSH_PX,
+                                           [f"{w}:0" for w in self._order])
+        colors = np.stack([_hex_to_rgb01(c["display_color"]) for c in channels])
+        coarse_lvl = levels[-1]                                   # coarsest -> tiny thumbnail
+        push_lvl = levels[min(3, len(levels) - 1)]                # ~512px level for the detail slider
+        self._worker = _ComputedPlateWorker(str(zroot), worker_wells, colors, coarse_lvl, push_lvl,
+                                            np.uint16)
+        self._worker.tileReady.connect(self._on_tile)
+        self._worker.pushReady.connect(self._on_push)
+        self._worker.progress.connect(
+            lambda i, n: self._readout.setText(f"● loading computed plate · {i}/{n} wells"))
+        self._worker.failed.connect(self._on_failed)
+        self._worker.finished_ok.connect(
+            lambda: self._readout.setText(f"✓ computed MIP · {len(self._order)} wells (read-only)"))
+        self._readout.setText(f"loading computed plate · {len(self._order)} wells …")
+        self._worker.start()
 
     # -- run a post-processing operator over the whole plate (persists a navigable OME-Zarr plate) --
     def run_operator(self, key: str, out_parent: Optional[str] = None,
@@ -1698,13 +1721,13 @@ class PlateWindow(QMainWindow):
         """Double-click -> show the well in the ndviewer. In RAW mode (no operator run yet) push the
         well's raw z-stack lazily (the true z-stack, zero bytes copied). In PROCESSED mode (an operator
         has run, the slider already holds the results) just navigate the slider to that well."""
-        if self._detail is None or self._reader is None or well_id not in self._fov_index:
+        if self._detail is None or well_id not in self._fov_index:
             return
         self._current_well = well_id
         if self._overview is not None:                 # current well at view = the red BOX
             self._overview.select(*self._fov_index[well_id]["rc"])
         idx = self._fov_index[well_id]["idx"]
-        if self._active_op_key is not None:            # processed mode: the result is already pushed
+        if self._active_op_key is not None or self._reader is None:   # processed/computed: already pushed
             try:
                 row, col = parse_well_id(well_id)
                 self._detail.go_to_well_fov(f"{row}{col}", fov_index)
@@ -1738,6 +1761,35 @@ class PlateWindow(QMainWindow):
         if info:
             self._overview.select(*info["rc"])
 
+    def _focus_reference_plane(self):
+        """Jump the detail viewer's z-slider to the CURRENT FOV's sharpest plane (Tenengrad autofocus).
+
+        Per-FOV, on demand — nothing is saved. Ranks focus on downsampled planes so it stays snappy.
+        This is the reference-plane feature in the viewer (not a plate-wide save operator)."""
+        if self._reader is None or self._current_well is None or self._detail is None:
+            self._readout.setText("double-click a well first, then focus its reference plane")
+            return
+        if not hasattr(self._detail, "set_current_index"):
+            return
+        from squidmip.projection import _tenengrad
+        well = self._current_well
+        fov = self._meta["fovs_per_region"][well][0]
+        chan = self._meta["channels"][0]["name"]        # rank on one representative channel
+        best_z_i, best_f = 0, -1.0
+        for z_i, z in enumerate(self._meta["z_levels"]):
+            try:
+                plane = self._reader.read(well, fov, chan, z)
+            except Exception:
+                continue
+            f = _tenengrad(_area_downsample(plane, 512, 512).astype(np.float32))  # downsample = fast
+            if f > best_f:
+                best_f, best_z_i = f, z_i
+        try:
+            self._detail.set_current_index("z_level", best_z_i)
+        except Exception:
+            pass
+        self._readout.setText(f"{well}: focused on reference plane z={best_z_i} (sharpest)")
+
     def _retire(self, w):
         """Retire a worker thread WITHOUT ever destroying a running QThread (that aborts the app).
         Disconnect its signals first so a tile already queued before the stop can't paint onto a
@@ -1768,7 +1820,6 @@ class PlateWindow(QMainWindow):
     def closeEvent(self, e):
         self._stop_worker()          # stop the run cleanly; nothing on disk to clean up (no cache)
         self._stop_preview()
-        self._stop_record()          # stop an in-flight video export
         for w in list(self._op_tabs.values()):
             if hasattr(w, "shutdown"):
                 w.shutdown()         # kill any live embedded terminal's shell

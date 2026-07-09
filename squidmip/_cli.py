@@ -92,6 +92,10 @@ def run(params: ProcessParameters) -> dict:
     from squidmip import open_reader, write_plate
 
     reader = open_reader(params.input_folder)
+    # Scope guard: 1536-well plates only for now (not a general product yet). Fail loud, before any write.
+    fmt = str(reader.metadata.get("wellplate_format", ""))
+    if "1536" not in fmt:
+        raise SystemExit(f"squidmip currently supports 1536-well plates only (got {fmt or 'unknown'!r}).")
     # Multi-FOV policy (IMA-191): current scope is one FOV per well; sample the first and warn.
     fpr = reader.metadata["fovs_per_region"]
     multi = sum(1 for r in fpr if len(fpr[r]) > 1)
