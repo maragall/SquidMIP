@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import Qt, QSocketNotifier, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QProcess, QProcessEnvironment, QSocketNotifier, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPalette, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
@@ -204,6 +204,8 @@ class _Terminal(QWidget):
         env = dict(os.environ)
         env["TERM"] = "dumb"        # minimise escape sequences; still a real interactive shell
         env["PS1"] = "$ "
+        # put the venv's Scripts/bin on PATH so the `squidmip` console script resolves directly.
+        env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
         try:
             self._pid, self._fd = pty.fork()
         except Exception as e:      # no PTY (e.g. Windows) — degrade to a disabled, informative pane
@@ -296,6 +298,95 @@ class _Terminal(QWidget):
             except OSError:
                 pass
             self._fd = None
+
+    def closeEvent(self, e):
+        self.shutdown()
+        super().closeEvent(e)
+
+
+class _ProcTerminal(QWidget):
+    """An interactive shell in the pane via QProcess — works on Windows (cmd.exe) AND Unix ($SHELL),
+    no PTY needed. Type a command, it runs, output streams back. Not a full VT100 (pipes don't echo,
+    so we echo the typed line ourselves), but `squidmip …` and any command work. `squidmip` is aliased
+    to this app's interpreter. Used where a PTY is unavailable (i.e. on Windows)."""
+
+    def __init__(self, cwd, banner: list, setup_cmds: list, parent=None):
+        super().__init__(parent)
+        self._nl = "\r\n" if sys.platform == "win32" else "\n"
+        self._history: list[str] = []
+        self._hpos = 0
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        self._out = QPlainTextEdit()
+        self._out.setReadOnly(True)
+        self._out.setMaximumBlockCount(4000)
+        self._out.setStyleSheet(_TERM_QSS)
+        v.addWidget(self._out, 1)
+        row = QWidget()
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(8, 6, 8, 8)
+        rl.setSpacing(6)
+        tag = QLabel("$")
+        tag.setStyleSheet("color:#58a6ff;font-weight:800;font-family:'SF Mono','Menlo',monospace;")
+        self._in = _CmdEdit(self)
+        self._in.setStyleSheet(
+            "QLineEdit{background:#05070b;color:#e6edf3;border:1px solid #232b3a;border-radius:6px;"
+            "padding:6px 8px;font-family:'SF Mono','Menlo',monospace;font-size:12px;}")
+        self._in.setPlaceholderText("type a command and press Enter  (e.g. squidmip … --tiff)")
+        self._in.returnPressed.connect(self._send)
+        rl.addWidget(tag)
+        rl.addWidget(self._in, 1)
+        v.addWidget(row)
+
+        self._proc = QProcess(self)
+        self._proc.setProcessChannelMode(QProcess.MergedChannels)
+        self._proc.readyRead.connect(self._read)
+        self._proc.finished.connect(lambda *a: self._append("\n[shell exited]\n"))
+        # put the venv's Scripts/bin on PATH so the `squidmip` console script resolves directly.
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PATH", os.path.dirname(sys.executable) + os.pathsep + env.value("PATH"))
+        self._proc.setProcessEnvironment(env)
+        if cwd and os.path.isdir(cwd):
+            self._proc.setWorkingDirectory(cwd)
+        shell = "cmd.exe" if sys.platform == "win32" else os.environ.get("SHELL", "/bin/sh")
+        self._proc.start(shell, [])
+        self._proc.waitForStarted(3000)
+        self._append("\n".join(banner) + "\n")
+        for c in setup_cmds:            # e.g. the squidmip alias/doskey — run silently
+            self._write(c)
+
+    def running(self) -> bool:
+        return self._proc.state() != QProcess.NotRunning
+
+    def _read(self):
+        data = bytes(self._proc.readAll())
+        self._append(_ANSI_RE.sub("", data.decode(errors="replace")).replace("\r", ""))
+
+    def _append(self, text: str):
+        cur = self._out.textCursor()
+        cur.movePosition(cur.End)
+        cur.insertText(text)
+        self._out.setTextCursor(cur)
+        self._out.ensureCursorVisible()
+
+    def _write(self, s: str):
+        if self.running():
+            self._proc.write((s + self._nl).encode())
+
+    def _send(self):
+        cmd = self._in.text()
+        self._in.clear()
+        if cmd.strip():
+            self._history.append(cmd)
+        self._hpos = len(self._history)
+        self._append("> " + cmd + "\n")   # pipes don't echo input, so show it ourselves
+        self._write(cmd)
+
+    def shutdown(self):
+        if self.running():
+            self._proc.kill()
+            self._proc.waitForFinished(1500)
 
     def closeEvent(self, e):
         self.shutdown()
@@ -1293,54 +1384,57 @@ class PlateWindow(QMainWindow):
         Pre-seeded with the how-to (MIP every well; `--tiff` -> FIJI-openable TIFFs). `squidmip` is
         aliased to this app's interpreter so it runs regardless of PATH/conda. Falls back to a static
         command preview where a PTY isn't available (e.g. Windows)."""
-        acq = str(self._acq_path) if self._acq_path else "your acquisition folder"
+        # Input must be a RAW acquisition folder; if the current path is a computed .hcs plate (or
+        # none), show a placeholder rather than a wrong path.
+        p = str(self._acq_path) if self._acq_path else ""
+        acq = p if (p and ".hcs" not in p and not p.endswith(".ome.zarr")) else "<your acquisition folder>"
         py = sys.executable
+        win = sys.platform == "win32"
         banner = [
-            "══════════════════════════════════════════════════════════",
+            "==========================================================",
             "  Process a whole plate from the command line",
-            "══════════════════════════════════════════════════════════",
+            "==========================================================",
             "",
-            "  This runs the same MIP as the buttons, on every well, and saves the",
-            "  result. Just copy a line below and press Enter.",
+            "  Same MIP as the buttons, on every well. Copy a line and press Enter.",
             "",
-            "  ▸ Flatten every well and save it (also saves TIFFs you can open in FIJI):",
-            f'      squidmip "{acq}" --tiff',
+            "  - Flatten every well + save FIJI-openable TIFFs:",
+            f'      python -m squidmip "{acq}" --tiff',
             "",
-            "  ▸ Try it on just the first 8 wells first (quick, uses little disk):",
-            f'      squidmip "{acq}" --limit 8 --tiff',
+            "  - Try just the first 8 wells first (quick, little disk):",
+            f'      python -m squidmip "{acq}" --limit 8 --tiff',
             "",
-            "  ▸ Choose where to save (e.g. your Downloads folder):",
-            f'      squidmip "{acq}" --limit 8 --tiff --output-folder ~/Downloads',
+            "  - Choose where to save:",
+            f'      python -m squidmip "{acq}" --limit 8 --tiff --output-folder ~/Downloads',
             "",
-            "  ▸ See all options:",
-            "      squidmip --help",
-            "",
-            "  ── To run this in your OWN Terminal (outside this app) ──",
-            "  Open Terminal (Applications ▸ Utilities ▸ Terminal), then paste:",
-            "      conda activate ndviewer_light",
-            f'      {py} -m squidmip "{acq}" --limit 8 --tiff --output-folder ~/Downloads',
+            "  - All options:   python -m squidmip --help",
             "",
         ]
-        # `squidmip` is aliased to this app's interpreter so it runs regardless of PATH/conda. The
-        # banner is DISPLAY text (printed straight to the pane); only the alias runs in the shell.
-        setup = [f"alias squidmip='{sys.executable} -m squidmip'"]
+        # The terminals put the venv's Scripts/bin on PATH, so the `squidmip` console script resolves
+        # directly — no alias needed (doskey is unreliable in a piped cmd.exe anyway).
+        setup: list = []
         cwd = str(self._acq_path.parent) if self._acq_path else str(Path.home())
-        try:
-            t = _Terminal(cwd, banner, setup_cmds=setup)
-            if t._fd is not None:                # PTY came up — use the live terminal
+        if not win:                              # Unix: a real PTY terminal
+            try:
+                t = _Terminal(cwd, banner, setup_cmds=setup)
+                if t._fd is not None:
+                    return t
+            except Exception:
+                pass
+        try:                                     # Windows (+ Unix fallback): a QProcess shell
+            t = _ProcTerminal(cwd, banner, setup)
+            if t.running():
                 return t
         except Exception:
             pass
-        term = QPlainTextEdit(); term.setReadOnly(True)   # fallback: static command preview
+        term = QPlainTextEdit(); term.setReadOnly(True)   # last resort: static, copy-paste preview
         term.setStyleSheet(_TERM_QSS)
         term.setPlainText(
             "Process a whole plate from the command line\n"
             "──────────────────────────────\n"
-            "Open your Terminal, then paste:\n\n"
-            "    conda activate ndviewer_light\n"
-            f'    {py} -m squidmip "{acq}" --limit 8 --tiff --output-folder ~/Downloads\n\n'
+            "Open a terminal, then paste (no conda needed — this is the app's own Python):\n\n"
+            f'    "{py}" -m squidmip "{acq}" --limit 8 --tiff --output-folder ~/Downloads\n\n'
             "This flattens the first 8 wells (MIP) and saves TIFFs you can open in FIJI.\n"
-            "Drop --limit 8 to do the whole plate. Run with --help to see all options.\n")
+            "Drop --limit 8 to do the whole plate. Add --help to see all options.\n")
         return term
 
     def _enable_operators(self, flag: bool):
