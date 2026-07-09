@@ -987,7 +987,7 @@ class PlateWindow(QMainWindow):
             "color:#e6edf3;font-size:17px;font-weight:800;padding:9px 14px;"
             "background:#0b0e14;border-bottom:1px solid #232b3a;")
         self._drop = QLabel("Drop a Squid acquisition folder here\n\n"
-                            "then pick an operator in  Process wells ▸")
+                            "then pick an operator in  Process wells")
         self._drop.setAlignment(Qt.AlignCenter)
         self._drop.setStyleSheet("color:#8b98ad;font-size:16px;border:2px dashed #232b3a;border-radius:12px;margin:24px;")
         plate_host = QWidget()
@@ -1183,7 +1183,7 @@ class PlateWindow(QMainWindow):
                 return
             state["dir"] = d
             ok, est_gb, _ = self._check_disk(Path(d) / f"{self._acq_name}.hcs")
-            dir_lbl.setText(f"{d}\n~{est_gb:.0f} GB needed" + ("" if ok else "  ⚠ not enough free space"))
+            dir_lbl.setText(f"{d}\n~{est_gb:.0f} GB needed" + ("" if ok else "  (not enough free space)"))
             run.setEnabled(True)
 
         pick_btn = QPushButton("Choose output folder…"); pick_btn.setStyleSheet(_BTN_QSS)
@@ -1513,6 +1513,12 @@ class PlateWindow(QMainWindow):
             self._overview.set_status(*rc, "empty")
         self._refresh_layers_tab()
         self._setup_raw_detail()
+        # resume the raw thumbnail fill — the operator run stopped the preview partway, so re-run it to
+        # finish downsampling every well's raw tile (idempotent: it just re-renders the raw layer).
+        self._stop_preview()
+        self._preview = _PreviewWorker(self._reader, self._meta, self._fov_index, self._order)
+        self._preview.tileReady.connect(self._on_preview_tile)
+        self._preview.start()
         self._readout.setText("raw view")
 
     def _open_computed(self):
@@ -1594,7 +1600,7 @@ class PlateWindow(QMainWindow):
         self._worker.tileReady.connect(self._on_tile)
         self._worker.pushReady.connect(self._on_push)
         self._worker.progress.connect(
-            lambda i, n: self._readout.setText(f"● loading computed plate · {i}/{n} wells"))
+            lambda i, n: self._readout.setText(f"loading computed plate — {i}/{n} wells"))
         self._worker.failed.connect(self._on_failed)
         self._worker.finished_ok.connect(
             lambda: self._readout.setText(f"✓ computed MIP · {len(self._order)} wells (read-only)"))
