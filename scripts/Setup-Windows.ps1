@@ -13,12 +13,15 @@ $AppName = "MIP tool"
 $Module  = "squidmip._viewer"
 $repo = Split-Path $PSScriptRoot -Parent
 
-# 1. Find Python. Prefer 3.11 (what this app is validated on) via the 'py' launcher, then any py -3,
-#    then 'python' on PATH.
+# 1. Find Python. Prefer a KNOWN-GOOD version (3.11 validated, 3.10/3.12 fully supported) over the
+#    newest default, since brand-new Python releases often lack wheels for PyQt5/tensorstore. Uses the
+#    'py' launcher when present, else 'python' on PATH.
 $pyExe = $null; $pyArgs = @()
 if (Get-Command py -ErrorAction SilentlyContinue) {
-    if ((& py -3.11 -c "print(1)" 2>$null) -eq "1") { $pyExe = "py"; $pyArgs = @("-3.11") }
-    else { $pyExe = "py"; $pyArgs = @("-3") }
+    foreach ($tag in @("-3.11", "-3.10", "-3.12", "-3.13")) {
+        if ((& py $tag -c "print(1)" 2>$null) -eq "1") { $pyExe = "py"; $pyArgs = @($tag); break }
+    }
+    if (-not $pyExe) { $pyExe = "py"; $pyArgs = @("-3") }   # last resort: the default runtime
 } elseif (Get-Command python -ErrorAction SilentlyContinue) {
     $pyExe = (Get-Command python).Source
 }
