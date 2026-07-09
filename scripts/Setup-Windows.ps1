@@ -13,20 +13,34 @@ $EnvName = "squidmip"
 $Module  = "squidmip._viewer"
 $AppName = "MIP tool"
 
-# 1. Locate conda.exe without relying on PATH.
+# 1. Locate conda.exe. Try $CONDA_EXE, then common install dirs, then whatever is on PATH.
 $conda = $env:CONDA_EXE
 if (-not $conda -or -not (Test-Path $conda)) {
     $cands = @(
         (Join-Path $env:USERPROFILE "miniconda3\Scripts\conda.exe"),
         (Join-Path $env:USERPROFILE "anaconda3\Scripts\conda.exe"),
         (Join-Path $env:LOCALAPPDATA "miniconda3\Scripts\conda.exe"),
+        (Join-Path $env:LOCALAPPDATA "anaconda3\Scripts\conda.exe"),
+        (Join-Path $env:LOCALAPPDATA "Continuum\miniconda3\Scripts\conda.exe"),
+        (Join-Path $env:LOCALAPPDATA "Continuum\anaconda3\Scripts\conda.exe"),
         "C:\ProgramData\miniconda3\Scripts\conda.exe",
-        "C:\ProgramData\Anaconda3\Scripts\conda.exe"
+        "C:\ProgramData\Anaconda3\Scripts\conda.exe",
+        "C:\miniconda3\Scripts\conda.exe",
+        "C:\Anaconda3\Scripts\conda.exe"
     )
     $conda = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
 if (-not $conda) {
-    Write-Error "Could not find conda.exe. Install Miniconda, or open the 'Anaconda PowerShell Prompt' and re-run."
+    # PATH fallback: conda may be reachable as conda.exe or as condabin\conda.bat (e.g. Anaconda Prompt).
+    $g = Get-Command conda -ErrorAction SilentlyContinue
+    if ($g) {
+        $base = Split-Path (Split-Path $g.Source)      # parent of Scripts\ or condabin\
+        $try = Join-Path $base "Scripts\conda.exe"
+        if (Test-Path $try) { $conda = $try } elseif ($g.Source -like "*.exe") { $conda = $g.Source }
+    }
+}
+if (-not $conda) {
+    Write-Error "Could not find conda. Easiest fix: open 'Anaconda PowerShell Prompt' from the Start menu and re-run this script there. (Or run:  `$env:CONDA_EXE = 'C:\path\to\Scripts\conda.exe'  then re-run.)"
 }
 $condaBase = Split-Path (Split-Path $conda)
 $repo = Split-Path $PSScriptRoot -Parent
