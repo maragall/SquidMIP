@@ -40,6 +40,9 @@ gui = [
 squidmip = "squidmip._cli:main"           # headless CLI (IMA-186): MIP a plate from the terminal
 squidmip-view = "squidmip._viewer:main"   # the MIP tool desktop app
 
+[tool.hatch.metadata]
+allow-direct-references = true   # permit the ndviewer_light @ git+... URL in the [gui] extra
+
 [tool.hatch.build.targets.wheel]
 packages = ["squidmip"]
 
