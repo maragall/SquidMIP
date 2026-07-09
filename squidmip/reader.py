@@ -98,14 +98,11 @@ def open_reader(path) -> "SquidReader":
             f"{path!s} is not a directory. Point open_reader at a Squid acquisition folder."
         )
     ome = path / "ome_tiff"
-    # Only OME-TIFF if that folder actually CONTAINS .ome.tiff files. Squid often leaves an EMPTY
-    # ome_tiff/ placeholder next to an individual-TIFF acquisition — an empty (or file-less) one must
-    # NOT block the individual-TIFF reader (that spurious empty folder was rejecting real data).
+    # OME-TIFF only if ome_tiff/ actually CONTAINS .ome.tiff files. Squid often leaves an EMPTY
+    # ome_tiff/ placeholder next to an individual-TIFF acquisition — that empty folder must NOT
+    # shadow the individual-TIFF reader.
     if ome.is_dir() and any(ome.rglob("*.ome.tif*")):
-        raise NotImplementedError(
-            "OME-TIFF acquisition detected (ome_tiff/ contains .ome.tiff files). Not implemented yet "
-            "— this build reads Squid individual TIFFs. Send Julio a sample and it'll be added."
-        )
+        return SquidOMEReader(path)
     if (path / "zarr.json").exists() or any(path.glob("*.zarr")):
         raise NotImplementedError(
             "Zarr layout detected. Not implemented in IMA-189; format-dispatch seam."
@@ -242,6 +239,11 @@ class SquidReader:
             raise IndexError(f"t={t} out of range (n_t={len(time_folders)}).")
         return self._resolve_file(time_folders[t], key, index[key])
 
+    def plane_ref(self, region, fov, channel, z, t=0) -> tuple:
+        """(filepath, page_index) for one plane — the viewer registers this into ndviewer. Individual
+        TIFFs hold one plane per file, so the page index is always 0."""
+        return str(self.plane_path(region, fov, channel, z, t)), 0
+
     # -- helpers ----------------------------------------------------------
     @staticmethod
     def _resolve_file(folder: Path, key, suffix: str) -> Path:
@@ -255,3 +257,136 @@ class SquidReader:
             if other.exists():
                 return other
         return candidate  # let tifffile raise a clear FileNotFoundError
+
+
+# {region}_{fov} stem (region = well id, no trailing _<digits>; fov = trailing integer).
+_OME_STEM_RE = re.compile(r"^(?P<region>.+)_(?P<fov>\d+)$")
+_OME_SUFFIXES = (".ome.tiff", ".ome.tif", ".OME.TIFF", ".OME.TIF")
+
+
+class SquidOMEReader:
+    """Lazy reader over a Squid OME-TIFF acquisition.
+
+    Layout (from Squid's utils_ome_tiff_writer): ``<acq>/ome_tiff/{region}_{fov}.ome.tiff`` — ONE
+    file per well-FOV, each a 5-D ``TZCYX`` stack (dimension order written as TZCYX). Presents the
+    SAME interface as :class:`SquidReader` (``metadata`` + ``read`` + ``plane_ref``), so the engine,
+    CLI and viewer consume it unchanged. Reads one plane at a time (``TiffFile.pages[p]``) so memory
+    stays bounded; the TiffFile handles are cached per file.
+    """
+
+    def __init__(self, path) -> None:
+        self._path = Path(path)
+        self._ome = self._path / "ome_tiff"
+        self._files: Optional[dict] = None      # {(region, fov): Path}
+        self._meta: Optional[dict] = None
+        self._axes: Optional[str] = None        # non-spatial axes order, e.g. "TZC"
+        self._handles: dict = {}                # Path -> tifffile.TiffFile (cached)
+
+    def _discover(self) -> dict:
+        if self._files is not None:
+            return self._files
+        files: dict = {}
+        for f in sorted(self._ome.iterdir() if self._ome.is_dir() else []):
+            name = f.name
+            stem = next((name[: -len(s)] for s in _OME_SUFFIXES if name.endswith(s)), None)
+            if stem is None:
+                continue
+            m = _OME_STEM_RE.match(stem)
+            if m:
+                files[(m["region"], int(m["fov"]))] = f
+        if not files:
+            raise ValueError(f"No {{region}}_{{fov}}.ome.tiff files found in {self._ome!s}")
+        self._files = files
+        return files
+
+    def _tif(self, path: Path):
+        tif = self._handles.get(path)
+        if tif is None:
+            tif = tifffile.TiffFile(path)
+            self._handles[path] = tif
+        return tif
+
+    @property
+    def metadata(self) -> dict:
+        if self._meta is not None:
+            return self._meta
+        files = self._discover()
+        sample = self._tif(next(iter(files.values()))).series[0]
+        dims = dict(zip(sample.axes, sample.shape))     # e.g. {'T':2,'Z':3,'C':2,'Y':64,'X':80}
+        n_t, n_z, n_c = dims.get("T", 1), dims.get("Z", 1), dims.get("C", 1)
+        self._axes = "".join(a for a in sample.axes if a in "TZC")   # non-spatial order for paging
+
+        fovs: dict[str, set] = {}
+        for (region, fov) in files:
+            fovs.setdefault(region, set()).add(fov)
+        regions = sorted(fovs, key=_plate_key)
+
+        # Channels come from acquisition_channels.yaml, in file order (== the writer's C-axis order).
+        yaml_map = load_channel_yaml(self._path)
+        names = list(yaml_map.keys())
+        if len(names) != n_c:
+            # yaml disagrees with the file — fall back to the OME channel names, else generic labels.
+            ome_names = _ome_channel_names(self._tif(next(iter(files.values()))))
+            names = [_normalize_local(n) for n in ome_names] if len(ome_names) == n_c \
+                else [f"C{i}" for i in range(n_c)]
+        channels = resolve_channels(names, yaml_map)
+
+        acq = load_acquisition_metadata(self._path)
+        if acq["n_z_declared"] is not None and acq["n_z_declared"] != n_z:
+            warnings.warn(f"Recorded Nz ({acq['n_z_declared']}) != OME Z ({n_z}); using {n_z}.")
+        self._meta = {
+            "regions": regions,
+            "fovs_per_region": {r: sorted(fovs[r]) for r in regions},
+            "channels": channels,
+            "n_z": n_z,
+            "z_levels": list(range(n_z)),
+            "dz_um": acq["dz_um"],
+            "pixel_size_um": acq["pixel_size_um"],
+            "wellplate_format": acq["wellplate_format"],
+            "frame_shape": (int(dims.get("Y", sample.shape[-2])), int(dims.get("X", sample.shape[-1]))),
+            "dtype": np.dtype(sample.dtype),
+            "n_t": n_t,
+        }
+        return self._meta
+
+    def _page_index(self, t: int, z: int, c: int) -> int:
+        """Flat IFD page index for (t, z, c), honouring the file's non-spatial axis order."""
+        meta = self.metadata
+        sizes = {"T": meta["n_t"], "Z": meta["n_z"], "C": len(meta["channels"])}
+        pos = {"T": t, "Z": z, "C": c}
+        order = self._axes or "TZC"
+        return int(np.ravel_multi_index([pos[a] for a in order], [sizes[a] for a in order]))
+
+    def _channel_index(self, channel) -> int:
+        names = [c["name"] for c in self.metadata["channels"]]
+        return names.index(str(channel))
+
+    def read(self, region, fov, channel, z, t=0):
+        """Return one plane as a 2D native-dtype array (reads exactly one IFD page)."""
+        files = self._discover()
+        key = (str(region), int(fov))
+        if key not in files:
+            raise KeyError(f"No such well/FOV region={region!r} fov={fov}. Known: {sorted(files)[:8]}")
+        p = self._page_index(int(t), int(z), self._channel_index(channel))
+        tif = self._tif(files[key])
+        return _validate_plane(np.asarray(tif.pages[p].asarray()), files[key])
+
+    def plane_ref(self, region, fov, channel, z, t=0) -> tuple:
+        """(filepath, page_index) for one plane — the viewer registers this (with the page) into
+        ndviewer, so the raw z-stack displays straight from the .ome.tiff, zero bytes copied."""
+        p = self._page_index(int(t), int(z), self._channel_index(channel))
+        return str(self._discover()[(str(region), int(fov))]), p
+
+
+def _normalize_local(name: str) -> str:
+    from squidmip._channels import normalize
+    return normalize(name)
+
+
+def _ome_channel_names(tif) -> list:
+    """Best-effort channel names from the OME-XML (Channel Name=...), else []."""
+    try:
+        xml = tif.ome_metadata or ""
+        return re.findall(r'<Channel[^>]*\bName="([^"]*)"', xml)
+    except Exception:
+        return []

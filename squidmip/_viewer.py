@@ -1512,7 +1512,8 @@ class PlateWindow(QMainWindow):
                 for z_i, z in enumerate(meta["z_levels"]):
                     for ch in channels:
                         try:
-                            entries.append((0, w_idx, z_i, ch, str(reader.plane_path(well, fov, ch, z))))
+                            path, page = reader.plane_ref(well, fov, ch, z)   # (file, page) — OME-safe
+                            entries.append((0, w_idx, z_i, ch, path, page))
                         except (KeyError, IndexError, OSError):
                             continue
             self._detail.register_images_bulk(entries)
@@ -1791,8 +1792,8 @@ class PlateWindow(QMainWindow):
             for z_i, z in enumerate(self._meta["z_levels"]):
                 for ch in (c["name"] for c in self._meta["channels"]):
                     try:
-                        path = self._reader.plane_path(well_id, fov, ch, z)
-                        self._detail.register_image(0, idx, z_i, ch, str(path))
+                        path, page = self._reader.plane_ref(well_id, fov, ch, z)
+                        self._detail.register_image(0, idx, z_i, ch, path, page)
                     except (KeyError, IndexError, OSError, RuntimeError):
                         continue   # a genuinely-missing plane / closed viewer shouldn't block the rest
             self._pushed.add(well_id)

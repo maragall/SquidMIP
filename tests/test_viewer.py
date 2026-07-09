@@ -55,7 +55,7 @@ class _StubDetail(QWidget):
         self._fov_labels = list(labels)
         self._fov_slider.setMaximum(max(0, len(labels) - 1))
 
-    def register_image(self, t, idx, z, ch, path):
+    def register_image(self, t, idx, z, ch, path, page_idx=0):
         self.registered.append((t, idx, z, ch, path))
 
     def go_to_well_fov(self, well_id, fov):
