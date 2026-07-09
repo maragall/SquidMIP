@@ -18,6 +18,7 @@ dependencies = [
     "tensorstore>=0.1.45",
     "pillow>=10.0",
     "pydantic-settings>=2.3",   # declarative CLI (IMA-186), same pattern as the stitcher
+    "imageio[ffmpeg]>=2.31",    # .mp4 video export (Record); bundled ffmpeg, no system install
 ]
 
 # No tilefusion dependency: IMA-189 ingest is self-contained (see docs/ima-189-eng-review.md).

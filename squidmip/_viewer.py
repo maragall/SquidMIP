@@ -845,13 +845,18 @@ class PlateWindow(QMainWindow):
         return w
 
     def _build_record_tab(self) -> QWidget:
+        axis = "time-lapse (T)" if (self._meta and self._meta.get("n_t", 1) > 1) else "focus sweep (Z)"
         w, v = self._op_tab_shell(
-            "Record z-stack",
-            "Save raw z-stacks to disk as multi-page TIFFs — one file per channel, no FIJI round-trip.")
+            "Record video (.mp4)",
+            f"Assemble each well's {axis} into an .mp4 — post-acquisition, no FIJI. One movie per well.")
         v.addWidget(QLabel("Scope"))
         self._rec_scope = QComboBox(); self._rec_scope.setStyleSheet(_COMBO_QSS)
         self._rec_scope.addItems(["Current well only", "Every well on the plate"])
         v.addWidget(self._rec_scope)
+        v.addWidget(QLabel("Playback fps"))
+        self._rec_fps = QComboBox(); self._rec_fps.setStyleSheet(_COMBO_QSS)
+        self._rec_fps.addItems(["2", "5", "10", "15"]); self._rec_fps.setCurrentText("5")
+        v.addWidget(self._rec_fps)
         self._rec_dir = None
         pick = QPushButton("Choose output folder…"); pick.setStyleSheet(_BTN_QSS)
         pick.clicked.connect(self._pick_rec_dir)
@@ -859,14 +864,14 @@ class PlateWindow(QMainWindow):
         self._rec_dir_lbl = QLabel("(no folder chosen)"); self._rec_dir_lbl.setWordWrap(True)
         self._rec_dir_lbl.setStyleSheet("color:#8b98ad;font-size:12px;")
         v.addWidget(self._rec_dir_lbl)
-        self._rec_run = QPushButton("⏺  Record"); self._rec_run.setStyleSheet(_BTN_QSS)
+        self._rec_run = QPushButton("⏺  Record .mp4"); self._rec_run.setStyleSheet(_BTN_QSS)
         self._rec_run.setEnabled(False); self._rec_run.clicked.connect(self._record_run)
         v.addWidget(self._rec_run)
         v.addStretch(1)
         return w
 
     def _pick_rec_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Record z-stacks to folder")
+        d = QFileDialog.getExistingDirectory(self, "Save .mp4(s) to folder")
         if d:
             self._rec_dir = d; self._rec_dir_lbl.setText(d); self._rec_run.setEnabled(True)
 
@@ -878,7 +883,7 @@ class PlateWindow(QMainWindow):
         else:
             self._readout.setText("double-click a well first, or choose 'Every well on the plate'")
             return
-        self._run_record(wells, self._rec_dir)
+        self._run_record(wells, self._rec_dir, int(self._rec_fps.currentText()))
 
     def _build_cli_tab(self) -> QWidget:
         """The headless-CLI stub as a tab (IMA-186 wires it; this shows the equivalent commands)."""
@@ -889,35 +894,34 @@ class PlateWindow(QMainWindow):
         term.setPlainText(
             "HCS viewer — CLI  (preview)\n"
             "──────────────────────────────\n"
-            "The same operators, run headlessly (coming with IMA-186):\n\n"
-            f"  $ squidmip mip    \"{name}\"     # MIP every well -> navigable OME-zarr\n"
-            f"  $ squidmip record \"{name}\"     # export raw z-stacks as TIFFs\n\n"
-            "# not wired yet — a stub until the CLI ticket lands.\n")
+            "The same operators, run headlessly (IMA-186 — the `squidmip` command):\n\n"
+            f"  $ squidmip \"{name}\"                        # MIP every well -> navigable OME-zarr\n"
+            f"  $ squidmip \"{name}\" --projector reference  # sharpest-plane per well\n"
+            f"  $ squidmip \"{name}\" --workers 8 --tiff     # tune + also export TIFFs\n\n"
+            "# this tab is a preview; run the command in a terminal.\n")
         return term
 
-    def _run_record(self, wells, out):
-        """Record (save) raw z-stacks for *wells* to *out* as multi-page TIFFs, one per channel."""
+    def _run_record(self, wells, out, fps):
+        """Record each well's video → ``<out>/<well>.mp4`` (time-lapse if there's a T series, else a
+        Z focus-sweep), composited by display colour at *fps*. Post-acquisition: reads existing frames.
+
+        Snapshot the inputs before the loop: it pumps processEvents (to update status), which can
+        deliver a re-drop -> ingest() that nulls self._reader/_meta mid-loop. Iterating over locals
+        means a concurrent open can't corrupt an in-flight record; _recording blocks re-entry."""
         if self._reader is None or self._recording:
             return
-        # Snapshot the inputs before the loop: it pumps processEvents (to update the status line),
-        # which can deliver a re-drop -> ingest() that nulls self._reader/_meta mid-loop. Iterating
-        # over locals means a concurrent open can't corrupt an in-flight record; _recording blocks a
-        # second record started during the same pump. (A future _RecordWorker QThread would remove
-        # the GUI-thread write entirely — deferred; this makes the current path correct.)
-        import tifffile
-        reader, meta = self._reader, self._meta       # `out` and `wells` are already local args
-        channels = [c["name"] for c in meta["channels"]]
-        zs = meta["z_levels"]
+        from squidmip._video import default_axis, well_movie_frames, write_mp4
+        reader, meta = self._reader, self._meta       # `out`, `wells`, `fps` are local args
+        axis = default_axis(meta)
         self._recording = True
         try:
             for i, well in enumerate(wells, 1):
                 fov = meta["fovs_per_region"][well][0]
-                for ch in channels:
-                    stack = np.stack([reader.read(well, fov, ch, z) for z in zs])
-                    tifffile.imwrite(str(Path(out) / f"{well}_{fov}_{ch}_zstack.tiff"), stack)
-                self._readout.setText(f"recording {i}/{len(wells)} · {well} …")
+                write_mp4(well_movie_frames(reader, well, fov, axis=axis),
+                          Path(out) / f"{well}.mp4", fps)
+                self._readout.setText(f"recording {i}/{len(wells)} · {well}.mp4 …")
                 QApplication.processEvents()
-            self._readout.setText(f"✓ recorded {len(wells)} well(s) → {out}")
+            self._readout.setText(f"✓ recorded {len(wells)} .mp4(s) → {out}")
         except Exception as e:
             self._readout.setText(f"record failed: {e}")
         finally:
