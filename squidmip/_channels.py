@@ -66,23 +66,32 @@ def fallback_color(filename_channel: str) -> str | None:
 
 
 def _extract_color(channel: dict) -> str | None:
-    """v1.0+ top-level display_color, else pre-v1.0 nested camera_settings.<first cam>."""
+    """v1.0+ top-level display_color, else pre-v1.0 nested camera_settings.<first cam>. Tolerant of
+    a real acquisition yaml where a section is a scalar (never call .get on a non-dict)."""
+    if not isinstance(channel, dict):
+        return None
     if channel.get("display_color"):
         return channel["display_color"]
-    cameras = channel.get("camera_settings") or {}
-    for cam_key in sorted(cameras):  # first camera key, not a hardcoded '1'
-        color = (cameras[cam_key] or {}).get("display_color")
-        if color:
-            return color
+    cameras = channel.get("camera_settings")
+    if isinstance(cameras, dict):
+        for cam_key in sorted(cameras, key=str):   # first camera key, not a hardcoded '1'
+            cam = cameras.get(cam_key)
+            color = cam.get("display_color") if isinstance(cam, dict) else None
+            if color:
+                return color
     return None
 
 
 def _extract_exposure(channel: dict):
-    cameras = channel.get("camera_settings") or {}
-    for cam_key in sorted(cameras):
-        exposure = (cameras[cam_key] or {}).get("exposure_time_ms")
-        if exposure is not None:
-            return exposure
+    if not isinstance(channel, dict):
+        return None
+    cameras = channel.get("camera_settings")
+    if isinstance(cameras, dict):
+        for cam_key in sorted(cameras, key=str):
+            cam = cameras.get(cam_key)
+            exposure = cam.get("exposure_time_ms") if isinstance(cam, dict) else None
+            if exposure is not None:
+                return exposure
     return channel.get("exposure_time_ms")
 
 
@@ -100,7 +109,10 @@ def load_channel_yaml(root) -> dict:
         return {}
     data = yaml.safe_load(path.read_text()) or {}
     out: dict = {}
-    for channel in data.get("channels") or []:
+    channels = data.get("channels") if isinstance(data, dict) else None
+    for channel in channels or []:
+        if not isinstance(channel, dict):
+            continue
         name = channel.get("name")
         if not name:
             continue
