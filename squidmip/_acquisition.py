@@ -48,10 +48,15 @@ def load_acquisition_metadata(root) -> dict:
         )
 
     rich = yaml.safe_load(path.read_text()) or {}
-    objective = rich.get("objective") or {}
-    z_stack = rich.get("z_stack") or {}
-    time_series = rich.get("time_series") or {}
-    sample = rich.get("sample") or {}
+
+    def _section(key):
+        v = rich.get(key)
+        return v if isinstance(v, dict) else {}   # a scalar/None section -> empty (never .get on a float)
+
+    objective = _section("objective")
+    z_stack = _section("z_stack")
+    time_series = _section("time_series")
+    sample = _section("sample")
     delta_z_mm = z_stack.get("delta_z_mm")
     return {
         "pixel_size_um": objective.get("pixel_size_um"),  # authoritative, binning-aware
