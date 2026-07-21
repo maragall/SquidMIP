@@ -9,11 +9,17 @@ plus the acquisition parameters.json scalars. Returns (root_path, {(region,fov,z
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 import tifffile
+
+# scripts/ holds non-product helpers (IMA-234's odon_bench, hcs_viewer_entry, ...). They
+# are deliberately NOT in the installed squidmip package, so make them importable here
+# rather than shipping eval-only code to every MIP-tool install.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 REGIONS = ["B2", "B3"]
 FOVS = [0, 1]
