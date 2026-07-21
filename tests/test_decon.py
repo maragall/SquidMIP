@@ -25,16 +25,22 @@ scipy_ndimage = pytest.importorskip("scipy.ndimage")
 
 
 def _ground_truth(size: int = 96, seed: int = 0) -> np.ndarray:
-    """A sparse-puncta phantom — the shape fluorescence actually has, and the shape RL assumes
-    (Poisson counts on a dark background). A smooth gradient would be nearly unchanged by any
-    deconvolution and would prove nothing."""
+    """A sparse-puncta phantom on a dim pedestal — the shape fluorescence actually has, and the
+    shape RL assumes (Poisson counts on a dark background). A smooth gradient would be nearly
+    unchanged by any deconvolution and would prove nothing.
+
+    The puncta have FINITE extent (sigma ~1.2 px, i.e. sub-micron objects at 0.752 um/px) rather
+    than being single-pixel deltas. That is deliberate and it is what the ticket's data looks
+    like: a true delta carries energy at every spatial frequency, including the ones the PSF has
+    annihilated, so NO deconvolution — ours or scikit-image's, measured — recovers more than a
+    few percent of its RMSE in a sane iteration count. Testing against a delta phantom would be
+    testing an information-theoretic impossibility, not this implementation.
+    """
     rng = np.random.default_rng(seed)
-    img = np.full((size, size), 20.0, dtype=np.float32)
-    ys = rng.integers(8, size - 8, 40)
-    xs = rng.integers(8, size - 8, 40)
-    for y, x in zip(ys, xs):
-        img[y, x] += rng.uniform(400, 2000)
-    return img
+    seeds = np.zeros((size, size), dtype=np.float32)
+    for y, x in zip(rng.integers(10, size - 10, 30), rng.integers(10, size - 10, 30)):
+        seeds[y, x] += rng.uniform(400, 2000)
+    return (scipy_ndimage.gaussian_filter(seeds, 1.2, mode="reflect") + 20.0).astype(np.float32)
 
 
 def _blur(img: np.ndarray, sigma: float) -> np.ndarray:
@@ -143,15 +149,25 @@ def test_flat_field_stays_flat_at_the_edges_no_boundary_artifact():
     assert np.allclose(rim, 1000.0, rtol=2e-3), f"edge artifact: rim range {rim.min()}..{rim.max()}"
 
 
-def test_wrap_boundary_would_bleed_across_the_edge_and_reflect_does_not():
-    """Evidence that the mode choice is load-bearing: a bright edge column bleeds to the
-    OPPOSITE edge under 'wrap' (what an FFT-based RL does by default) and does not under
-    the default reflect."""
-    plane = np.full((48, 48), 10.0, dtype=np.float32)
+def test_wrap_boundary_corrupts_the_opposite_edge_and_reflect_does_not():
+    """Evidence that the mode choice is load-bearing, at the scale it actually bites.
+
+    A bright edge column bleeds across to the OPPOSITE edge under 'wrap' — which is what an
+    FFT-based RL does by default (scikit-image, flowdec) unless the caller pads by hand. The
+    visible symptom is not extra brightness there: RL *deconvolves* the phantom bleed, so it
+    pulls the far edge DOWN, carving a dark rim into a region whose true value is a flat 10.
+    A dark rim adjacent to bright signal is exactly what an out-of-focus membrane looks like.
+    """
+    true_level = 10.0
+    plane = np.full((48, 48), true_level, dtype=np.float32)
     plane[:, 0] = 5000.0
     reflected = richardson_lucy_gaussian(plane, sigma=3.0, iterations=10, mode="reflect")
     wrapped = richardson_lucy_gaussian(plane, sigma=3.0, iterations=10, mode="wrap")
-    assert wrapped[:, -1].mean() > reflected[:, -1].mean() * 5
+
+    reflect_err = abs(float(reflected[:, -1].mean()) - true_level) / true_level
+    wrap_err = abs(float(wrapped[:, -1].mean()) - true_level) / true_level
+    assert reflect_err < 0.01, f"the default mode itself has an edge artifact ({reflect_err:.1%})"
+    assert wrap_err > 0.2, f"wrap did not corrupt the far edge ({wrap_err:.1%})"
 
 
 # --- prior art cross-check ----------------------------------------------------------------
