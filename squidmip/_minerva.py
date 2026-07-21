@@ -11,7 +11,7 @@ Pipeline
          │
          │  require pixel_size_um ──── missing ──▶ ValueError (see "Pixel size" below)
          ▼
-    project_well(reader, region, fov, reduce=<projector>, t=t)   →  (1, C, 1, Y, X)
+    project_well(reader, region, fov, reduce=op.fn, consumes=op.consumes, t=t)  →  (1, C, 1, Y, X)
          │
          │  [0, :, 0]
          ▼
@@ -314,7 +314,10 @@ def export_selection(
 
     meta = reader.metadata
     pixel_um = _require_pixel_size(meta)                  # refuse early — nothing written yet
-    reduce = _resolve_projector(projector)
+    # IMA-210 made the registry hand back an Operator (name, fn, consumes), not a bare callable.
+    # Pass BOTH halves through, exactly as _engine.project_plate does: `consumes` is what decides
+    # project_well's grouping, and defaulting it would silently mis-shape any future plane-op.
+    op = _resolve_projector(projector)
 
     fovs_per_region = meta.get("fovs_per_region", {})
     for region, fov in sel:
@@ -338,7 +341,7 @@ def export_selection(
     for i, (region, fov) in enumerate(sel):
         # Stream: project one FOV, write it, drop it. Peak memory is one (C, Y, X) frame
         # regardless of how many FOVs were selected.
-        image = project_well(reader, region, fov, reduce=reduce, t=t)
+        image = project_well(reader, region, fov, reduce=op.fn, consumes=op.consumes, t=t)
         img_cyx = image[0, :, 0]
 
         stem = f"{stem_prefix}_{_safe(region)}_fov{fov}_t{t}_{_safe(projector)}"
