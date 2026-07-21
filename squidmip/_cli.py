@@ -55,6 +55,16 @@ class ProcessParameters(BaseModel, use_attribute_docstrings=True):
     """Process only the first N wells — a quick SLICE of the plate (subset preview) so you can test
     the operator without committing the whole plate's compute + disk. Default: every well."""
 
+    allow_incomplete: bool = False
+    """Project a Zarr acquisition that did not finish (crashed or aborted mid-run).
+
+    Zarr arrays are allocated full-size up front, so planes that were never written read back as
+    ZEROS rather than as an error — projecting such a plate silently yields blank or dimmed wells
+    in an output that looks complete. SquidMIP therefore refuses by default. Turn this on to
+    project what WAS acquired; wells never reached are skipped, but a partially-written well
+    still projects its unwritten planes as zeros. No effect on TIFF acquisitions (a missing plane
+    there is a missing file, which already fails loudly)."""
+
     verbose: bool = False
     """Show debug-level logging."""
 
@@ -91,7 +101,7 @@ def run(params: ProcessParameters) -> dict:
     """Open the acquisition and write the operator's OME-Zarr plate; return write_plate's manifest."""
     from squidmip import open_reader, write_plate
 
-    reader = open_reader(params.input_folder)
+    reader = open_reader(params.input_folder, allow_incomplete=params.allow_incomplete)
     # Scope guard: 1536-well plates only for now (not a general product yet). Fail loud, before any write.
     fmt = str(reader.metadata.get("wellplate_format", ""))
     if not any(s in fmt for s in ("384", "1536")):

@@ -45,6 +45,7 @@ import os
 import re
 import sys
 import threading
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -54,8 +55,8 @@ from PyQt5.QtCore import Qt, QProcess, QProcessEnvironment, QSocketNotifier, QTh
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPalette, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
-    QStyleFactory, QTabBar, QTabWidget, QVBoxLayout, QWidget,
+    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox,
+    QSplitter, QStyleFactory, QTabBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from squidmip._engine import _default_workers
@@ -1509,9 +1510,28 @@ class PlateWindow(QMainWindow):
             reader = open_reader(str(p))
             meta = reader.metadata
         except Exception as e:   # not a Squid acquisition / unreadable -> report, don't crash the app
-            self._readout.setText(f"not a readable Squid acquisition: {e}")
-            self._drop.show()
-            return
+            # An UNFINISHED zarr acquisition is refused by default because its unwritten planes
+            # decode as zeros (a silently wrong projection). That is the right default, but the
+            # person most likely to be holding a crashed plate is sitting in front of this GUI —
+            # so offer the override here instead of making them go find the CLI flag.
+            if "acquisition_complete" in str(e):
+                if not self._confirm_incomplete(str(e)):
+                    self._readout.setText("acquisition is incomplete — not opened")
+                    self._drop.show()
+                    return
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")   # already surfaced in the dialog
+                        reader = open_reader(str(p), allow_incomplete=True)
+                        meta = reader.metadata
+                except Exception as e2:
+                    self._readout.setText(f"not a readable Squid acquisition: {e2}")
+                    self._drop.show()
+                    return
+            else:
+                self._readout.setText(f"not a readable Squid acquisition: {e}")
+                self._drop.show()
+                return
         fmt = str(meta.get("wellplate_format", ""))
         if not any(s in fmt for s in _SUPPORTED_PLATES):   # scope guard: supported formats only
             self._readout.setText(f"only 384- and 1536-well plates are supported right now — this is a {fmt or 'other'}")
@@ -1588,34 +1608,105 @@ class PlateWindow(QMainWindow):
         note = (f" · {multi} multi-FOV well(s): sampling 1 FOV/well (stitching TBD)" if multi else "")
         self._readout.setText(f"live · {len(self._fov_index)} wells · double-click to open{note}")
 
+    def _confirm_incomplete(self, detail: str) -> bool:
+        """Ask before opening an acquisition that never finished. Returns True to proceed.
+
+        Deliberately NOT a silent warning: the whole hazard is that the resulting projection
+        looks complete. The user has to say yes to a message that spells out what they will get.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Acquisition did not finish")
+        box.setText("This acquisition is marked incomplete.")
+        box.setInformativeText(
+            "Planes that were never written read back as ZEROS, not as an error. If you open it, "
+            "wells that were never reached are skipped, but a partially-written well will project "
+            "its missing planes as black — and the result will still look like a finished plate.\n\n"
+            "Open it anyway and project what was acquired?"
+        )
+        box.setDetailedText(detail)
+        box.setStandardButtons(QMessageBox.Open | QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Cancel)
+        return box.exec_() == QMessageBox.Open
+
     def _setup_raw_detail(self):
         """Point the detail viewer at the RAW acquisition: full z-stack, full frame, whole-plate FOV
-        slider. Registers every well's raw plane PATHS up front (cheap — paths only, no image I/O) so
-        scrubbing shows a real (lazily read + cached) image per well instead of black. Shared by open
-        (ingest) and 'Return to raw view'."""
+        slider. Shared by open (ingest) and 'Return to raw view'.
+
+        Two wirings, because the two input families expose their pixels differently::
+
+            TIFF / OME-TIFF   reader.plane_ref(...)  -> (file, page)  -> register_images_bulk
+            HCS zarr          reader.fov_store_path() -> store dir    -> start_zarr_acquisition
+
+        A zarr plane is a slice of a chunked, compressed array, so there is no (file, page) to
+        register; ndviewer reads the store itself. Either way we pass OUR well order as the FOV
+        labels, so the detail pane's FOV slider index stays aligned with `_fov_index[well]["idx"]`
+        and the plate red-box tracking keeps working.
+        """
         if self._detail is None or self._reader is None:
             return
         meta, reader, order = self._meta, self._reader, self._order
         h, w = meta["frame_shape"]
         channels = [c["name"] for c in meta["channels"]]
-        self._detail.start_acquisition(channels, meta["n_z"], h, w, [f"{r}:0" for r in order])
+        labels = [f"{r}:0" for r in order]
         self._pushed = set()
-        if hasattr(self._detail, "register_images_bulk"):
-            entries = []
-            for well in order:
-                w_idx = self._fov_index[well]["idx"]
-                fov = meta["fovs_per_region"][well][0]
-                for z_i, z in enumerate(meta["z_levels"]):
-                    for ch in channels:
-                        try:
-                            path, page = reader.plane_ref(well, fov, ch, z)   # (file, page) — OME-safe
-                            entries.append((0, w_idx, z_i, ch, path, page))
-                        except (KeyError, IndexError, OSError):
-                            continue
-            self._detail.register_images_bulk(entries)
-            self._pushed.update(order)   # every well is registered; double-click just navigates
+
+        if getattr(reader, "supports_plane_ref", True) is False:
+            self._setup_raw_detail_zarr(reader, meta, order, channels, labels, h, w)
+        else:
+            self._detail.start_acquisition(channels, meta["n_z"], h, w, labels)
+            if hasattr(self._detail, "register_images_bulk"):
+                entries = []
+                for well in order:
+                    w_idx = self._fov_index[well]["idx"]
+                    fov = meta["fovs_per_region"][well][0]
+                    for z_i, z in enumerate(meta["z_levels"]):
+                        for ch in channels:
+                            try:
+                                path, page = reader.plane_ref(well, fov, ch, z)  # (file, page)
+                                entries.append((0, w_idx, z_i, ch, path, page))
+                            except (KeyError, IndexError, OSError):
+                                continue
+                self._detail.register_images_bulk(entries)
+                self._pushed.update(order)   # all registered; double-click just navigates
+
         if order:                        # land on the first well so the viewer isn't blank
             self.activate_well(order[0], 0)
+
+    def _setup_raw_detail_zarr(self, reader, meta, order, channels, labels, h, w):
+        """Hand ndviewer the per-field zarr stores (IMA-229).
+
+        `start_zarr_acquisition` is the seam Squid's own HCS GUI uses, and crucially it takes
+        `fov_labels` explicitly — so OUR row-major plate order wins over ndviewer's internal
+        directory-discovery order. `load_dataset()` would look simpler but never populates
+        `_fov_labels`, and `go_to_well_fov` bails out when that list is empty, which would
+        silently break double-click navigation and the plate/slider link.
+
+        Falls back to a plain whole-plate load if the installed ndviewer_light predates the zarr
+        API, so an older viewer degrades instead of crashing.
+        """
+        fov_paths = []
+        for well in order:
+            fov = meta["fovs_per_region"][well][0]
+            try:
+                fov_paths.append(reader.fov_store_path(well, fov))
+            except (KeyError, IndexError, OSError):
+                fov_paths.append("")     # keep index alignment with `order` / `labels`
+
+        if hasattr(self._detail, "start_zarr_acquisition") and any(fov_paths):
+            self._detail.start_zarr_acquisition(fov_paths, channels, meta["n_z"], labels, h, w)
+            self._pushed.update(order)   # every field is registered up front, like the TIFF path
+            return
+
+        # Older ndviewer_light: no zarr push API. Show the plate rather than nothing.
+        if hasattr(self._detail, "load_dataset"):
+            self._detail.load_dataset(str(self._acq_path))
+            self._pushed.update(order)
+            return
+        self._readout.setText(
+            "This ndviewer_light build cannot display zarr acquisitions — update it to see the "
+            "raw z-stack. Projection and output still work."
+        )
 
     def _return_to_raw(self):
         """Stop previewing/processing and restore the raw downsampled view across the whole plate."""
@@ -1883,7 +1974,11 @@ class PlateWindow(QMainWindow):
             except Exception:
                 pass
             return
-        if well_id not in self._pushed:
+        # Zarr readers have no plane_ref: every field was handed to ndviewer up front by
+        # _setup_raw_detail_zarr, so there is nothing to push here and _pushed already covers
+        # the plate. Guard on the capability, NOT on catching the error — plane_ref would raise
+        # AttributeError/NotImplementedError, neither of which is in the except tuple below.
+        if well_id not in self._pushed and getattr(self._reader, "supports_plane_ref", True):
             fov = self._meta["fovs_per_region"][well_id][0]
             for z_i, z in enumerate(self._meta["z_levels"]):
                 for ch in (c["name"] for c in self._meta["channels"]):

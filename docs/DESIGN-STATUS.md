@@ -24,6 +24,12 @@
 ## IO
 
 - ReadAcquisition: squidmip `open_reader`. done. GUI delegates (does not read directly): done.
+  Three formats: individual TIFF + OME-TIFF (IMA-189), HCS Zarr v3 `plate.ome.zarr` (IMA-229).
+  One `metadata` contract for all three (`_plate.build_metadata`). Squid's non-HCS zarr layouts
+  (per-FOV `fov_N.ome.zarr`, 6-D `acquisition.zarr`) are refused by name, not read — deferred in
+  TODOS.md. Zarr specifics: group metadata is the acquisition PLAN so discovery intersects it
+  with what is on disk; an unfinished acquisition is refused unless `allow_incomplete=True`
+  (unwritten chunks decode as zeros); `open_reader` refuses SquidMIP's OWN `write_plate` output.
 - WriteAcquisition: squidmip/_output.py `write_plate` (multiscale OME-Zarr + optional TIFF + disk guard). done. .mp4 via _video: done.
 - CLI: squidmip/_cli.py (pydantic-settings CliApp, up front validation, resilient skip). done.
 

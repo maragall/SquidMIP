@@ -467,3 +467,73 @@ def test_ima185_sim1536_montage_real_seam_subset(sim_1536wp, tmp_path):
     rgb = np.asarray(Image.open(manifest["montage"]))
     assert rgb.shape == (n_rows * 48, n_cols * 48, 3)
     assert rgb.max() > 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# SECTION: IMA-229 ↔ 183/188/184  —  HCS zarr ingest through the WHOLE pipeline.
+#          Proves the reader is interchangeable with the TIFF reader at every downstream
+#          seam: select_fovs -> project_well/project_plate -> write_plate -> valid NGFF.
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+def test_ima229_zarr_pipeline_end_to_end(squid_zarr_dataset, tmp_path):
+    """AC2: a zarr acquisition drives the same pipeline and yields a spec-valid plate."""
+    from tests.ngff_check import assert_valid_ngff_plate
+
+    root, _ = squid_zarr_dataset
+    reader = open_reader(root)
+    meta = reader.metadata
+
+    wells = select_fovs(meta, n_fovs=1)
+    assert set(wells) == {"B2", "B3"}
+
+    manifest = write_plate(reader, tmp_path, n_fovs=1, workers=2, tiff=False)
+    assert manifest["n_fields_written"] == 2
+    plate = tmp_path / "plate.ome.zarr"
+    assert plate.is_dir()
+    assert_valid_ngff_plate(plate)          # independent OME-NGFF v0.5 schema validation
+
+
+def test_ima229_zarr_projection_is_a_real_mip(squid_zarr_dataset):
+    """The projection must actually reduce z, and match a hand-computed maximum."""
+    root, arrays = squid_zarr_dataset
+    reader = open_reader(root)
+    meta = reader.metadata
+    names = [c["name"] for c in meta["channels"]]
+
+    img = project_well(reader, "B3", 0)                       # (T, C, 1, Y, X)
+    assert img.shape == (meta["n_t"], len(names), 1, 4, 4)
+    assert img.dtype == meta["dtype"]
+
+    for c_i in range(len(names)):
+        planes = [arrays[("B3", 0, z, c_i)] for z in meta["z_levels"]]
+        np.testing.assert_array_equal(img[0, c_i, 0], np.maximum.reduce(planes))
+        # and it is genuinely a reduction, not just the first plane
+        assert not np.array_equal(img[0, c_i, 0], planes[0])
+
+
+def test_ima229_zarr_and_tiff_readers_are_interchangeable(squid_zarr_dataset, squid_dataset):
+    """Both readers satisfy the same contract, so downstream code needs no format branch."""
+    zreader = open_reader(squid_zarr_dataset[0])
+    treader = open_reader(squid_dataset[0])
+    assert set(zreader.metadata) == set(treader.metadata)
+    for key in ("regions", "fovs_per_region", "n_z", "z_levels", "n_t", "frame_shape"):
+        assert zreader.metadata[key] == treader.metadata[key], key
+    # the one legitimate difference: how the viewer gets at raw pixels
+    assert zreader.supports_plane_ref is False
+    assert getattr(treader, "supports_plane_ref", True) is not False
+
+
+def test_ima229_partial_plate_projects_only_acquired_wells(squid_zarr_partial, tmp_path):
+    """AC4: a crashed plate whose metadata over-claims still projects — just less of it."""
+    import warnings as _w
+
+    with _w.catch_warnings():
+        _w.simplefilter("ignore")
+        reader = open_reader(squid_zarr_partial, allow_incomplete=True)
+        manifest = write_plate(reader, tmp_path, n_fovs=1, workers=2, tiff=False)
+
+    # plate metadata planned B2..B5; only B2 and B3 were acquired.
+    assert manifest["n_fields_written"] == 2
+    assert (tmp_path / "plate.ome.zarr" / "B" / "2" / "0" / "0").is_dir()
+    assert not (tmp_path / "plate.ome.zarr" / "B" / "4").exists()

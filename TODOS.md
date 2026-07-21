@@ -90,3 +90,20 @@ so a future session doesn't rediscover it from zero.
 - **Context:** IMA-229 already treats plate/well metadata as a plan and intersects it with disk,
   which is exactly the primitive a re-scan would repeat on a timer.
 - **Depends on / blocked by:** IMA-229.
+
+## OME reader's generic C0/C1 channel fallback is dead code → small cleanup
+- **What:** `reader.py` `SquidOMEReader.metadata` ends its channel-name ladder with generic
+  `f"C{i}"` labels, but that rung can never succeed: `resolve_channels` refuses any channel whose
+  display color it cannot resolve (`_channels.py:145`), and `"C0"` matches neither the yaml nor
+  `CHANNEL_COLORS_MAP`. The intended graceful fallback raises `ValueError` instead.
+- **Why:** Pre-existing since IMA-189; found by the IMA-229 characterization tests written before
+  the shared-helper refactor. Today's behavior is pinned by
+  `test_ome_generic_label_fallback_is_unreachable_and_raises` so it cannot change silently.
+- **Pros:** Either make the fallback real (a neutral color for unidentifiable channels) or delete
+  the dead rung and raise a message that says what is actually wrong. Both beat the current
+  confusing error, which names a channel `'C0'` the user never heard of.
+- **Cons:** Needs a product call: is an OME-TIFF with no channel names anywhere worth opening at
+  all? Refusing may well be correct — it is the *message* that is wrong, not the outcome.
+- **Context:** Only reachable when the yaml channel count disagrees with the file AND the OME-XML
+  carries no `Channel Name=` entries. Rare. Not touched by IMA-229 (out of scope, deliberately).
+- **Depends on / blocked by:** nothing.
