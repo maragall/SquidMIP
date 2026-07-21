@@ -50,3 +50,19 @@ so a future session doesn't rediscover it from zero.
 - **Cons:** Different repo, different owner; not on any SquidMIP critical path.
 - **Context:** SquidMIP does **not** carry this bug — IMA-189's `squidmip/_channels.py` already resolves `display_color` correctly (top-level v1.0+ *and* nested `camera_settings`, mapped by name, raises on unresolved), and IMA-184 consumes `metadata.channels[].display_color` rather than re-parsing the yaml. This TODO is purely a flag for whoever owns `~/CEPHLA/projects/explorer/squid2minerva`.
 - **Depends on / blocked by:** squid2minerva maintainer.
+
+## ImageJ-style drag-BACK re-attach for floating tabs → follow-up after IMA-209
+- **What:** Drag a floating tab window back onto the `_left_tabs` bar to re-dock it (the symmetric half of the IMA-209 detach gesture). IMA-209 ships a Re-dock button instead.
+- **Why:** "ImageJ-style" most plausibly implies the symmetric gesture; the button covers the round trip but isn't the gesture Nick may picture.
+- **Pros:** Full ImageJ parity; no chrome in the float.
+- **Cons:** The expensive half of custom tab dragging — drop-target hit-testing, insertion-index calculation, cross-window drag state — none of it testable offscreen; roughly triples the untested gesture surface.
+- **Context:** IMA-209 eng review D6 (2026-07-20). All re-dock LOGIC already exists as `_redock(key)`; only the gesture would be new. Wait for Nick to actually miss the drag before paying for it.
+- **Depends on / blocked by:** IMA-209 landed; real user demand.
+
+## IMA-205 exploration tab: verify it registers via _open_op_tab → IMA-205
+- **What:** When the exploration pane lands, open it through `_open_op_tab(key, title, builder)` so it inherits detach/float/re-dock for free.
+- **Why:** IMA-209 made detach a property of the tab container (eng review D2); any tab bypassing the registry won't detach and won't be cleaned up by `_dispose_tab_widget`.
+- **Pros:** Zero extra work in 205 to get the Nick float behavior.
+- **Cons:** None — this is a one-line integration constraint.
+- **Context:** Registry + cleanup contract in `squidmip/_viewer.py` (`_op_tabs`/`_floating`/`_dispose_tab_widget`).
+- **Depends on / blocked by:** IMA-205 design.

@@ -393,6 +393,101 @@ class _ProcTerminal(QWidget):
         super().closeEvent(e)
 
 
+class _DetachTabBar(QTabBar):
+    """Tab bar that detaches a tab when it's dragged OUT of the bar (ImageJ-style float-out,
+    IMA-209). Gesture only — all detach logic lives in PlateWindow._detach_tab (the seam the
+    offscreen tests drive directly). The home tab (index 0) never detaches; a drag that stays
+    inside the bar keeps Qt's normal tab behavior."""
+
+    def __init__(self, on_detach, parent=None):
+        super().__init__(parent)
+        self._on_detach = on_detach
+        self._press_pos = None
+        self._press_index = -1
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._press_pos = e.pos()
+            self._press_index = self.tabAt(e.pos())
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if (self._press_pos is not None and self._press_index > 0
+                and (e.pos() - self._press_pos).manhattanLength() >= QApplication.startDragDistance()
+                and not self.rect().contains(e.pos())):
+            idx = self._press_index
+            self._press_pos, self._press_index = None, -1      # fire once per press
+            # Defer: _detach_tab calls removeTab, and mutating the bar from inside its own
+            # mouseMoveEvent (mid-drag, pressed-index state live) is re-entrant — crash bait.
+            QTimer.singleShot(0, lambda: self._on_detach(idx))
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._press_pos, self._press_index = None, -1
+        super().mouseReleaseEvent(e)
+
+
+class _DetachTabs(QTabWidget):
+    """QTabWidget with a detachable tab bar. Qt requires setTabBar BEFORE any tab is added,
+    so the custom bar is installed here in __init__ rather than at the call site."""
+
+    def __init__(self, on_detach):
+        super().__init__()
+        self.setTabBar(_DetachTabBar(on_detach, self))
+
+
+class _FloatWindow(QWidget):
+    """A detached operator tab as a free-floating top-level window (IMA-209).
+
+    Owns no logic: PlateWindow hands it the live tab widget and two callbacks. 'Re-dock'
+    returns the widget to the tab bar (the SAME object — a live CLI keeps its shell and
+    history); closing the window disposes the widget through the same cleanup path as
+    closing its tab (PlateWindow._dispose_tab_widget)."""
+
+    def __init__(self, title, content, on_close, on_redock):
+        super().__init__()
+        self._tab_title = title            # verbatim, for re-dock (never parsed back out)
+        self.setWindowTitle(f"{title} — SquidMIP")
+        self._content = content
+        self._on_close = on_close
+        # Scoped dark chrome — palette + stylesheet only, never app-wide (see _dark_palette).
+        # NO per-widget Fusion style here: _left_tabs needs it for its TAB STRIP rendering, but a
+        # float has no strip, and a Python-owned QStyle on a deleteLater'd widget can be GC'd
+        # first — ~QWidget then unpolishes a dangling style (segfault, found by the test suite).
+        self.setPalette(_dark_palette())
+        self.setAutoFillBackground(True)
+        self.setStyleSheet(f"background:{_BG};color:#e6edf3;")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        bar = QWidget()
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(8, 5, 8, 5)
+        h.addStretch(1)
+        dock = QPushButton("Re-dock")
+        dock.setStyleSheet(_BTN_QSS)
+        dock.setToolTip("Return this view to the main window's tab bar")
+        dock.clicked.connect(on_redock)
+        h.addWidget(dock)
+        v.addWidget(bar)
+        v.addWidget(content, 1)
+        self.resize(560, 480)
+
+    def take_content(self):
+        """Detach and return the live widget (re-dock / app-exit); the window becomes an empty
+        shell whose close is then a plain close (see closeEvent's guard)."""
+        w, self._content = self._content, None
+        if w is not None:
+            w.setParent(None)
+        return w
+
+    def closeEvent(self, e):
+        if self._content is not None:      # re-dock/app-exit already emptied us otherwise
+            self._on_close()
+        super().closeEvent(e)
+
+
 @dataclass(frozen=True)
 class Operation:
     """One post-processing operator declared in ONE place — the 'operation template'. Adding a feature
@@ -1045,9 +1140,12 @@ class PlateWindow(QMainWindow):
         self._layers_tab = None       # the Layers tab widget, once opened
         self._order = []              # well order = the detail's FOV-slider order
         self._op_tabs = {}            # key -> operator-UI widget currently open as a tab in _left_tabs
+        self._floating = {}           # key -> _FloatWindow holding that operator's UI detached
+                                      # (a key lives in exactly ONE of the two dicts, never both)
 
         # THREE-PANE layout. Tabs live ONLY inside the top-left pane (their bar sits at the pane's top,
-        # like the plate pane's title bar) — never a global strip across the window:
+        # like the plate pane's title bar) — never a global strip across the window. Any closable tab
+        # can be DRAGGED OUT of the bar into a free-floating window (ImageJ-style; see _detach_tab):
         #   top-left  = the PROCESS console, a QTabWidget: a "Process wells" home tab (operator list),
         #               and one tab per operator you open (MIP -> where-to-save UI; Record -> recorder
         #               UI). The right pane stays a plain singleton, so operator UIs live here.
@@ -1056,7 +1154,7 @@ class PlateWindow(QMainWindow):
 
         # top-left: the process console (build the home tab first — it owns self._readout, which
         # _make_detail_viewer writes to if ndviewer is unavailable).
-        self._left_tabs = QTabWidget()
+        self._left_tabs = _DetachTabs(self._detach_tab)
         # Dark the tab widget's own canvas (the strip behind/beside the tabs rendered white in macOS
         # light mode). Scope a Fusion style + dark palette to THIS widget subtree only — NOT the app,
         # which would bleed into the embedded ndviewer and hide its per-channel colour swatches.
@@ -1222,7 +1320,14 @@ class PlateWindow(QMainWindow):
 
     # -- operator UIs live as tabs INSIDE the top-left pane (home tab + one per opened operator) ----
     def _open_op_tab(self, key: str, title: str, builder):
-        """Open (or focus) an operator's UI as a tab beside 'Process wells'. Built lazily, once."""
+        """Open (or focus) an operator's UI as a tab beside 'Process wells'. Built lazily, once.
+        If the UI is currently detached (see _detach_tab), focus its floating window instead —
+        never rebuild: for the CLI that would mean a second live shell."""
+        win = self._floating.get(key)
+        if win is not None:
+            win.raise_()
+            win.activateWindow()
+            return
         w = self._op_tabs.get(key)
         if w is None:
             w = builder()
@@ -1235,6 +1340,11 @@ class PlateWindow(QMainWindow):
             return
         w = self._left_tabs.widget(index)
         self._left_tabs.removeTab(index)
+        self._dispose_tab_widget(w)
+
+    def _dispose_tab_widget(self, w):
+        """The ONE teardown path for an operator UI — tab close, float close, and app exit all
+        route here so they can't drift: registry pop, stale-ref clear, shell kill, delete."""
         for k, v in list(self._op_tabs.items()):
             if v is w:
                 del self._op_tabs[k]
@@ -1244,6 +1354,54 @@ class PlateWindow(QMainWindow):
         if hasattr(w, "shutdown"):                         # a live terminal — kill its shell first
             w.shutdown()
         w.deleteLater()
+
+    # -- drag a tab out -> free-floating window (IMA-209); Re-dock returns it ---------------------
+    def _detach_tab(self, index: int):
+        """Detach the tab at `index` into a _FloatWindow. ALL detach logic lives here (the drag in
+        _DetachTabBar is a thin, deferred caller) so the offscreen tests drive it directly.
+        Returns the new window, or None when the tab can't detach (home tab / unregistered)."""
+        if index <= 0:
+            return None
+        w = self._left_tabs.widget(index)
+        key = next((k for k, v in self._op_tabs.items() if v is w), None)
+        if key is None:
+            return None
+        title = self._left_tabs.tabText(index)
+        self._left_tabs.removeTab(index)
+        del self._op_tabs[key]
+        # _layers_tab is deliberately NOT cleared: the widget lives on in the float and
+        # _refresh_layers_tab writes into it directly, so a floating Layers keeps updating.
+        win = _FloatWindow(title, w,
+                           on_close=lambda k=key: self._on_float_closed(k),
+                           on_redock=lambda k=key: self._redock(k))
+        self._floating[key] = win
+        win.show()
+        return win
+
+    def _on_float_closed(self, key: str):
+        """User closed the floating window: same fate as closing the tab."""
+        win = self._floating.pop(key, None)
+        if win is None:
+            return
+        w = win.take_content()
+        if w is not None:
+            self._dispose_tab_widget(w)
+
+    def _redock(self, key: str):
+        """Re-dock button: return the floated widget to the tab bar — the SAME object, so a live
+        CLI keeps its shell and history (close-and-reopen would kill both)."""
+        win = self._floating.pop(key, None)
+        if win is None:
+            return
+        title = win._tab_title
+        w = win.take_content()                             # empties the window: its close is plain
+        win.close()
+        win.deleteLater()
+        if w is None:
+            return
+        self._op_tabs[key] = w
+        self._left_tabs.addTab(w, title)
+        self._left_tabs.setCurrentWidget(w)
 
     def _activate_operator(self, key: str):
         """Operator card / menu clicked: open the operator's UI tab. Fully generic — driven by the
@@ -1969,6 +2127,12 @@ class PlateWindow(QMainWindow):
     def closeEvent(self, e):
         self._stop_worker()          # stop the run cleanly; nothing on disk to clean up (no cache)
         self._stop_preview()
+        for key in list(self._floating):   # floated tabs are top-levels of their own — Qt won't
+            win = self._floating.pop(key)  # close them for us, and each may hold a live shell
+            w = win.take_content()
+            if w is not None:
+                self._dispose_tab_widget(w)
+            win.close()
         for w in list(self._op_tabs.values()):
             if hasattr(w, "shutdown"):
                 w.shutdown()         # kill any live embedded terminal's shell
