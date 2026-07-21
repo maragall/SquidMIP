@@ -54,7 +54,7 @@ from PyQt5.QtCore import Qt, QProcess, QProcessEnvironment, QSocketNotifier, QTh
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPalette, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QDoubleSpinBox, QLineEdit, QMainWindow, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
     QStyleFactory, QTabBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -791,9 +791,10 @@ class _OperatorWorker(QThread):
     finished_ok = pyqtSignal()
 
     def __init__(self, operator: str, reader, meta, fov_index: dict, nr: int, nc: int, out_dir: str,
-                 regions=None, save: bool = True):
+                 regions=None, save: bool = True, background=None):
         super().__init__()
         self._operator = operator
+        self._background = background    # percentile to subtract, or None for no correction
         self._reader, self._meta = reader, meta
         self._fov_index, self._nr, self._nc = fov_index, nr, nc
         self._out_dir = out_dir
@@ -845,16 +846,45 @@ class _OperatorWorker(QThread):
         if info is not None:
             self.wellFailed.emit(*info["rc"])
 
+    def _projector(self):
+        """The reduce callable for this run: the named operator, optionally background-corrected.
+
+        Estimated ONCE here (not per well, not per plane) so every well gets the same subtraction
+        and cross-well intensities stay comparable. AFTER is used only for 'mip', where
+        subtraction provably commutes with the max at 1/Nz the cost; anything else gets BEFORE,
+        which is always correct. Returns (projector, level) — level is None when off.
+        """
+        if self._background is None:
+            return self._operator, None
+        from squidmip._correction import (AFTER, BEFORE, background_corrector,
+                                          estimate_background, with_correction)
+        from squidmip._engine import _resolve_projector
+
+        level = estimate_background(self._reader, self._background)
+        side = AFTER if self._operator == "mip" else BEFORE
+        return with_correction(_resolve_projector(self._operator),
+                               background_corrector(level), side), level
+
     def run(self):
         try:
+            projector, bg_level = self._projector()
             if self._save:
                 from squidmip import write_plate  # persist + project in one bounded, streaming pass
 
                 write_plate(self._reader, self._out_dir, n_fovs=1, workers=_VIEWER_WORKERS,
-                            projector=self._operator, tiff=False, on_well=self._on_well,
+                            projector=projector, tiff=False, on_well=self._on_well,
                             stop=self._stop.is_set, on_error=self._on_error, regions=self._regions)
                 if self._stop.is_set():
                     return  # window closing / re-opening; drop out cleanly (no final/written emit)
+                if self._background is not None:
+                    # The correction is destructive and the output does not carry the level that
+                    # was removed, so record it beside the plate or the artifact is unreproducible.
+                    from squidmip._correction import write_provenance
+                    write_provenance(self._out_dir, {
+                        "operator": self._operator,
+                        "background_percentile": self._background,
+                        "background_level": bg_level,
+                    })
                 self.finalReady.emit(self._final_montage())
                 self.writtenReady.emit(str(Path(self._out_dir) / "plate.ome.zarr"))
             else:
@@ -863,7 +893,7 @@ class _OperatorWorker(QThread):
                 # the subset's compute). Same math as the saved run — a faithful preview.
                 from squidmip import project_plate
 
-                stream = project_plate(self._reader, workers=_VIEWER_WORKERS, projector=self._operator,
+                stream = project_plate(self._reader, workers=_VIEWER_WORKERS, projector=projector,
                                        on_error=self._on_error, regions=self._regions)
                 try:
                     for region, fov, image in stream:
@@ -1292,7 +1322,40 @@ class PlateWindow(QMainWindow):
 
         pick_btn = QPushButton("Choose output folder…"); pick_btn.setStyleSheet(_BTN_QSS)
         pick_btn.clicked.connect(pick)
-        run.clicked.connect(lambda: self.run_operator(op.key, out_parent=state["dir"]))
+
+        # CORRECTION block (IMA-224). A correction is NOT a projector — it does not reduce z, so it
+        # cannot be an _OPERATIONS/_PROJECTORS peer without breaking the Z=1 output contract. It
+        # decorates whichever reducer this tab runs, which is why it lives in the GENERIC tab
+        # builder: one implementation serves every z-reduction operator, present and future.
+        v.addWidget(_hline())
+        corr_lbl = QLabel("Correction")
+        corr_lbl.setStyleSheet("color:#57606a;font-size:10px;font-weight:800;letter-spacing:1.5px;padding-top:6px;")
+        v.addWidget(corr_lbl)
+        bg_cb = QCheckBox("Subtract background"); bg_cb.setStyleSheet(_CHECK_QSS)
+        v.addWidget(bg_cb)
+        bg_row = QHBoxLayout(); bg_row.setSpacing(6)
+        bg_row.addWidget(QLabel("Percentile"))
+        bg_spin = QDoubleSpinBox(); bg_spin.setRange(0.0, 100.0); bg_spin.setDecimals(1)
+        bg_spin.setSingleStep(1.0); bg_spin.setValue(10.0); bg_spin.setStyleSheet(_COMBO_QSS)
+        bg_spin.setEnabled(False)
+        bg_row.addWidget(bg_spin); bg_row.addStretch(1)
+        v.addLayout(bg_row)
+        bg_cb.toggled.connect(bg_spin.setEnabled)
+        bg_hint = QLabel("Removes a uniform pedestal (camera offset / stray light). Uneven "
+                         "illumination is a separate correction. The plate view auto-scales "
+                         "contrast, so the effect may not be obvious on screen — the level used is "
+                         "recorded in squidmip-provenance.json beside the output.")
+        bg_hint.setWordWrap(True); bg_hint.setStyleSheet("color:#8b98ad;font-size:11px;")
+        v.addWidget(bg_hint)
+        v.addWidget(_hline())
+
+        def _background():
+            """The percentile to subtract, or None when the toggle is off (the null case)."""
+            return bg_spin.value() if bg_cb.isChecked() else None
+
+        self._bg_controls = (bg_cb, bg_spin)   # tests assert the toggle drives run_operator
+        run.clicked.connect(lambda: self.run_operator(op.key, out_parent=state["dir"],
+                                                      background=_background()))
         v.addWidget(pick_btn); v.addWidget(dir_lbl); v.addWidget(run)
 
         # PREVIEW on a subset — test the operator on the first N wells without committing the whole
@@ -1319,7 +1382,8 @@ class PlateWindow(QMainWindow):
                 dest = state["dir"] or QFileDialog.getExistingDirectory(self, f"Save {op.label} preview to folder")
                 if not dest:
                     return
-            self.run_operator(op.key, out_parent=dest, preview_limit=spin.value(), save=save)
+            self.run_operator(op.key, out_parent=dest, preview_limit=spin.value(), save=save,
+                              background=_background())
 
         prev.clicked.connect(do_preview)
         v.addWidget(prev)
@@ -1728,13 +1792,18 @@ class PlateWindow(QMainWindow):
 
     # -- run a post-processing operator over the whole plate (persists a navigable OME-Zarr plate) --
     def run_operator(self, key: str, out_parent: Optional[str] = None,
-                     preview_limit: Optional[int] = None, save: bool = True):
+                     preview_limit: Optional[int] = None, save: bool = True,
+                     background: Optional[float] = None):
         """Run a projector operator (MIP / reference) over the plate.
 
         preview_limit=N runs on only the first N wells (a subset) — a cheap way to test an operator.
         save=False is PREVIEW: compute + stream results into the plate + ndviewer slider, writing
         NOTHING to disk (no folder, no disk-space cost). save=True persists a navigable OME-Zarr;
         combined with preview_limit it saves just that subset. Tests pass out_parent to skip the dialog.
+
+        background=P (IMA-224) subtracts a background level before writing, estimated as the Pth
+        percentile of sampled pixels. None (default) means no correction and the run is
+        byte-identical to before this feature existed.
         """
         if self._reader is None or self._overview is None:
             return
@@ -1752,7 +1821,10 @@ class PlateWindow(QMainWindow):
                 out_parent = QFileDialog.getExistingDirectory(self, f"Save {label} plate to folder")
                 if not out_parent:
                     return
-            out_dir = Path(out_parent) / f"{self._acq_name}.hcs"
+            # Distinct folder per correction: bgsub is destructive and irreversible, so two runs
+            # at different percentiles must not overwrite each other's plate.
+            suffix = f".bgsub{background:g}" if background is not None else ""
+            out_dir = Path(out_parent) / f"{self._acq_name}{suffix}.hcs"
             ok, est_gb, msg = self._check_disk(out_dir)   # whole-plate estimate; a subset only uses less
             if not ok and regions is None:
                 self._readout.setText(msg)
@@ -1778,7 +1850,8 @@ class PlateWindow(QMainWindow):
                                            _PUSH_PX, _PUSH_PX, [f"{r}:0" for r in self._order])
         self._worker = _OperatorWorker(key, self._reader, self._meta, self._fov_index,
                                        self._overview._nr, self._overview._nc,
-                                       str(out_dir) if out_dir else "", regions=regions, save=save)
+                                       str(out_dir) if out_dir else "", regions=regions, save=save,
+                                       background=background)
         dest = f" → {out_dir.name}" if save else " (preview — not saved)"
         self._worker.tileReady.connect(self._on_tile)
         self._worker.pushReady.connect(self._on_push)

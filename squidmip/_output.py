@@ -373,7 +373,7 @@ def write_plate(
     *,
     n_fovs: int = 1,
     workers: Optional[int] = None,
-    projector: str = "mip",
+    projector = "mip",   # name or a Projector callable (IMA-224 correction)
     tiff: bool = False,
     on_well=None,
     write_workers: int = _WRITE_WORKERS,
