@@ -1442,6 +1442,110 @@ def test_set_mosaic_boxes_is_actually_called_by_the_viewer(
         win._stop_worker(); win.close()
 
 
+# --- IMA-218: the mosaic's PLACEMENT and PIXELS, not just its wiring --------------------------
+#
+# The two guards above prove the mosaic path is REACHED (n_fovs is passed, set_mosaic_boxes is
+# called). Neither proves a FOV lands anywhere in particular, and neither ever looks at a pixel:
+# a mosaic that stacked every field at (0, 0), or mirrored the well vertically, passes both.
+# Those are precisely the failures `_placement.py`'s docstring is written against -- they do not
+# raise, they draw a plausible-but-wrong picture. So these drive the REAL widget and assert on
+# geometry and on rendered pixels.
+
+def test_mosaic_places_each_fov_at_its_own_stage_offset(qapp, stub_detail, squid_dataset,
+                                                        tmp_path):
+    """FOVs must occupy DISTINCT boxes derived from stage coords, not pile up at the origin.
+
+    The fixture's fov 1 is +0.5 mm in x from fov 0 at the same y, so the mosaic must place it to
+    the RIGHT, on the same row. A collapsed placement, a scale error and a transposed axis each
+    break one of these assertions.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("mip", out_parent=str(tmp_path))
+    _drain_until(qapp, lambda: bool(win._overview._boxes))
+    try:
+        boxes = win._overview._boxes
+        assert boxes, "no mosaic boxes reached the widget"
+        (t0, l0, h0, w0) = boxes[("B2", 0)]
+        (t1, l1, h1, w1) = boxes[("B2", 1)]
+        assert (t0, l0) != (t1, l1), (
+            f"both FOVs placed at the same spot {(t0, l0)}: the mosaic collapsed into one pile, "
+            "which is what a dropped offset or a zeroed pixel_size_um looks like.")
+        assert l1 > l0, (
+            f"fov 1 is +0.5 mm in x from fov 0, so it must sit to the RIGHT: got left {l1} <= {l0}. "
+            "A negated or transposed x axis mirrors every well horizontally.")
+        assert t1 == t0, (
+            f"the two FOVs share a stage y, so they must share a row: got top {t1} != {t0}.")
+        assert h0 > 0 and w0 > 0 and l1 + w1 <= V._CELL, (
+            f"box {(t1, l1, h1, w1)} escapes the {V._CELL}px cell and would bleed into its neighbour.")
+    finally:
+        win._stop_worker(); win.close()
+
+
+def _cell_of(img, ri, ci):
+    """Crop cell (ri, ci) out of the plate's composited montage (exactly _CELL px per cell)."""
+    buf = img.constBits().asstring(img.byteCount())
+    a = np.frombuffer(buf, np.uint8).reshape(img.height(), img.bytesPerLine() // 3, 3)
+    a = a[:, :img.width(), :]
+    return a[ri * V._CELL:(ri + 1) * V._CELL, ci * V._CELL:(ci + 1) * V._CELL].astype(int)
+
+
+def test_mosaic_cell_composites_real_structured_pixels(qapp, stub_detail, squid_dataset, tmp_path):
+    """Drive the real widget and LOOK at the acquired cell: it must hold real, varying imagery.
+
+    Measured on the MONTAGE (``_active_source``), one cell of which is exactly _CELL x _CELL, and
+    NOT on ``grab()`` of the whole widget. That is deliberate. The widget also paints row/column
+    labels, a 3px grid, status dots, the red current-well box and (IMA-220) the carrier
+    photograph; on this fixture the plate auto-fits to ~12 px per cell, so a cropped cell is
+    almost entirely chrome and its variance stays high with the montage blanked out entirely.
+    A whole-widget dynamic-range assertion therefore passes with the tiles deleted -- it was
+    written that way first, and a mutation that returns a blank montage still passed it. The
+    montage crop kills that mutant, which is the only reason to prefer it.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("mip", out_parent=str(tmp_path))
+    _drain_until(qapp, lambda: len(win._overview._tiles) >= 2)
+    try:
+        ov = win._overview
+        ov.recomposite(ov._active)
+        qapp.processEvents()
+        img = ov._active_source()
+        tiled = sorted(ov._tiles_by_layer.get(ov._active, set()))
+        assert tiled, "no cell has an image on the active layer"
+        got = _cell_of(img, *tiled[0])
+        assert got.size, "the acquired cell fell outside the montage"
+        assert int(got.max()) - int(got.min()) > 30, (
+            f"acquired-cell dynamic range is only {int(got.max()) - int(got.min())}: the cell is "
+            "effectively blank (tiles never composited, or contrast collapsed the window).")
+        # NOTE: no std-over-the-whole-cell assertion. This fixture's frames are 4x4 px, so their
+        # boxes cover a few percent of the 88px cell and the rest is legitimate zero padding --
+        # whole-cell std is ~0.4 even when the mosaic is perfect. Coverage of the cell is the
+        # mosaic's business (asserted by box below), brightness is the tile's.
+        # ...and it must differ from an UNACQUIRED cell, or "structure" could just be background.
+        empty = [(r, c) for r in range(ov._nr) for c in range(ov._nc) if (r, c) not in tiled]
+        if empty:
+            ref = _cell_of(img, *empty[-1])
+            # MAX, not mean: this fixture's fields cover a few percent of the cell, so a mean over
+            # all 88x88 px is ~0.004 even for a perfectly drawn mosaic. Mean would only be asking
+            # "does the tile fill the cell", which is not this assertion's question.
+            assert int(np.abs(got - ref).max()) > 30, (
+                "an acquired cell is indistinguishable from an empty one: nothing was drawn.")
+        # ...and the mosaic must reach BOTH fields' sub-boxes, not just fov 0's.
+        if ov._boxes:
+            ri, ci = win._fov_index["B2"]["rc"]
+            cell = ov._store_for(ov._active)[:, ri * V._CELL:(ri + 1) * V._CELL,
+                                             ci * V._CELL:(ci + 1) * V._CELL]
+            for fov in (0, 1):
+                top, left, h, w = ov._boxes[("B2", fov)]
+                assert int(np.count_nonzero(cell[:, top:top + h, left:left + w])) > 0, (
+                    f"fov {fov}'s sub-box is entirely zero: only part of the mosaic was composited.")
+    finally:
+        win._stop_worker(); win.close()
+
+
 # --- IMA-205 + IMA-221: the SHIFT GESTURE opens the exploration tab ---------------------------
 #
 # This is the user's verbatim sentence, end to end: "hold shift to open an 'exploration' tab with
