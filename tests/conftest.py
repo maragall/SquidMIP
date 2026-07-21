@@ -135,6 +135,64 @@ def pyramid_dataset(tmp_path):
     return root, region, size
 
 
+# --- IMA-254: one fixture per Squid output writer --------------------------------------------
+#
+# The builders live in tests/writer_fixtures.py and are imported INSIDE each fixture, not at
+# module scope: writer_fixtures imports this module's shape constants, so a top-level import here
+# would be circular. Deferring it also keeps collection cheap for the many tests that need none
+# of them.
+#
+# Every one of these produces the SAME logical acquisition (2 regions x 2 FOVs x 2 z x 2 channels
+# of 4x4 uint16) through a DIFFERENT writer, which is what lets the coverage suite assert
+# identical metadata and identical pixels across all six with no per-writer special-casing.
+
+def _writer_fixture(tmp_path, builder, name):
+    from tests import writer_fixtures
+
+    root = builder(tmp_path / name)
+    return root, writer_fixtures.expected_arrays()
+
+
+@pytest.fixture
+def multipage_dataset(tmp_path):
+    """MULTI_PAGE_TIFF: ``0/{region}_{fov:04}_stack.tiff``, positions inline, no coordinates.csv."""
+    from tests import writer_fixtures
+
+    return _writer_fixture(tmp_path, writer_fixtures.build_multi_page_tiff, "acq_multipage")
+
+
+@pytest.fixture
+def ome_tiff_dataset(tmp_path):
+    """SaveOMETiffJob: ``ome_tiff/{region}_{fov:04}.ome.tiff``, 5-D TZCYX."""
+    from tests import writer_fixtures
+
+    return _writer_fixture(tmp_path, writer_fixtures.build_ome_tiff, "acq_ome")
+
+
+@pytest.fixture
+def zarr_hcs_dataset(tmp_path):
+    """SaveZarrJob HCS: ``plate.ome.zarr/{row}/{col}/{fov}/0``, 5-D TCZYX."""
+    from tests import writer_fixtures
+
+    return _writer_fixture(tmp_path, writer_fixtures.build_zarr_hcs, "acq_zarr_hcs")
+
+
+@pytest.fixture
+def zarr_per_fov_dataset(tmp_path):
+    """SaveZarrJob non-HCS default: ``zarr/{region}/fov_{n}.ome.zarr/0``, 5-D TCZYX."""
+    from tests import writer_fixtures
+
+    return _writer_fixture(tmp_path, writer_fixtures.build_zarr_per_fov, "acq_zarr_fov")
+
+
+@pytest.fixture
+def zarr_6d_dataset(tmp_path):
+    """SaveZarrJob non-HCS 6D: ``zarr/{region}/acquisition.zarr``, 6-D FTCZYX (non-standard)."""
+    from tests import writer_fixtures
+
+    return _writer_fixture(tmp_path, writer_fixtures.build_zarr_6d, "acq_zarr_6d")
+
+
 @pytest.fixture
 def real_dataset():
     """The real 10x laser-AF tissue acquisition; else skip (used by integration tests).

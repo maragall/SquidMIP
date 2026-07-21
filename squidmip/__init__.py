@@ -52,7 +52,13 @@ from squidmip.projection import (
     project_well,
     select_fovs,
 )
-from squidmip.reader import SquidReader, open_reader
+from squidmip.reader import (
+    SquidMultiPageTiffReader,
+    SquidOMEReader,
+    SquidReader,
+    SquidZarrReader,
+    open_reader,
+)
 
 # --- the IMA-223/224/225 plane-ops ------------------------------------------------------------
 #
@@ -82,7 +88,11 @@ from squidmip._flatfield import FlatfieldProfile, correct_flatfield, estimate_pr
 
 __all__ = [
     "open_reader",
+    # One reader per Squid writer, all behind the same interface (IMA-254).
     "SquidReader",
+    "SquidMultiPageTiffReader",
+    "SquidOMEReader",
+    "SquidZarrReader",
     "select_fovs",
     "project",
     "project_well",

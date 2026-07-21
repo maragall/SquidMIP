@@ -250,8 +250,12 @@ def test_open_reader_rejects_non_directory(tmp_path):
 
 
 def test_empty_dir_raises(tmp_path):
+    # IMA-254: the refusal now comes from open_reader's dispatch rather than from SquidReader's
+    # index build, and it names EVERY writer it looked for instead of only the individual-TIFF
+    # one. An operator whose acquisition is multi-page or Zarr previously got "no
+    # {region}_{fov}_{z}_{channel}.tiff" — true, and a dead end.
     (tmp_path / "0").mkdir()
-    with pytest.raises(ValueError, match="No Squid individual-TIFF"):
+    with pytest.raises(ValueError, match="not a readable Squid acquisition"):
         open_reader(tmp_path).metadata
 
 

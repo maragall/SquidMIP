@@ -1,15 +1,26 @@
-"""SquidMIP reader: format-aware ingest for Squid individual-TIFF acquisitions.
+"""SquidMIP reader: format-aware ingest for EVERY Squid output writer.
 
-``open_reader(path)`` dispatches on the on-disk format and returns a reader. Three formats are
-served, all behind ONE interface — ``metadata`` (identical key set, micrometres, ``_um``-suffixed)
-plus ``read(region, fov, channel, z, t)`` returning a 2-D native-dtype plane:
+``open_reader(path)`` dispatches on the on-disk format and returns a reader. All four readers sit
+behind ONE interface — ``metadata`` (identical key set, micrometres, ``_um``-suffixed) plus
+``read(region, fov, channel, z, t)`` returning a 2-D native-dtype plane:
 
     individual TIFFs   :class:`SquidReader`      (IMA-189)   ``<acq>/{t}/{region}_{fov}_{z}_{ch}.tiff``
+    multi-page TIFF    :class:`SquidMultiPageTiffReader` (IMA-254) ``<acq>/{t}/{region}_{fov}_stack.tiff``
     OME-TIFF           :class:`SquidOMEReader`               ``<acq>/ome_tiff/{region}_{fov}.ome.tiff``
     OME-NGFF Zarr      :class:`SquidZarrReader`  (IMA-229)   ``<acq>/plate.ome.zarr/…`` or ``<acq>/zarr/…``
 
 The interface IS the seam: engine, CLI and viewer consume any of them with no ``isinstance``
-check and no parallel API. Multi-page TIFF remains unimplemented.
+check and no parallel API.
+
+COVERAGE FOLLOWS THE SPEC, NOT THE LOCAL DISK (IMA-254). The writer list above is read out of
+``control/core/job_processing.py`` (``SaveImageJob``, ``SaveOMETiffJob``, ``SaveZarrJob``) and
+``control/utils.py`` (the three zarr path builders), and every one of them has a synthetic
+fixture in ``tests/conftest.py`` sized in kilobytes. Before this, two writers were unserved
+because only two acquisitions had ever been tested against and both came from the same writer;
+one of the two — MULTI_PAGE_TIFF — was not refused but SILENTLY skipped file-by-file, so a full
+acquisition reported as empty. Every unsupported or malformed layout now fails loudly, naming
+the format it found and the formats it expected. ``tests/test_writer_coverage.py`` asserts there
+is no ``continue`` past a file matching a known Squid naming pattern.
 
 Individual-TIFFs layout (one channel per file), verified against real data::
 
@@ -76,6 +87,21 @@ from squidmip._channels import fallback_color, load_channel_yaml, resolve_channe
 # region has no underscore; fov and z are ints; channel is the remainder (may contain _ and -).
 _STEM_RE = re.compile(r"^(?P<region>[^_]+)_(?P<fov>\d+)_(?P<z>\d+)_(?P<channel>.+)$")
 _TIFF_SUFFIXES = (".tiff", ".tif")
+
+# IMA-254. Squid's SaveImageJob has TWO on-disk shapes, selected by _def.FILE_SAVING_OPTION:
+#
+#   FileSavingOption.<default>         {region}_{fov}_{z}_{channel}.tiff    -> _STEM_RE
+#   FileSavingOption.MULTI_PAGE_TIFF   {region}_{fov:0{FILE_ID_PADDING}}_stack.tiff
+#
+# The fov field is ZERO-PADDED to control._def.FILE_ID_PADDING, which is a deployment setting
+# (0 on the reference config, but sites set it to 3, 4, ...). The width is therefore parsed, never
+# assumed: ``\d+`` then ``int()``. Writing the padding into the pattern would make this reader
+# silently blind on any rig configured differently — the exact class of failure IMA-254 is about.
+_STACK_STEM_RE = re.compile(r"^(?P<region>[^_]+)_(?P<fov>\d+)_stack$")
+
+# TIFF tags Squid's multi-page writer populates per page (job_processing.SaveImageJob.save_image).
+_TAG_IMAGE_DESCRIPTION = 270
+_TAG_PAGE_NAME = 285
 
 # Squid grayscale planes are MONO8 (uint8) or MONO12/MONO16 (uint16); see
 # software/squid/camera/utils.py get_available_pixel_formats. It never writes uint32/float
@@ -353,10 +379,60 @@ def _plate_key(region: str):
     return (0, len(m.group(1)), m.group(1).upper(), int(m.group(2)))
 
 
+def _time_folders(path: Path) -> list[Path]:
+    """Squid's timepoint folders (``0/``, ``1/``, …) under *path*, else *path* itself.
+
+    Shared by every TIFF-shaped reader: ``multi_point_worker`` writes to
+    ``{experiment_path}/{time_point:0{FILE_ID_PADDING}}``, so the folder NAME is a zero-padded
+    integer of unknown width and the sort must be numeric, not lexicographic.
+    """
+    numeric = [d for d in path.iterdir() if d.is_dir() and d.name.isdigit()]
+    return sorted(numeric, key=lambda d: int(d.name)) if numeric else [path]
+
+
+def _classify_tiff_folder(folder: Path) -> tuple[int, int, list]:
+    """``(n_individual, n_stack, other_names)`` for one timepoint folder.
+
+    The dispatch evidence, gathered ONCE so the error message can state what was actually on
+    disk. ``other_names`` is capped — an error listing 20 000 filenames is not a message.
+    """
+    individual = stacks = 0
+    other: list = []
+    for f in sorted(folder.iterdir()):
+        if not f.is_file() or f.suffix.lower() not in _TIFF_SUFFIXES:
+            continue
+        if _STEM_RE.match(f.stem):
+            individual += 1
+        elif _STACK_STEM_RE.match(f.stem):
+            stacks += 1
+        elif len(other) < 8:
+            other.append(f.name)
+    return individual, stacks, other
+
+
 def open_reader(path) -> "SquidReader":
     """Detect the acquisition format at *path* and return a reader.
 
-    Raises NotImplementedError for formats other than individual TIFFs (the dispatch seam).
+    Dispatch covers every writer in ``control/core/job_processing.py`` (IMA-254). The mapping,
+    verified against that module rather than against whichever acquisitions happen to be on a
+    given machine — the reason two writers went unserved is that only two acquisitions were ever
+    tested, and both came from the same writer:
+
+    ===========================================  =======================================  =========
+    Squid writer                                 on-disk shape                            reader
+    ===========================================  =======================================  =========
+    ``SaveImageJob`` (default)                   ``{t}/{region}_{fov}_{z}_{ch}.tiff``     SquidReader
+    ``SaveImageJob`` MULTI_PAGE_TIFF             ``{t}/{region}_{fov}_stack.tiff``        SquidMultiPageTiffReader
+    ``SaveOMETiffJob``                           ``ome_tiff/{region}_{fov}.ome.tiff``     SquidOMEReader
+    ``SaveZarrJob`` HCS                          ``plate.ome.zarr/{row}/{col}/{fov}/0``   SquidZarrReader
+    ``SaveZarrJob`` non-HCS per-FOV              ``zarr/{region}/fov_{n}.ome.zarr/0``     SquidZarrReader
+    ``SaveZarrJob`` non-HCS 6D (non-standard)    ``zarr/{region}/acquisition.zarr``       SquidZarrReader
+    ===========================================  =======================================  =========
+
+    Anything else raises, NAMING what was found and what was expected. There is no path on which
+    an unrecognised layout yields an empty-looking acquisition: a reader that reports "0 images"
+    for a directory full of images is worse than one that refuses, because the operator believes
+    it.
     """
     path = Path(path)
     if not path.is_dir():
@@ -372,18 +448,76 @@ def open_reader(path) -> "SquidReader":
     store = _find_zarr_store(path)
     if store is not None:
         return SquidZarrReader(store, acquisition_root=path)
-    return SquidReader(path)
+
+    folder = _time_folders(path)[0]
+    individual, stacks, other = _classify_tiff_folder(folder)
+    if individual:
+        if stacks:
+            # Both writers' output in one folder. Serve the richer one, but say so: this is
+            # either a re-run over an existing folder or a config change mid-acquisition, and
+            # silently ignoring half the files is how IMA-254 happened in the first place.
+            warnings.warn(
+                f"{folder!s} contains BOTH {individual} individual-TIFF plane(s) "
+                f"({{region}}_{{fov}}_{{z}}_{{channel}}.tiff) and {stacks} multi-page stack(s) "
+                "({region}_{fov}_stack.tiff). Squid writes one or the other per acquisition, so "
+                "this folder holds two runs. Reading the individual TIFFs and IGNORING the "
+                "stacks — split them into separate folders to read the stacks."
+            )
+        return SquidReader(path)
+    if stacks:
+        return SquidMultiPageTiffReader(path)
+    raise ValueError(
+        f"{path!s} is not a readable Squid acquisition: {folder!s} contains no "
+        "{region}_{fov}_{z}_{channel}.tiff (individual TIFF writer) and no "
+        "{region}_{fov}_stack.tiff (MULTI_PAGE_TIFF writer), there is no ome_tiff/ folder with "
+        ".ome.tiff files (SaveOMETiffJob) and no plate.ome.zarr/ or zarr/ store (SaveZarrJob). "
+        + (f"Non-matching TIFF files present: {other}. " if other else "")
+        + "Point open_reader at the acquisition folder itself, not a parent or a subfolder."
+    )
+
+
+# IMA-254. Squid's non-HCS Zarr output nests one MORE level than IMA-229 assumed:
+# ``zarr/{region_id}/fov_{n}.ome.zarr`` (``control/utils.build_per_fov_zarr_path``), one NGFF image
+# group per FOV, with the array at ``…/fov_{n}.ome.zarr/0``. ``n`` is the raw FOV index, unpadded.
+_PER_FOV_ZARR_RE = re.compile(r"^fov_(?P<fov>\d+)\.ome\.zarr$")
+
+# ``control/utils.build_6d_zarr_path``: the non-standard 6D layout, one (FOV, T, C, Z, Y, X) array
+# per region. Note this node is a zarr ARRAY, not a group — Squid's ZarrWriter writes the OME
+# metadata into the array's own ``zarr.json`` attributes with ``datasets[0].path == "."`` — so
+# ``_is_zarr_group`` is False for it and it must be recognised by NAME.
+_SIXD_ZARR_NAME = "acquisition.zarr"
+
+
+def _nonhcs_region_children(region_dir: Path) -> tuple[list, Optional[Path]]:
+    """``(per_fov_groups, sixd_array_or_None)`` inside one ``zarr/{region_id}/`` directory."""
+    if not region_dir.is_dir():
+        return [], None
+    per_fov = sorted(
+        (c for c in region_dir.iterdir() if c.is_dir() and _PER_FOV_ZARR_RE.match(c.name)),
+        key=lambda c: int(_PER_FOV_ZARR_RE.match(c.name)["fov"]),
+    )
+    sixd = region_dir / _SIXD_ZARR_NAME
+    return per_fov, (sixd if sixd.is_dir() else None)
 
 
 def _find_zarr_store(path: Path):
     """The Zarr root to read at/under *path*, or ``None`` if this is not a Zarr acquisition.
 
-    Recognised (IMA-229), in priority order:
+    Recognised (IMA-229, extended in IMA-254), in priority order:
 
     * *path* IS a zarr group — an ``…​.ome.zarr`` plate or image group handed in directly;
     * ``<path>/plate.ome.zarr`` — Squid's (and SquidMIP's own writer's) canonical HCS output;
     * ``<path>/*.zarr`` — any other single ``.zarr`` sibling, e.g. a renamed plate;
-    * ``<path>/zarr/`` — the non-HCS layout, one image group per ``{region_id}``.
+    * ``<path>/zarr/`` — the non-HCS layouts. THREE shapes live under here and all three are
+      served: a bare image group per region (``zarr/{region}/`` itself, what IMA-229 assumed and
+      what SquidMIP's own round-trip writes), Squid's real per-FOV
+      ``zarr/{region}/fov_{n}.ome.zarr``, and the non-standard 6D
+      ``zarr/{region}/acquisition.zarr``.
+
+    A ``zarr/`` folder that holds region subdirectories but nothing recognisable RAISES rather
+    than returning ``None``. Returning ``None`` would fall through to the individual-TIFF reader,
+    whose complaint ("no {region}_{fov}_{z}_{channel}.tiff") names the wrong format entirely and
+    sends the reader hunting for missing TIFFs in a Zarr acquisition.
     """
     if _is_zarr_group(path):
         return path
@@ -394,9 +528,22 @@ def _find_zarr_store(path: Path):
         if _is_zarr_group(candidate):
             return candidate
     bare = path / "zarr"
-    if bare.is_dir() and any(_is_zarr_group(d) for d in bare.iterdir() if d.is_dir()):
-        return bare
-    return None
+    if not bare.is_dir():
+        return None
+    subdirs = [d for d in sorted(bare.iterdir()) if d.is_dir()]
+    if not subdirs:
+        return None
+    for d in subdirs:
+        per_fov, sixd = _nonhcs_region_children(d)
+        if _is_zarr_group(d) or per_fov or sixd is not None:
+            return bare
+    raise ValueError(
+        f"{bare!s} looks like Squid's non-HCS Zarr output but no readable store was found in it. "
+        f"Region folders present: {[d.name for d in subdirs[:8]]}. Expected one of: "
+        "zarr/{region}/fov_{n}.ome.zarr (SaveZarrJob non-HCS default), "
+        "zarr/{region}/acquisition.zarr (SaveZarrJob non-HCS 6D), or zarr/{region}/ itself being "
+        "an OME-NGFF image group. Refusing rather than reporting an empty acquisition."
+    )
 
 
 class SquidReader:
@@ -411,10 +558,7 @@ class SquidReader:
     # -- timepoints -------------------------------------------------------
     def _discover_time_folders(self) -> list[Path]:
         if self._time_folders is None:
-            numeric = [d for d in self._path.iterdir() if d.is_dir() and d.name.isdigit()]
-            self._time_folders = (
-                sorted(numeric, key=lambda d: int(d.name)) if numeric else [self._path]
-            )
+            self._time_folders = _time_folders(self._path)
         return self._time_folders
 
     # -- index ------------------------------------------------------------
@@ -424,19 +568,38 @@ class SquidReader:
             return self._index
         folder = self._discover_time_folders()[0]
         index: dict = {}
-        for f in folder.iterdir():
+        skipped: list = []
+        for f in sorted(folder.iterdir()):
             if f.suffix.lower() not in _TIFF_SUFFIXES:
                 continue
             m = _STEM_RE.match(f.stem)
-            if not m:
-                continue  # e.g. {region}_{fov}_stack.tiff (multi-page) — not this reader's format
-            key = (m["region"], int(m["fov"]), int(m["z"]), m["channel"])
-            index[key] = f.suffix
+            if m:
+                key = (m["region"], int(m["fov"]), int(m["z"]), m["channel"])
+                index[key] = f.suffix
+                continue
+            # IMA-254. This branch used to be a bare ``continue`` with a comment naming the very
+            # format it was discarding. On a MULTI_PAGE_TIFF acquisition EVERY file took it, the
+            # index came out empty, and the acquisition reported as unreadable-because-empty
+            # rather than as the wrong reader for a known Squid format. The code knew and said
+            # nothing. A stem that matches a known Squid pattern now raises here; anything else
+            # is remembered so the empty-index error can name it.
+            if _STACK_STEM_RE.match(f.stem):
+                raise ValueError(
+                    f"{f.name} is Squid's MULTI_PAGE_TIFF layout "
+                    "({region}_{fov:0FILE_ID_PADDING}_stack.tiff, written by SaveImageJob when "
+                    "_def.FILE_SAVING_OPTION == FileSavingOption.MULTI_PAGE_TIFF), not the "
+                    "individual-TIFF layout ({region}_{fov}_{z}_{channel}.tiff) this reader "
+                    "serves. Use squidmip.open_reader(), which dispatches to "
+                    "SquidMultiPageTiffReader for this format."
+                )
+            if len(skipped) < 8:
+                skipped.append(f.name)
         if not index:
             raise ValueError(
                 "No Squid individual-TIFF files "
                 "({region}_{fov}_{z}_{channel}.tiff) found in "
-                f"{folder!s}"
+                f"{folder!s}" + (f"; TIFF files present but unrecognised: {skipped}" if skipped
+                                 else "")
             )
         self._index = index
         return index
@@ -552,6 +715,267 @@ class SquidReader:
             if other.exists():
                 return other
         return candidate  # let tifffile raise a clear FileNotFoundError
+
+
+def _page_json(page, path: Path, page_index: int) -> dict:
+    """The per-page metadata dict Squid embeds in ImageDescription, or a loud failure.
+
+    ``SaveImageJob.save_image`` calls ``TiffWriter.write(metadata=..., description=json.dumps(...),
+    extratags=[(285, 's', 0, channel, False)])``. tifffile honours BOTH arguments, so each page
+    carries TWO ImageDescription (270) tags: Squid's own JSON first, then tifffile's "shaped" JSON
+    (the same keys plus ``shape``). Either answers the question, so every 270 tag is tried and the
+    first one that parses as an object carrying ``z_level`` wins — that tolerates a tifffile
+    version that emits only one of them, in either order.
+    """
+    for tag in page.tags:
+        if tag.code != _TAG_IMAGE_DESCRIPTION:
+            continue
+        try:
+            payload = json.loads(tag.value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and "z_level" in payload:
+            return payload
+    raise ValueError(
+        f"{path.name} page {page_index} carries no Squid metadata: no ImageDescription (TIFF tag "
+        f"{_TAG_IMAGE_DESCRIPTION}) holding JSON with a 'z_level' key. Squid's MULTI_PAGE_TIFF "
+        "writer records z_level/channel/region_id/fov/x_mm/y_mm/z_mm/time on every page; without "
+        "it the page's place in the (z, channel) grid is unknowable. Refusing to guess from page "
+        "order — a guessed order silently mis-assigns channels."
+    )
+
+
+def _page_channel(page, payload: dict, path: Path, page_index: int) -> str:
+    """The page's channel name: PageName (tag 285) first, the JSON ``channel`` key as fallback.
+
+    Tag 285 is the primary source because it is the one field a generic TIFF viewer also shows,
+    so it is what an operator sees; the JSON copy exists for readers that drop unknown tags. When
+    both are present and DISAGREE the file is refused rather than resolved by precedence — two
+    different channel names for one plane means the writer or a post-processing step is broken,
+    and picking either one mislabels pixels in a way nothing downstream can detect.
+    """
+    tag = page.tags.get(_TAG_PAGE_NAME)
+    from_tag = str(tag.value).strip() if tag is not None and tag.value else ""
+    from_json = str(payload.get("channel") or "").strip()
+    if from_tag and from_json and from_tag != from_json:
+        raise ValueError(
+            f"{path.name} page {page_index} disagrees with itself about the channel: PageName "
+            f"(tag {_TAG_PAGE_NAME}) says {from_tag!r} but ImageDescription JSON says "
+            f"{from_json!r}. Refusing to pick one — a mislabelled channel is invisible downstream."
+        )
+    name = from_tag or from_json
+    if not name:
+        raise ValueError(
+            f"{path.name} page {page_index} names no channel: neither PageName (tag "
+            f"{_TAG_PAGE_NAME}) nor a 'channel' key in the ImageDescription JSON. Squid's "
+            "MULTI_PAGE_TIFF writer sets both."
+        )
+    return name
+
+
+class SquidMultiPageTiffReader:
+    """Lazy reader over Squid's MULTI_PAGE_TIFF acquisitions (IMA-254).
+
+    Layout, from ``control/core/job_processing.py`` ``SaveImageJob.save_image`` on the
+    ``_def.FILE_SAVING_OPTION == FileSavingOption.MULTI_PAGE_TIFF`` branch::
+
+        <acq>/{t}/{region}_{fov:0{FILE_ID_PADDING}}_stack.tiff
+
+    ONE file per (timepoint, region, FOV), APPENDED to one page at a time — every (z, channel) of
+    that field is a separate IFD page in whatever order the acquisition happened to run. The file
+    carries no series axes (tifffile reports four independent ``YX`` series for four pages), so
+    page ORDER is not a usable index.
+
+    The index therefore comes from each page's own metadata, never from its position:
+
+    * ``PageName`` (tag 285) -> channel name;
+    * ``ImageDescription`` (tag 270) -> JSON with ``z_level``, ``channel``, ``channel_index``,
+      ``region_id``, ``fov``, ``x_mm``, ``y_mm``, ``z_mm``, ``time`` and, when the piezo is in
+      use, ``z_piezo (um)``.
+
+    That is also why an interrupted or re-ordered acquisition still reads correctly, and why a
+    page missing its metadata is refused instead of being slotted in by position.
+
+    Presents the SAME interface as :class:`SquidReader`, :class:`SquidOMEReader` and
+    :class:`SquidZarrReader` — the identical ``metadata`` key set (micrometres, ``_um``-suffixed)
+    plus ``read``/``plane_ref``. The interface is the seam; no consumer branches on reader type.
+
+    Positions: this writer records the stage position INLINE, per page, in MILLIMETRES
+    (``x_mm``/``y_mm``). The mm -> um conversion happens here, at the producer, into
+    ``fov_positions_um``, exactly as ``coordinates.csv`` is converted in
+    :func:`load_fov_positions_um`. There is no second scale factor anywhere downstream.
+    """
+
+    def __init__(self, path) -> None:
+        self._path = Path(path)
+        self._time_folders_cache: Optional[list[Path]] = None
+        self._indexes: dict[int, dict] = {}     # t -> {(region, fov, z, channel): (Path, page)}
+        self._positions_mm: dict = {}           # {(region, fov): (x_mm, y_mm)} from t=0
+        self._meta: Optional[dict] = None
+        self._handles: dict = {}                # Path -> tifffile.TiffFile (cached)
+
+    # -- discovery ---------------------------------------------------------
+    def _discover_time_folders(self) -> list[Path]:
+        if self._time_folders_cache is None:
+            self._time_folders_cache = _time_folders(self._path)
+        return self._time_folders_cache
+
+    def _tif(self, path: Path):
+        tif = self._handles.get(path)
+        if tif is None:
+            tif = tifffile.TiffFile(path)
+            self._handles[path] = tif
+        return tif
+
+    def _index_for(self, t: int) -> dict:
+        """``{(region, fov, z, channel): (path, page_index)}`` for one timepoint folder."""
+        if t in self._indexes:
+            return self._indexes[t]
+        folder = self._discover_time_folders()[t]
+        index: dict = {}
+        stacks = [f for f in sorted(folder.iterdir())
+                  if f.suffix.lower() in _TIFF_SUFFIXES and _STACK_STEM_RE.match(f.stem)]
+        for f in stacks:
+            m = _STACK_STEM_RE.match(f.stem)
+            # FILE_ID_PADDING is a deployment setting; int() reads whatever width was written.
+            region, fov = m["region"], int(m["fov"])
+            tif = self._tif(f)
+            for page_index, page in enumerate(tif.pages):
+                payload = _page_json(page, f, page_index)
+                channel = _page_channel(page, payload, f, page_index)
+                z = int(payload["z_level"])
+                key = (region, fov, z, channel)
+                if key in index:
+                    raise ValueError(
+                        f"{f.name} has two pages claiming z={z} channel={channel!r} (pages "
+                        f"{index[key][1]} and {page_index}). One of them would be unreachable; "
+                        "refusing rather than serving whichever happened to be indexed last."
+                    )
+                index[key] = (f, page_index)
+                if t == 0:
+                    self._record_position(region, fov, payload)
+        if not index:
+            raise ValueError(
+                "No Squid MULTI_PAGE_TIFF stacks ({region}_{fov}_stack.tiff) found in "
+                f"{folder!s}"
+            )
+        self._indexes[t] = index
+        return index
+
+    def _record_position(self, region: str, fov: int, payload: dict) -> None:
+        """First page wins for a field's stage position — deliberately, and without a cross-check.
+
+        ``multi_point_worker`` re-reads ``stage.get_pos()`` for EVERY capture, so the x/y recorded
+        on a field's z=1 page differs from its z=0 page by the stage's own repeatability. Treating
+        that jitter as a conflict (the way ``coordinates.csv`` treats two genuinely different
+        positions filed under one fov id) would refuse every real z-stack. The first page of a
+        field is the position at which that field was first imaged, which is the tile origin.
+        """
+        key = (str(region), int(fov))
+        if key in self._positions_mm:
+            return
+        try:
+            x_mm, y_mm = float(payload["x_mm"]), float(payload["y_mm"])
+        except (KeyError, TypeError, ValueError):
+            return          # a page without a position simply contributes none
+        self._positions_mm[key] = (x_mm, y_mm)
+
+    # -- metadata ----------------------------------------------------------
+    @property
+    def metadata(self) -> dict:
+        if self._meta is not None:
+            return self._meta
+        index = self._index_for(0)
+        time_folders = self._discover_time_folders()
+
+        fovs: dict[str, set] = {}
+        channels: set = set()
+        z_levels: set = set()
+        for (region, fov, z, channel) in index:
+            fovs.setdefault(region, set()).add(fov)
+            channels.add(channel)
+            z_levels.add(z)
+        regions = sorted(fovs, key=_plate_key)
+        fovs_per_region = {r: sorted(fovs[r]) for r in regions}
+        z_sorted = sorted(z_levels)
+        n_z, n_t = len(z_sorted), len(time_folders)
+
+        acq = load_acquisition_metadata(self._path)
+        if acq["n_z_declared"] is not None and acq["n_z_declared"] != n_z:
+            warnings.warn(
+                f"Recorded Nz ({acq['n_z_declared']}) != distinct z levels in the stack pages "
+                f"({n_z}); using the page-derived value."
+            )
+        if acq["n_t_declared"] is not None and acq["n_t_declared"] != n_t:
+            warnings.warn(
+                f"Recorded Nt ({acq['n_t_declared']}) != timepoint folders found ({n_t}); "
+                "using the folder-derived value."
+            )
+
+        # frame shape + dtype come from a real decoded page — they vary with binning / pixel format.
+        s_region, s_fov, s_z, s_channel = next(iter(index))
+        sample = self.read(s_region, s_fov, s_channel, s_z)
+        self._meta = {
+            "regions": regions,
+            "fovs_per_region": fovs_per_region,
+            "fov_positions_um": self._positions_um(fovs_per_region),
+            "channels": resolve_channels(sorted(channels), load_channel_yaml(self._path)),
+            "n_z": n_z,
+            "z_levels": z_sorted,
+            "dz_um": acq["dz_um"],
+            "pixel_size_um": acq["pixel_size_um"],
+            "wellplate_format": acq["wellplate_format"],
+            "frame_shape": tuple(sample.shape),
+            "dtype": sample.dtype,
+            "n_t": n_t,
+        }
+        return self._meta
+
+    def _positions_um(self, fovs_per_region: dict) -> dict:
+        """``{(region, fov): (x_um, y_um)}`` — MICROMETRES, converted HERE at the single producer.
+
+        The pages' inline ``x_mm``/``y_mm`` are authoritative for this writer: they are the stage
+        position of the capture itself, not a plan of where it was supposed to go. A sibling
+        ``coordinates.csv`` is the fallback only when no page carried a position at all.
+        """
+        self._index_for(0)                       # populates _positions_mm
+        if self._positions_mm:
+            return {k: (x * _MM_TO_UM, y * _MM_TO_UM)
+                    for k, (x, y) in self._positions_mm.items()}
+        return _fov_positions_um_or_empty(self._path, fovs_per_region)
+
+    # -- read --------------------------------------------------------------
+    def _locate(self, region, fov, channel, z, t) -> tuple:
+        time_folders = self._discover_time_folders()
+        t = int(t)
+        if not 0 <= t < len(time_folders):
+            raise IndexError(f"t={t} out of range (n_t={len(time_folders)}).")
+        index = self._index_for(t)
+        key = (str(region), int(fov), int(z), str(channel))
+        if key not in index:
+            raise KeyError(
+                f"No such plane region={region!r} fov={fov} channel={channel!r} z={z}. "
+                f"Known regions={sorted({k[0] for k in index})}, "
+                f"channels={sorted({k[3] for k in index})}."
+            )
+        return index[key]
+
+    def read(self, region, fov, channel, z, t=0):
+        """Return one plane as a 2D array in its native dtype (decodes exactly one IFD page)."""
+        path, page_index = self._locate(region, fov, channel, z, t)
+        page = self._tif(path).pages[page_index]
+        return _validate_plane(np.asarray(page.asarray()), path)
+
+    def plane_path(self, region, fov, channel, z, t=0) -> Path:
+        """The stack file holding this plane. Unlike the individual-TIFF reader's one-file-per-
+        plane, this path holds the whole field — see :meth:`plane_ref` for the addressable form."""
+        return self._locate(region, fov, channel, z, t)[0]
+
+    def plane_ref(self, region, fov, channel, z, t=0) -> tuple:
+        """``(filepath, page_index)`` — the viewer registers this straight into ndviewer, so the
+        raw stack displays from the .tiff on disk with zero bytes copied."""
+        path, page_index = self._locate(region, fov, channel, z, t)
+        return str(path), page_index
 
 
 # {region}_{fov} stem (region = well id, no trailing _<digits>; fov = trailing integer).
@@ -881,9 +1305,20 @@ class _Multiscale:
         x, y = self._physical(self._translation, "x"), self._physical(self._translation, "y")
         return None if x is None or y is None else (x, y)
 
-    def index(self, shape, t: int, c: int, z: int) -> tuple:
-        """The tensorstore index tuple selecting the single ``(y, x)`` plane at (t, c, z)."""
-        picks = {"t": t, "c": c, "z": z}
+    @property
+    def is_6d_fov(self) -> bool:
+        """True for Squid's non-standard 6D ``acquisition.zarr`` — a leading ``fov`` axis."""
+        return self.axis_names[:1] == ["fov"]
+
+    def index(self, shape, t: int, c: int, z: int, fov: int = 0) -> tuple:
+        """The tensorstore index tuple selecting the single ``(y, x)`` plane at (t, c, z[, fov]).
+
+        ``fov`` matters only for the 6D layout; a 5D store has no ``fov`` axis and the value is
+        simply never consulted. It is threaded through rather than defaulted inside because the
+        alternative — letting the unknown axis fall to ``picks.get(n, 0)`` — served FOV 0's pixels
+        for every FOV of the region, which is a silently wrong image, not an error.
+        """
+        picks = {"t": t, "c": c, "z": z, "fov": fov}
         return tuple(
             slice(None) if n in ("y", "x") else picks.get(n, 0)
             for n in self.axis_names[: len(shape)]
@@ -957,15 +1392,63 @@ class SquidZarrReader:
         return fields
 
     def _discover_flat(self) -> dict:
-        """Non-HCS: every child group of ``zarr/`` is one region's single image (FOV 0)."""
+        """Non-HCS: map every region folder under ``zarr/`` to its field image group(s).
+
+        Three shapes, all real (IMA-254 — the first was the only one IMA-229 handled, and it is
+        the one Squid does NOT write; it exists because SquidMIP's own round-trip produces it):
+
+        ``zarr/{region}/``                     the region folder IS the image group; one FOV, id 0.
+        ``zarr/{region}/fov_{n}.ome.zarr``     ``build_per_fov_zarr_path`` — 5D TCZYX per FOV.
+        ``zarr/{region}/acquisition.zarr``     ``build_6d_zarr_path`` — ONE 6D FTCZYX array whose
+                                               leading axis is the FOV. Every FOV of the region
+                                               maps to the same node; ``_Multiscale.index`` picks
+                                               the FOV out of the leading axis at read time.
+
+        A region folder that holds none of these RAISES rather than being skipped: a region that
+        vanishes from ``regions`` looks exactly like a region that was never acquired.
+        """
         fields: dict = {}
         for child in sorted(self._path.iterdir()):
-            if child.is_dir() and _is_zarr_group(child) and "multiscales" in _group_attrs(child):
+            if not child.is_dir():
+                continue
+            if _is_zarr_group(child) and "multiscales" in _group_attrs(child):
                 fields[(child.name, 0)] = child
+                continue
+            per_fov, sixd = _nonhcs_region_children(child)
+            for group in per_fov:
+                fov = int(_PER_FOV_ZARR_RE.match(group.name)["fov"])
+                fields[(child.name, fov)] = group
+            if sixd is not None:
+                for fov in range(self._sixd_fov_count(sixd)):
+                    fields[(child.name, fov)] = sixd
+            if not per_fov and sixd is None:
+                raise ValueError(
+                    f"{child!s} is under a Squid non-HCS zarr/ folder but is not a readable "
+                    "store: it is not an OME-NGFF image group and contains no "
+                    "fov_{n}.ome.zarr (non-HCS default) or acquisition.zarr (non-HCS 6D). "
+                    f"Contents: {[c.name for c in sorted(child.iterdir())][:8]}."
+                )
         # A store that IS a single image group (handed in directly) is that one region.
         if not fields and "multiscales" in _group_attrs(self._path):
             fields[(self._path.name.replace(".ome.zarr", "").replace(".zarr", ""), 0)] = self._path
         return fields
+
+    def _sixd_fov_count(self, sixd: Path) -> int:
+        """How many FOVs the 6D array's leading axis holds.
+
+        Read from the ARRAY's shape, never from ``region_fov_counts`` or any sidecar: the shape is
+        what was actually allocated, and a count taken from elsewhere that disagreed would index
+        past the end (loud) or leave real FOVs unreachable (silent).
+        """
+        ms = self._multiscale(sixd)
+        if ms.axis_names[:1] != ["fov"]:
+            raise ValueError(
+                f"{sixd!s} is Squid's non-standard 6D layout (build_6d_zarr_path) but its "
+                f"multiscales axes are {ms.axis_names}, not the expected FTCZYX with 'fov' "
+                "leading. Refusing to guess which axis is the FOV — guessing draws every field "
+                "at the wrong index without erroring."
+            )
+        return int(self._array(sixd).shape[0])
 
     def _multiscale(self, group: Path) -> _Multiscale:
         ms = self._ms.get(group)
@@ -1032,7 +1515,14 @@ class SquidZarrReader:
         """
         from_store = {}
         for key, group in fields.items():
-            position = self._multiscale(group).position_um
+            ms = self._multiscale(group)
+            if ms.is_6d_fov:
+                # One 6D array holds every FOV of a region behind ONE translation, so that
+                # translation cannot be a per-FOV stage position. Copying it onto each FOV would
+                # stack the whole region on one tile — a plausible-looking, wrong mosaic. Fall
+                # through to coordinates.csv, which does record per-FOV positions.
+                continue
+            position = ms.position_um
             if position is not None:
                 from_store[key] = position
         if from_store:
@@ -1124,7 +1614,9 @@ class SquidZarrReader:
         if not 0 <= t < meta["n_t"]:
             raise IndexError(f"t={t} out of range (n_t={meta['n_t']}).")
         arr = self._array(group)
-        idx = self._multiscale(group).index(arr.shape, t, self._channel_index(channel), z)
+        idx = self._multiscale(group).index(
+            arr.shape, t, self._channel_index(channel), z, fov=int(fov)
+        )
         plane = np.asarray(arr[idx].read().result())
         return _validate_plane(plane, self._multiscale(group).array_path)
 
