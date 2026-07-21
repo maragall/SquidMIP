@@ -498,3 +498,37 @@ def test_tiling_select_is_fast_on_a_55k_box_geometry():
     per_call_ms = (time.perf_counter() - t0) / 100 * 1e3
     print(f"\nselect_tiles over {n} boxes: {per_call_ms:.3f} ms/call")
     assert per_call_ms < 10.0                                # generous: a regression canary, not a target
+
+
+# --- IMA-216 follow-up: make the fit-to-plate cost explicit and catch inverted ladders ---
+
+def test_geometry_rejects_a_coarser_level_holding_more_tiles():
+    """Regridding cannot invent tiles; a coarser rung with more of them is a construction bug."""
+    fine, fk = _grid(4, 100.0, "L0")      # 16 tiles
+    coarse, ck = _grid(8, 50.0, "L1")     # 64 tiles -- inverted
+    with pytest.raises(ValueError, match="cannot hold more tiles"):
+        Geometry([Level(1.0, fine, fk), Level(8.0, coarse, ck)])
+
+
+def test_geometry_allows_equal_counts_for_a_per_fov_pyramid():
+    """One tile per FOV at every level is a legal NGFF layout, not an error."""
+    b, k = _grid(4, 100.0, "L0")
+    geo = Geometry([Level(1.0, b, k), Level(8.0, b, list(k))])
+    assert geo.worst_case_tiles == 16
+
+
+def test_worst_case_tiles_is_the_fit_to_plate_cost():
+    """The coarsest rung's count bounds any single view -- the number IMA-217 must keep small."""
+    geo = _ladder()                      # 400 / 100 / 1
+    assert geo.worst_case_tiles == 1
+    fit = select_tiles((0.0, 0.0, 2000.0, 2000.0), 1e6, geo, channels=("c",))
+    assert len(fit) <= geo.worst_case_tiles
+
+
+def test_worst_case_tiles_exposes_a_ladder_with_no_plate_rung():
+    """The silent-performance-cliff case: coarsest is still per-FOV, so fit-to-plate reads all."""
+    b, k = _grid(20, 100.0, "L0")
+    geo = Geometry([Level(1.0, b, k), Level(8.0, b, list(k))])
+    assert geo.worst_case_tiles == 400   # loud in a test instead of silent in the UI
+    fit = select_tiles((0.0, 0.0, 2000.0, 2000.0), 1e6, geo, channels=("c",))
+    assert len(fit) == 400

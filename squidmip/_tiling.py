@@ -108,8 +108,29 @@ class Geometry:
         scales = [lv.scale_um_per_px for lv in levels]
         if any(b <= a for a, b in zip(scales, scales[1:])):
             raise ValueError(f"levels must be ordered finest-first with strictly increasing scale, got {scales}")
+        counts = [len(lv) for lv in levels]
+        # A coarser rung holding MORE tiles than the one below it is always a construction bug
+        # (regridding cannot invent tiles). Equal counts are legal: a per-FOV pyramid keeps one
+        # tile per FOV at every level. See `worst_case_tiles` for the cost that actually bites.
+        bad = [(i, counts[i], counts[i + 1]) for i in range(len(counts) - 1) if counts[i + 1] > counts[i]]
+        if bad:
+            raise ValueError(
+                "a coarser level cannot hold more tiles than the level below it; "
+                f"offending (level, n, next_n): {bad}")
         self.levels = levels
         self._scales = np.asarray(scales, dtype=np.float64)
+
+    @property
+    def worst_case_tiles(self) -> int:
+        """Upper bound on tiles any single view can request: the coarsest level's tile count.
+
+        Fit-to-plate clamps to the coarsest rung, so this IS the fit-to-plate cost. The
+        O(viewport) promise is a promise about *this number*, not about the algorithm: if the
+        ladder has no plate-level rung, the coarsest level is still per-FOV and this equals the
+        FOV count — culling then returns every FOV and the plate view crawls, silently.
+        IMA-217 builds the ladder and should assert this stays small (tens, not thousands).
+        """
+        return len(self.levels[-1])
 
     def __len__(self) -> int:
         return len(self.levels)

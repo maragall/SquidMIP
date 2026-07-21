@@ -3,7 +3,7 @@
 - **Ticket:** IMA-216
 - **Branch:** juliomaragall/ima-216-viewport-tiler
 - **Spec:** .spec/open/ima-216.md
-- **Phase:** PLAN (eng review complete 2026-07-20; spec locked, ENG CLEARED)
+- **Phase:** THINK
 - **Mode:** attended → user delegated finish (commit+push, no further input until merge)
 
 ## Now
