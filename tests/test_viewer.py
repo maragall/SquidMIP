@@ -111,6 +111,192 @@ def test_resolve_plate_root(tmp_path):
     assert not is_plate
 
 
+# --- carrier background (IMA-220) -----------------------------------------------------------
+
+def _overview(qapp, carrier=None, rows=("A", "B"), cols=("1", "2"), wells=None):
+    ov = V.PlateOverview(list(rows), list(cols),
+                         {(0, 0): "A1"} if wells is None else wells, carrier=carrier)
+    ov.resize(600, 500)
+    return ov
+
+
+def _render(ov):
+    """Rasterise the widget offscreen and return it as a QImage we can sample."""
+    from PyQt5.QtGui import QImage, QPainter
+    img = QImage(ov.width(), ov.height(), QImage.Format_ARGB32)
+    img.fill(Qt.black)
+    p = QPainter(img)
+    ov.render(p)
+    p.end()
+    return img
+
+
+def test_montage_canvas_is_transparent_so_a_background_can_show_through(qapp):
+    """REGRESSION + the core IMA-220 premise. With the old Format_RGB888 canvas an opaque
+    montage covered the whole plate rect, so ANY background layer was invisible regardless
+    of paint order."""
+    from PyQt5.QtGui import QImage
+    ov = _overview(qapp)
+    assert ov._canvas.format() == QImage.Format_ARGB32_Premultiplied
+    assert ov._canvas.hasAlphaChannel()
+    assert qapp.instance() is not None
+    assert ov._canvas.pixelColor(5, 5).alpha() == 0          # un-imaged cell -> transparent
+    assert ov._canvas_for("op1").pixelColor(5, 5).alpha() == 0
+
+
+def test_add_tile_still_paints_an_opaque_tile(qapp):
+    """REGRESSION. Tiles must stay fully opaque on the now-transparent canvas, otherwise the
+    carrier bleeds through real image data."""
+    ov = _overview(qapp)
+    rgb = np.full((V._CELL, V._CELL, 3), 200, np.uint8)
+    ov.add_tile(0, 0, "A1", rgb)
+    assert ov._canvas.pixelColor(V._CELL // 2, V._CELL // 2).alpha() == 255
+    assert (0, 0) in ov._tiles
+    assert ov._canvas.pixelColor(V._CELL + 5, 5).alpha() == 0   # untouched cell still clear
+
+
+def test_carrier_none_leaves_geometry_identical_to_the_lattice(qapp):
+    """REGRESSION. Every existing construction path passes no carrier and must be unchanged."""
+    ov = _overview(qapp, carrier=None)
+    ov._fit()
+    w, h = ov.width(), ov.height()
+    expect_cd = max(2.0, min((w - V._HDR - 2 * V._PAD) / ov._nc,
+                             (h - V._COLH - 2 * V._PAD) / ov._nr))
+    assert ov._cd == pytest.approx(expect_cd)
+    assert ov._ox == pytest.approx(max(V._PAD, (w - V._HDR - ov._nc * ov._cd) / 2))
+    assert ov._oy == pytest.approx(max(V._PAD, (h - V._COLH - ov._nr * ov._cd) / 2))
+    assert ov._extent_cells() == (0.0, 0.0, float(ov._nc), float(ov._nr))
+
+
+def _wells_384():
+    return {(r, c): f"{V._row_letter(r)}{c + 1}" for r in range(16) for c in range(24)}
+
+
+def test_fit_with_a_carrier_keeps_the_whole_artwork_on_screen(qapp):
+    """The skirt extends left of and above A1, so a lattice-only fit clipped it into the
+    label gutters and the zoom-out floor could never reveal it."""
+    from squidmip._plate import carrier_for, carrier_placement
+    spec = carrier_for("384")
+    ov = _overview(qapp, carrier=spec, rows=[V._row_letter(i) for i in range(16)],
+                   cols=[str(i + 1) for i in range(24)], wells=_wells_384())
+    ov._fit()
+    ax, ay = ov._ox + V._HDR, ov._oy + V._COLH
+    _, dx, dy, dw, dh = carrier_placement(spec, ov._cd, ax, ay)
+    assert dx >= -0.5 and dy >= -0.5                       # not clipped off the left/top
+    assert dx + dw <= ov.width() + 0.5
+    assert dy + dh <= ov.height() + 0.5
+    assert dx < ax and dy < ay                             # artwork really does start before A1
+
+
+def test_carrier_fit_is_smaller_than_lattice_fit(qapp):
+    """Pins the accepted trade-off: honouring the skirt costs ~16% of displayed data, and
+    because _fit_cd is also the zoom-out floor that cost is permanent."""
+    from squidmip._plate import carrier_for
+    rows, cols = [V._row_letter(i) for i in range(16)], [str(i + 1) for i in range(24)]
+    bare = _overview(qapp, None, rows, cols, _wells_384())
+    with_c = _overview(qapp, carrier_for("384"), rows, cols, _wells_384())
+    assert with_c._fit_cd() < bare._fit_cd()
+    assert with_c._fit_cd() / bare._fit_cd() == pytest.approx(1 / 1.1875, abs=0.02)
+
+
+def test_carrier_is_actually_visible_behind_empty_wells(qapp):
+    """End to end: render the widget and prove non-background pixels appear where the carrier
+    is, and do not when there is none."""
+    from squidmip._plate import carrier_for
+    rows, cols = [V._row_letter(i) for i in range(16)], [str(i + 1) for i in range(24)]
+    bg = V.QColor(V._BG).rgb()
+
+    def _nonbg(ov):
+        img = _render(ov)
+        return sum(img.pixel(x, y) not in (bg, V.QColor(Qt.black).rgb())
+                   for x in range(0, ov.width(), 7) for y in range(0, ov.height(), 7))
+
+    with_c = _nonbg(_overview(qapp, carrier_for("384"), rows, cols, _wells_384()))
+    without = _nonbg(_overview(qapp, None, rows, cols, _wells_384()))
+    assert with_c > without * 1.5, (with_c, without)
+
+
+def test_carrier_pixmap_never_exceeds_the_viewport(qapp):
+    """The obvious implementation (scale the whole PNG to the destination, like _scaled does)
+    allocates ~2.3 GB at the zoom clamp on a 1536wp. The crop must stay widget-bounded."""
+    from squidmip._plate import carrier_for
+    rows, cols = [V._row_letter(i) for i in range(32)], [str(i + 1) for i in range(48)]
+    wells = {(r, c): f"{V._row_letter(r)}{c + 1}" for r in range(32) for c in range(48)}
+    ov = _overview(qapp, carrier_for("1536"), rows, cols, wells)
+    ov._fit()
+    ov._cd = ov._fit_cd() * 40          # the wheelEvent zoom clamp
+    ov._user_view = True
+    _render(ov)                          # must not allocate at plate scale
+    _at, pm = ov._carrier_scaled
+    assert pm.width() <= ov.width() + 1 and pm.height() <= ov.height() + 1
+
+
+def test_carrier_cache_holds_across_hover_but_rebuilds_on_zoom(qapp):
+    """Hover repaints fire on every cross-cell move; rescaling the artwork each time would be
+    a visible regression against an already-optimised paint path."""
+    from squidmip._plate import carrier_for
+    ov = _overview(qapp, carrier_for("384"), [V._row_letter(i) for i in range(16)],
+                   [str(i + 1) for i in range(24)], _wells_384())
+    _render(ov)
+    key1 = ov._carrier_key
+    ov._hover = (2, 3)
+    _render(ov)
+    assert ov._carrier_key == key1               # hover: cache survives
+    ov._user_view = True
+    ov._cd *= 2
+    _render(ov)
+    assert ov._carrier_key != key1               # zoom: rebuilt
+
+
+def test_carrier_artwork_is_not_rotated(qapp):
+    """A well lattice is centro-symmetric, so 'A1 lands on cell (0,0) and the last well lands
+    on the last cell' is satisfied whether or not the artwork is upside-down. These pixels sit
+    near the A1 corner marking and differ from their 180-degree counterparts, so they are what
+    actually pins orientation."""
+    from PyQt5.QtGui import QImage
+    from squidmip._plate import carrier_for
+    for fmt, (x, y), bright in (("384", (44, 32), True), ("1536", (122, 85), False)):
+        img = QImage(str(carrier_for(fmt).image_path()))
+        assert not img.isNull()
+        here = img.pixelColor(x, y).value()
+        there = img.pixelColor(img.width() - 1 - x, img.height() - 1 - y).value()
+        assert (here > there) is bright, f"{fmt} artwork looks rotated ({here} vs {there})"
+
+
+def test_set_final_marks_only_rendered_cells_opaque(qapp, stub_detail, tmp_path):
+    """REGRESSION + the _tiles_by_layer trap. The alpha must come from the set the montage was
+    built from; _tiles_by_layer is never cleared between a preview and a full run and drops
+    tiles the montage keeps, which would paint solid black squares onto the carrier."""
+    from PyQt5.QtGui import QImage
+    win = V.PlateWindow.__new__(V.PlateWindow)          # bypass __init__: only _set_final under test
+    win._overview = _overview(qapp)
+    win._active_op_key = None
+    win._final_arr = None
+    nr, nc = win._overview._nr, win._overview._nc
+    rgb = np.full((nr * V._CELL, nc * V._CELL, 3), 77, np.uint8)
+    win._overview._tiles_by_layer["raw"] = {(1, 1)}      # deliberately WRONG / stale
+    win._set_final((rgb, {(0, 0)}))                      # the montage really only has (0,0)
+    img = win._overview._final
+    assert img.format() == QImage.Format_ARGB32_Premultiplied
+    assert img.pixelColor(V._CELL // 2, V._CELL // 2).alpha() == 255          # rendered cell
+    assert img.pixelColor(V._CELL + V._CELL // 2, V._CELL // 2).alpha() == 0  # stale claim ignored
+    assert win._final_arr is not None and win._final_arr.shape[2] == 4        # buffer kept alive
+
+
+def test_set_final_preserves_colour_channels(qapp, stub_detail):
+    """REGRESSION. The RGB->ARGB32 byte-order swap must not silently swap red and blue."""
+    win = V.PlateWindow.__new__(V.PlateWindow)
+    win._overview = _overview(qapp)
+    win._active_op_key = None
+    win._final_arr = None
+    nr, nc = win._overview._nr, win._overview._nc
+    rgb = np.zeros((nr * V._CELL, nc * V._CELL, 3), np.uint8)
+    rgb[:, :, 0] = 200          # pure red
+    win._set_final((rgb, {(0, 0)}))
+    c = win._overview._final.pixelColor(V._CELL // 2, V._CELL // 2)
+    assert (c.red(), c.green(), c.blue()) == (200, 0, 0)
+
+
 # --- GUI behavior (offscreen; embedded viewer stubbed) --------------------------------------
 
 def test_ingest_bad_folder_does_not_crash(qapp, stub_detail, tmp_path):

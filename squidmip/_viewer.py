@@ -50,7 +50,8 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import Qt, QProcess, QProcessEnvironment, QSocketNotifier, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import (Qt, QProcess, QProcessEnvironment, QRectF, QSocketNotifier, QThread,
+                          QTimer, pyqtSignal)
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPalette, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
@@ -62,6 +63,8 @@ from squidmip._engine import _default_workers
 from squidmip._layers import OperationStack
 from squidmip._montage import _area_downsample, _hex_to_rgb01, _window
 from squidmip._output import parse_well_id
+from squidmip._plate import (CarrierSpec, carrier_extent_cells, carrier_for,
+                             carrier_placement, plate_dims)
 
 _SUPPORTED_PLATES = ("384", "1536")   # well-plate formats the tool currently accepts (no stitching yet)
 _CELL = 88                 # per-well px in the low-res overview (1536wp -> ~4224x2816)
@@ -453,12 +456,6 @@ def _fit_cell(a: np.ndarray) -> np.ndarray:
     return a[yi][:, xi].astype(np.float32)
 
 
-# The Squid well-plate formats we fit a plate to (well count -> (rows, cols)). An acquisition whose
-# format isn't one of these falls back to a present-only grid (see _plate_grid).
-_PLATE_DIMS = {4: (2, 2), 6: (2, 3), 12: (3, 4), 24: (4, 6), 96: (8, 12),
-               384: (16, 24), 1536: (32, 48)}
-
-
 def _row_letter(i: int) -> str:
     """0->A, 25->Z, 26->AA, ... (plate row labels)."""
     s, i = "", i + 1
@@ -471,10 +468,11 @@ def _row_letter(i: int) -> str:
 def _plate_grid(wellplate_format) -> Optional[tuple[list, list]]:
     """Full (rows, cols) label grid for a Squid wellplate format, so the plate view shows every
     position evenly spaced (present wells fill; absent stay blank) rather than collapsing gaps.
-    Returns None for an unknown/absent format (caller falls back to present-only)."""
-    import re
-    m = re.search(r"(\d+)", str(wellplate_format or ""))
-    dims = _PLATE_DIMS.get(int(m.group(1))) if m else None
+    Returns None for an unknown/absent format (caller falls back to present-only).
+
+    Dimensions come from _plate.plate_dims — the SAME table the carrier background is placed
+    from, so the drawn grid and the artwork can never describe different plates."""
+    dims = plate_dims(wellplate_format)
     if not dims:
         return None
     nr, nc = dims
@@ -520,9 +518,12 @@ class PlateOverview(QWidget):
     hovered = pyqtSignal(str)              # region id (or "" off-plate), for the window's readout
     wellActivated = pyqtSignal(str, int)   # (well_id, fov_index) double-clicked -> load in ndviewer
 
-    def __init__(self, rows, cols, wells: dict):
+    def __init__(self, rows, cols, wells: dict, carrier: Optional[CarrierSpec] = None):
         """``wells``: (row_index, col_index) -> well_id for every acquired well (drawn grey until
-        processed). Tiles/status arrive as an operator runs."""
+        processed). Tiles/status arrive as an operator runs.
+
+        ``carrier``: optional plate artwork drawn UNDER the montage (IMA-220). None is a fully
+        supported state — the widget then renders exactly as it always has."""
         super().__init__()
         self._rows, self._cols = list(rows), list(cols)
         self._nr, self._nc = len(self._rows), len(self._cols)
@@ -530,12 +531,12 @@ class PlateOverview(QWidget):
         self._status: dict[tuple, str] = {rc: "empty" for rc in wells}
         self._tiles: set[tuple] = set()                        # cells that have a tile painted (any layer)
         self._tiles_by_layer: dict[str, set] = {}              # layer -> cells with an image there
-        self._canvas = QImage(self._nc * _CELL, self._nr * _CELL, QImage.Format_RGB888)
-        self._canvas.fill(QColor(_BG))
+        self._canvas = self._blank_canvas()
         self._final = None            # crisp global-contrast montage of the ACTIVE layer (or None)
         # Layer stack render: the base ("raw") is self._canvas; each operator draws into its own
         # per-layer canvas/final. self._active is the layer the plate currently shows (LayersTab picks
-        # it via set_active_layer). Keeps memory to one small montage-canvas per layer used.
+        # it via set_active_layer). One montage-canvas per layer used, ARGB32 premultiplied
+        # (4 B/px, not 3) so un-imaged cells stay TRANSPARENT and the carrier shows through.
         self._op_canvas: dict[str, QImage] = {}
         self._op_final: dict[str, QImage] = {}
         self._active = "raw"
@@ -549,29 +550,58 @@ class PlateOverview(QWidget):
         self._press = None            # (x, y, ox, oy) at left-press, for drag-to-pan
         self._panning = False
         self._user_view = False       # True once the user wheel-zooms/pans (stop auto-fitting)
+        # -- carrier background (IMA-220) --
+        self._carrier = carrier
+        self._carrier_src = None      # QPixmap of the artwork at native resolution (lazy, once)
+        self._carrier_scaled = None   # viewport-sized crop, rebuilt on zoom/pan (see _draw_carrier)
+        self._carrier_key = None
         self.setMouseTracking(True)
         self.setMinimumSize(240, 200)
 
+    def _blank_canvas(self) -> QImage:
+        """A fully transparent montage canvas. ARGB (not RGB888) is what makes 'draw the carrier
+        BEHIND the cells' possible at all: an opaque canvas covers the whole plate rect, so
+        anything painted under it is invisible no matter the paint order."""
+        img = QImage(self._nc * _CELL, self._nr * _CELL, QImage.Format_ARGB32_Premultiplied)
+        img.fill(Qt.transparent)
+        return img
+
+    def _extent_cells(self) -> tuple[float, float, float, float]:
+        """(min_x, min_y, w, h) of what must be visible, in well-pitch units.
+
+        Without a carrier this is just the lattice: (0, 0, nc, nr) — byte-identical to the old
+        behaviour. With one, it is the UNION of lattice and artwork, whose origin is negative
+        because the skirt extends left of and above A1. Fit must honour that or the artwork is
+        clipped by the label gutters; plates are also not centred on their well array, so the
+        old symmetric formula is wrong in principle once the carrier is in play."""
+        if self._carrier is None:
+            return 0.0, 0.0, float(self._nc), float(self._nr)
+        return carrier_extent_cells(self._carrier, self._nr, self._nc)
+
     def _fit(self):
-        """Reset the view: the whole plate fits the widget, centered (zoom = 1)."""
+        """Reset the view: the whole plate (and its carrier) fits the widget, centered (zoom = 1)."""
         if self._nr == 0 or self._nc == 0:
             return
         w, h = self.width(), self.height()
-        self._cd = max(2.0, min((w - _HDR - 2 * _PAD) / self._nc, (h - _COLH - 2 * _PAD) / self._nr))
-        self._ox = max(_PAD, (w - _HDR - self._nc * self._cd) / 2)
-        self._oy = max(_PAD, (h - _COLH - self._nr * self._cd) / 2)
+        min_x, min_y, ew, eh = self._extent_cells()
+        self._cd = self._fit_cd()
+        # Centre the EXTENT, then shift so that ax/ay still denote the lattice origin: the
+        # lattice sits +min_x cells into the extent, so subtracting min_x*cd puts the artwork's
+        # left edge (not the lattice's) against the padding.
+        self._ox = max(_PAD, (w - _HDR - ew * self._cd) / 2) - min_x * self._cd
+        self._oy = max(_PAD, (h - _COLH - eh * self._cd) / 2) - min_y * self._cd
 
     def _fit_cd(self) -> float:
         w, h = self.width(), self.height()
-        return max(2.0, min((w - _HDR - 2 * _PAD) / self._nc, (h - _COLH - 2 * _PAD) / self._nr))
+        _, _, ew, eh = self._extent_cells()
+        return max(2.0, min((w - _HDR - 2 * _PAD) / ew, (h - _COLH - 2 * _PAD) / eh))
 
     def _canvas_for(self, layer: str) -> QImage:
         if layer == "raw":
             return self._canvas
         cv = self._op_canvas.get(layer)
         if cv is None:
-            cv = QImage(self._nc * _CELL, self._nr * _CELL, QImage.Format_RGB888)
-            cv.fill(QColor(_BG))
+            cv = self._blank_canvas()
             self._op_canvas[layer] = cv
         return cv
 
@@ -681,16 +711,81 @@ class PlateOverview(QWidget):
         if c and c["well_id"]:
             self.wellActivated.emit(c["well_id"], 0)   # 1 FOV/well (IMA-183); IMA-187 will pick the FOV
 
+    # -- carrier background (IMA-220) --
+    def _carrier_source(self) -> Optional[QPixmap]:
+        """The artwork at native resolution, loaded once. None (not an exception) if the asset
+        is missing or unreadable — a plate without its picture still has to open."""
+        if self._carrier_src is None:
+            if self._carrier is None:
+                return None
+            pm = QPixmap(str(self._carrier.image_path()))
+            self._carrier_src = pm if not pm.isNull() else False
+        return self._carrier_src or None
+
+    def _draw_carrier(self, p: QPainter, ax: float, ay: float, cd: float):
+        """Blit the plate artwork under everything, aligned so its A1 pixel is the centre of
+        cell (0,0).
+
+        VIEWPORT-CROPPED ON PURPOSE. The obvious implementation — scale the whole PNG to the
+        destination rect and cache it, mirroring self._scaled — allocates ~2.3 GB at the zoom
+        clamp on a 1536wp (wheelEvent caps cd at _fit_cd()*40, and the carrier is ~1.19x the
+        lattice in each axis). Scaling only the visible sub-rect keeps the pixmap bounded by
+        the WIDGET, whatever the zoom. The cache key includes the destination origin, so hover
+        repaints (which never move it) hit, while a pan simply rebuilds something viewport-sized.
+
+              dest rect (may be far larger than the widget at high zoom)
+             +--------------------------------------------------+
+             |            +==================+                   |
+             |            |  widget viewport | <- only THIS is   |
+             |            |  (what we scale) |    ever rasterised|
+             |            +==================+                   |
+             +--------------------------------------------------+
+        """
+        src = self._carrier_source()
+        if src is None:
+            return
+        scale, dx, dy, dw, dh = carrier_placement(self._carrier, cd, ax, ay)
+        if dw <= 0 or dh <= 0 or scale <= 0:
+            return
+        vis = QRectF(0, 0, self.width(), self.height()).intersected(QRectF(dx, dy, dw, dh))
+        if vis.isEmpty():
+            return
+        key = (round(cd, 4), round(dx, 1), round(dy, 1), self.width(), self.height())
+        if self._carrier_scaled is None or self._carrier_key != key:
+            # Rasterise the visible crop ONCE per zoom/pan. Caching only the rectangles and
+            # letting drawPixmap rescale every repaint measured ~5 ms of hover cost on a
+            # 1536wp — the exact per-repaint resample the montage cache at :_scaled exists
+            # to avoid. The pixmap is viewport-sized, so this stays bounded at any zoom.
+            sub = QRectF((vis.left() - dx) / scale, (vis.top() - dy) / scale,
+                         vis.width() / scale, vis.height() / scale)
+            pm = QPixmap(max(1, int(round(vis.width()))), max(1, int(round(vis.height()))))
+            pm.fill(Qt.transparent)
+            q = QPainter(pm)
+            q.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            q.drawPixmap(QRectF(0, 0, pm.width(), pm.height()), src, sub)
+            q.end()
+            self._carrier_scaled = (vis.topLeft(), pm)
+            self._carrier_key = key
+        at, pm = self._carrier_scaled
+        p.drawPixmap(at, pm)                 # QPointF origin: sub-pixel, so no pan jitter
+
     # -- paint --
     def paintEvent(self, _):
         if not self._user_view:          # auto-fit until the user first zooms/pans
             self._fit()
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
         p.fillRect(self.rect(), QColor(_BG))
         cd, nr, nc = self._cd, self._nr, self._nc
         ax, ay = self._ox + _HDR, self._oy + _COLH   # plate top-left (after label margins)
         W, H = nc * cd, nr * cd
+        # PAINT ORDER (IMA-220): the carrier goes down FIRST, then the montage on top of it.
+        # This only shows through because the montage canvases are ARGB with transparent
+        # un-imaged cells (see _blank_canvas) — with the old RGB888 canvas the carrier would be
+        # perfectly hidden regardless of ordering.
+        #   1. carrier PNG   2. montage   3. status dots / grid / labels / selection
+        self._draw_carrier(p, ax, ay, cd)
         # Blit the montage from a cached pixmap scaled to the current zoom. The expensive smooth
         # resample runs ONCE per zoom/source-change (not every repaint) — pan/hover just re-blit.
         w, h = max(1, int(W)), max(1, int(H))
@@ -727,7 +822,16 @@ class PlateOverview(QWidget):
                 # else: has an image on the active layer -> no dot
         p.setBrush(Qt.NoBrush)
 
-        p.setPen(QPen(_GRID, 3))       # black grid lines between wells (room for multi-FOV, IMA-187)
+        # Grid lines between wells (room for multi-FOV, IMA-187). Over a carrier the solid 3px
+        # black lattice would black out ~a quarter of the artwork on a 1536wp, so it thins and
+        # goes semi-transparent there — keeping the cell boundaries IMA-187 needs without
+        # burying the picture. Unchanged (opaque, 3px) when there is no carrier.
+        if self._carrier is not None:
+            soft = QColor(_GRID)
+            soft.setAlpha(90)
+            p.setPen(QPen(soft, 1))
+        else:
+            p.setPen(QPen(_GRID, 3))
         for c in range(nc + 1):
             p.drawLine(int(ax + c * cd), int(ay), int(ax + c * cd), int(ay + H))
         for r in range(nr + 1):
@@ -783,7 +887,7 @@ class _OperatorWorker(QThread):
 
     tileReady = pyqtSignal(int, int, str, object)   # (row_index, col_index, well_id, rgb tile)
     progress = pyqtSignal(int, int)                 # (done, total)
-    finalReady = pyqtSignal(object)                 # final global-contrast montage (H, W, 3) uint8
+    finalReady = pyqtSignal(object)                 # ((H, W, 3) uint8 montage, {(ri, ci) rendered})
     writtenReady = pyqtSignal(str)                  # path of the written plate.ome.zarr
     wellFailed = pyqtSignal(int, int)               # (ri, ci) of a well SKIPPED on a read error
     pushReady = pyqtSignal(int, object)             # (fov_idx, [per-channel ~512px plane]) for the slider
@@ -855,7 +959,7 @@ class _OperatorWorker(QThread):
                             stop=self._stop.is_set, on_error=self._on_error, regions=self._regions)
                 if self._stop.is_set():
                     return  # window closing / re-opening; drop out cleanly (no final/written emit)
-                self.finalReady.emit(self._final_montage())
+                self.finalReady.emit((self._final_montage(), set(self._raw)))
                 self.writtenReady.emit(str(Path(self._out_dir) / "plate.ome.zarr"))
             else:
                 # PREVIEW: run the engine over the subset and push each result to the plate + slider,
@@ -876,7 +980,7 @@ class _OperatorWorker(QThread):
                         close()
                 if self._stop.is_set():
                     return
-                self.finalReady.emit(self._final_montage())
+                self.finalReady.emit((self._final_montage(), set(self._raw)))
             self.finished_ok.emit()
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -1558,7 +1662,9 @@ class PlateWindow(QMainWindow):
             wells[rc] = region
 
         self._order = order                          # well order = the detail's FOV-slider order
-        self._overview = PlateOverview(rows, cols, wells)
+        # Carrier artwork for this format, or None when it has no usable calibration — None is
+        # a supported state, the plate just renders as it always has.
+        self._overview = PlateOverview(rows, cols, wells, carrier=carrier_for(fmt))
         self._overview.hovered.connect(self._on_hover)
         self._overview.wellActivated.connect(self.activate_well)
         self._plate_mode = "raw"                     # a freshly-opened plate shows raw previews
@@ -1693,6 +1799,10 @@ class PlateWindow(QMainWindow):
 
         if self._overview is not None:
             self._overview.setParent(None); self._overview.deleteLater()
+        # No carrier here (IMA-220 D10): a written plate carries no wellplate_format, and the
+        # meta built below has no such key. Inferring one from (nr, nc) is unreliable — a
+        # subset run writes only the acquired wells, so an 8x3 plate matches no format. A
+        # TODO tracks persisting the format at write time.
         self._overview = PlateOverview(rows, cols, wells_rc)
         self._overview.hovered.connect(self._on_hover)
         self._overview.wellActivated.connect(self.activate_well)
@@ -1851,13 +1961,31 @@ class PlateWindow(QMainWindow):
                     self._overview.set_status(*rc, "failed")  # red x on wells that didn't finish
         self._readout.setText(f"failed: {msg}")
 
-    def _set_final(self, rgb):
+    def _set_final(self, payload):
+        """Publish the crisp global-contrast montage, with un-rendered cells TRANSPARENT so the
+        carrier background shows through them (IMA-220).
+
+        ``payload`` is (rgb, cells) where *cells* is the exact set the montage was built from.
+        The set is passed explicitly rather than read from the overview's _tiles_by_layer,
+        which is never cleared between a preview run and a full run and which drops tiles the
+        montage keeps (add_tile's stale-run guard). Trusting it would mark cells opaque with
+        RGB 0 — solid black squares sitting on the carrier."""
         if self._overview is None:
             return
-        self._final_arr = np.ascontiguousarray(rgb)
-        h, w, _ = self._final_arr.shape
-        self._overview.set_final(QImage(self._final_arr.data, w, h, 3 * w, QImage.Format_RGB888),
-                                 layer=self._active_op_key or "raw")
+        rgb, cells = payload
+        h, w, _ = rgb.shape
+        # ARGB32_Premultiplied is byte-order BGRA on little-endian, and for alpha in {0,255}
+        # premultiplication is the identity, so a straight channel swap is correct here.
+        rgba = np.zeros((h, w, 4), np.uint8)
+        rgba[:, :, 0], rgba[:, :, 1], rgba[:, :, 2] = rgb[:, :, 2], rgb[:, :, 1], rgb[:, :, 0]
+        for ri, ci in cells:
+            rgba[ri * _CELL:(ri + 1) * _CELL, ci * _CELL:(ci + 1) * _CELL, 3] = 255
+        # The QImage does NOT own this buffer — the array bound to self._final_arr must be the
+        # very one it points at, or we hand Qt freed memory.
+        self._final_arr = np.ascontiguousarray(rgba)
+        self._overview.set_final(
+            QImage(self._final_arr.data, w, h, 4 * w, QImage.Format_ARGB32_Premultiplied),
+            layer=self._active_op_key or "raw")
 
     # -- navigation links --
     def _on_hover(self, text: str):
