@@ -30,11 +30,16 @@ legacy fallback. read() constructs the path directly and returns exactly what ti
 decodes (native dtype), refusing non-2D planes and dtypes outside {uint8, uint16}.
 
 ``coordinates.csv`` IS read (IMA-187), into ``metadata["fov_positions_um"]``, so multiple FOVs
-per region can be placed at their true stage offsets. Its real schema is::
+per region can be placed at their true stage offsets. TWO schemas ship in real Squid output and
+both parse (IMA-215), discriminated by the HEADER and never by row count::
 
-    region,x (mm),y (mm),z (mm)
+    (a) region,fov,z_level,x (mm),y (mm),z (um),time     # fov id STATED
+    (b) region,x (mm),y (mm),z (mm)                      # fov id is ROW ORDER
 
-There is NO ``fov`` column — the only link from a row to an image is position within the
+In (a) the ``fov`` column is the row -> image mapping, so row order is irrelevant; repeats (one
+row per z-level) collapse, and a repeat that disagrees about x/y is a hard error.
+
+In (b) there is NO ``fov`` column — the only link from a row to an image is position within the
 region's rows, so the Nth row of a region maps to that region's Nth sorted FOV. Rows are
 de-duplicated on (region, x, y) FIRST, because a multi-z / multi-timepoint acquisition can
 repeat a stage position once per z-level; comparing raw row counts against FOV counts would
@@ -108,7 +113,117 @@ def _coord_columns(fieldnames) -> tuple[str, str]:
     return x, y
 
 
+# IMA-215: the second real on-disk schema carries an explicit ``fov`` column. Its presence in the
+# HEADER is the whole format signal — see _fov_column.
+_FOV_COL_RE = re.compile(r"^\s*fov\s*$", re.I)
+
+
+def _fov_column(fieldnames):
+    """The explicit ``fov`` column if this coordinates.csv has one, else ``None``.
+
+    This single header lookup IS the format discriminator (IMA-215). Two schemas ship in real
+    Squid output:
+
+        (a) ``region,fov,z_level,x (mm),y (mm),z (um),time``   — the fov id is STATED
+        (b) ``region,x (mm),y (mm),z (mm)``                    — the fov id is row ORDER
+
+    Detection must be on the header and never on row counts. Row counts are data: a type-(a) file
+    can happen to have exactly one row per FOV (a single-z acquisition), and a type-(b) file can
+    happen to have a count that looks like a z-repeat pattern. Guessing from them would silently
+    swap the two mappings, and a swapped mapping does not crash — it draws every tile in the wrong
+    place. The header is the schema; the schema decides.
+    """
+    return next((n for n in list(fieldnames or []) if n and _FOV_COL_RE.match(n)), None)
+
+
 _MM_TO_UM = 1000.0
+
+
+def _parse_mm_pair(raw_x: str, raw_y: str, region: str, line_no: int):
+    """``(x_mm, y_mm)`` floats, or ``None`` for a blank (position-less) row. Raises on garbage."""
+    if not raw_x or not raw_y:
+        return None                     # a blank position row carries no placement info
+    try:
+        return float(raw_x), float(raw_y)
+    except ValueError:
+        raise ValueError(
+            f"{_COORDS_NAME} line {line_no}: region {region!r} has non-numeric "
+            f"coordinates ({raw_x!r}, {raw_y!r}); refusing to guess a stage position."
+        ) from None
+
+
+def _positions_from_fov_column(reader, fovs_per_region: dict, fov_col, x_col, y_col) -> dict:
+    """Parse the type-(a) ("monkey") schema, where each row STATES its FOV id (IMA-215).
+
+    ``region,fov,z_level,x (mm),y (mm),z (um),time``. This is the strictly better of the two
+    schemas: the row -> FOV mapping is declared, so row order is irrelevant and a shuffled or
+    interleaved file still places correctly. The positional fallback in
+    :func:`load_fov_positions_um` exists only because the type-(b) schema has nothing else to go on.
+
+    Three properties are enforced, all for the same reason the positional path enforces its count:
+    a wrong mapping renders a plausible-looking, wrong mosaic and nothing downstream can catch it.
+
+    1. **Repeats of the same FOV are collapsed, not counted.** A z-stack writes one row per
+       z-level per FOV (the real 10x dataset: 550 rows, 55 FOVs, Nz=10). The first row for a FOV
+       wins.
+    2. **A repeat that DISAGREES about x/y is a hard error**, not a silent first-wins. Two
+       different stage positions filed under one FOV id means the file is corrupt or was
+       concatenated from two runs; picking either one would be a guess.
+    3. **The FOV id set must match the filename-derived set exactly.** An id in the CSV with no
+       image (or an image with no row) leaves part of the plate unplaceable.
+
+    Units: x/y are millimetres here exactly as in the type-(b) schema, so the same single
+    ``_MM_TO_UM`` conversion applies. The ``z (um)`` column is ALREADY micrometres and is not
+    read at all — there is no third unit crossing this boundary and no second scale factor.
+    """
+    by_region: dict[str, dict[int, tuple]] = {}
+    for line_no, row in enumerate(reader, start=2):
+        region = (row.get("region") or "").strip()
+        if not region or region not in fovs_per_region:
+            continue
+        pair = _parse_mm_pair(
+            (row.get(x_col) or "").strip(), (row.get(y_col) or "").strip(), region, line_no
+        )
+        if pair is None:
+            continue
+        raw_fov = (row.get(fov_col) or "").strip()
+        try:
+            fov = int(raw_fov)
+        except ValueError:
+            raise ValueError(
+                f"{_COORDS_NAME} line {line_no}: region {region!r} has a non-integer fov id "
+                f"({raw_fov!r}); the fov column is the row -> image mapping and cannot be guessed."
+            ) from None
+        x, y = pair
+        key = (round(x, 6), round(y, 6))    # tolerate float-repr drift, as the positional path does
+        seen = by_region.setdefault(region, {})
+        if fov in seen:
+            if seen[fov][0] != key:
+                raise ValueError(
+                    f"{_COORDS_NAME} line {line_no}: region {region!r} fov {fov} appears at two "
+                    f"conflicting stage positions ({seen[fov][0]} and {key} mm). A repeated fov id "
+                    "is normal (one row per z-level) only when the position is identical; differing "
+                    "positions mean the file is corrupt or concatenated — refusing to pick one."
+                )
+            continue                        # same position repeated (one row per z / per t)
+        seen[fov] = (key, (x * _MM_TO_UM, y * _MM_TO_UM))
+
+    positions: dict = {}
+    for region, seen in by_region.items():
+        expected = set(fovs_per_region[region])
+        if set(seen) != expected:
+            missing = sorted(expected - set(seen))
+            extra = sorted(set(seen) - expected)
+            raise ValueError(
+                f"{_COORDS_NAME}: region {region!r} lists {len(seen)} distinct stage position(s) "
+                f"for fov ids that do not match the {len(expected)} FOV(s) found in the filenames "
+                f"(missing from the CSV: {missing}; in the CSV but not on disk: {extra}). "
+                "Refusing to place a partially-known plate at positions that would look plausible "
+                "but be wrong."
+            )
+        for fov, (_key, xy) in seen.items():
+            positions[(region, fov)] = xy
+    return positions
 
 
 def load_fov_positions_um(root, fovs_per_region: dict) -> dict:
@@ -150,22 +265,21 @@ def load_fov_positions_um(root, fovs_per_region: dict) -> dict:
     with path.open(newline="") as fh:
         reader = csv.DictReader(fh)
         x_col, y_col = _coord_columns(reader.fieldnames)
+        fov_col = _fov_column(reader.fieldnames)
+        if fov_col is not None:
+            return _positions_from_fov_column(reader, fovs_per_region, fov_col, x_col, y_col)
         ordered: dict[str, list] = {}
         seen: dict[str, set] = {}
         for line_no, row in enumerate(reader, start=2):
             region = (row.get("region") or "").strip()
             if not region or region not in fovs_per_region:
                 continue
-            raw_x, raw_y = (row.get(x_col) or "").strip(), (row.get(y_col) or "").strip()
-            if not raw_x or not raw_y:
-                continue                    # a blank position row carries no placement info
-            try:
-                x, y = float(raw_x), float(raw_y)
-            except ValueError:
-                raise ValueError(
-                    f"{_COORDS_NAME} line {line_no}: region {region!r} has non-numeric "
-                    f"coordinates ({raw_x!r}, {raw_y!r}); refusing to guess a stage position."
-                ) from None
+            pair = _parse_mm_pair(
+                (row.get(x_col) or "").strip(), (row.get(y_col) or "").strip(), region, line_no
+            )
+            if pair is None:
+                continue
+            x, y = pair
             key = (round(x, 6), round(y, 6))   # tolerate float-repr drift when de-duplicating
             if key in seen.setdefault(region, set()):
                 continue                    # same position repeated (one row per z / per t)
@@ -548,3 +662,4 @@ def _ome_channel_names(tif) -> list:
         return re.findall(r'<Channel[^>]*\bName="([^"]*)"', xml)
     except Exception:
         return []
+

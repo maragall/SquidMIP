@@ -12,6 +12,8 @@ stage position once per z-level.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from squidmip.reader import load_fov_positions_um, open_reader
@@ -264,3 +266,184 @@ def test_degradation_does_not_swallow_unexpected_errors(squid_dataset, monkeypat
     root, _ = squid_dataset
     with pytest.raises(RuntimeError, match="disk on fire"):
         open_reader(root).metadata
+
+
+# ============================================================================================
+# IMA-215: the SECOND on-disk coordinates.csv format ("monkey style"), detected BY HEADER
+# ============================================================================================
+#
+# Two schemas ship in real Squid output and both must parse:
+#
+#   (a) monkey-style   region,fov,z_level,x (mm),y (mm),z (um),time
+#   (b) 20x-style      region,x (mm),y (mm),z (mm)
+#
+# (a) carries an explicit ``fov`` column, so the row->FOV mapping is STATED rather than inferred
+# from row order — strictly better, and it must be used when present. Detection is on the HEADER
+# (does a ``fov`` column exist?), never on row counts: a monkey CSV whose row count happens to
+# equal the FOV count is still a monkey CSV, and a 20x CSV whose row count happens to match a
+# z-repeat pattern is still positional. Row counts are data; the header is the schema.
+#
+# Units do NOT change between the formats: x/y are millimetres in BOTH, and the mm -> µm
+# conversion stays at this single producer. (a)'s ``z (um)`` column is already µm — it is not
+# read at all, so it cannot smuggle a unit mismatch in.
+
+_MONKEY_HEADER = "region,fov,z_level,x (mm),y (mm),z (um),time"
+
+
+def _monkey_csv(rows):
+    return _csv(rows, header=_MONKEY_HEADER)
+
+
+def test_monkey_header_uses_the_fov_column(tmp_path):
+    """The explicit fov id wins: row order is irrelevant when the schema states the mapping."""
+    (tmp_path / "coordinates.csv").write_text(_monkey_csv([
+        "A1,2,0,3.0,4.0,100.0,t",
+        "A1,0,0,1.0,2.0,100.0,t",
+        "A1,1,0,1.5,2.0,100.0,t",
+    ]))
+    pos = load_fov_positions_um(tmp_path, {"A1": [0, 1, 2]})
+    assert pos == {("A1", 0): (1000, 2000), ("A1", 1): (1500, 2000), ("A1", 2): (3000, 4000)}
+
+
+def test_monkey_positions_are_micrometres(tmp_path):
+    """Same units contract as the 20x format: the file says mm, the key says _um."""
+    (tmp_path / "coordinates.csv").write_text(_monkey_csv(["A1,0,0,98.2245316296875,10.1854,3930.75,t"]))
+    pos = load_fov_positions_um(tmp_path, {"A1": [0]})
+    assert pos[("A1", 0)] == pytest.approx((98224.5316296875, 10185.4))
+
+
+def test_monkey_z_um_column_is_not_multiplied_by_1000(tmp_path):
+    """``z (um)`` is ALREADY µm. It is not stored, so no key can carry a doubled conversion."""
+    (tmp_path / "coordinates.csv").write_text(_monkey_csv(["A1,0,0,1.0,2.0,3930.75,t"]))
+    pos = load_fov_positions_um(tmp_path, {"A1": [0]})
+    assert all(len(v) == 2 for v in pos.values())     # x,y only — z is not smuggled in
+
+
+def test_monkey_z_levels_are_deduplicated_per_fov(tmp_path):
+    """A 10-z acquisition writes one row per z-level per FOV; that is 2 FOVs, not 20."""
+    rows = [f"A1,{fov},{z},{1.0 + 0.5 * fov},2.0,{3930.0 + z},t"
+            for z in range(10) for fov in (0, 1)]
+    (tmp_path / "coordinates.csv").write_text(_monkey_csv(rows))
+    pos = load_fov_positions_um(tmp_path, {"A1": [0, 1]})
+    assert pos == {("A1", 0): (1000, 2000), ("A1", 1): (1500, 2000)}
+
+
+def test_monkey_format_detected_by_header_not_row_count(tmp_path):
+    """Row count == FOV count, yet the fov column still decides the mapping (rows are shuffled).
+
+    If detection ever regressed to a row-count heuristic this file would parse positionally and
+    silently assign FOV 0 the position of FOV 1 — a scrambled mosaic that looks fine.
+    """
+    (tmp_path / "coordinates.csv").write_text(_monkey_csv([
+        "A1,1,0,9.0,9.0,0,t",
+        "A1,0,0,1.0,1.0,0,t",
+    ]))
+    pos = load_fov_positions_um(tmp_path, {"A1": [0, 1]})
+    assert pos[("A1", 0)] == (1000, 1000)
+    assert pos[("A1", 1)] == (9000, 9000)
+
+
+def test_twenty_x_format_still_positional_when_no_fov_column(tmp_path):
+    """The (b) path is untouched: no fov column -> Nth distinct position is the Nth sorted FOV."""
+    (tmp_path / "coordinates.csv").write_text(_csv(["A1,9.0,9.0,", "A1,1.0,1.0,"]))
+    pos = load_fov_positions_um(tmp_path, {"A1": [0, 1]})
+    assert pos[("A1", 0)] == (9000, 9000)
+
+
+def test_monkey_multiple_regions_grouped_independently(tmp_path):
+    (tmp_path / "coordinates.csv").write_text(_monkey_csv([
+        "manual0,0,0,1.0,2.0,0,t", "manual1,0,0,50.0,60.0,0,t", "manual0,1,0,1.5,2.0,0,t",
+    ]))
+    pos = load_fov_positions_um(tmp_path, {"manual0": [0, 1], "manual1": [0]})
+    assert pos[("manual0", 1)] == (1500, 2000)
+    assert pos[("manual1", 0)] == (50000, 60000)
+
+
+def test_monkey_cross_check_missing_fov_raises(tmp_path):
+    """A truncated monkey CSV is still a mismatch — fail loud, same as the positional path."""
+    (tmp_path / "coordinates.csv").write_text(_monkey_csv(["A1,0,0,1.0,2.0,0,t"]))
+    with pytest.raises(ValueError, match="stage position"):
+        load_fov_positions_um(tmp_path, {"A1": [0, 1, 2]})
+
+
+def test_monkey_fov_id_not_in_filenames_raises(tmp_path):
+    """A CSV fov id with no matching image is unknowable, not silently dropped."""
+    (tmp_path / "coordinates.csv").write_text(_monkey_csv([
+        "A1,0,0,1.0,2.0,0,t", "A1,7,0,1.5,2.0,0,t",
+    ]))
+    with pytest.raises(ValueError, match="stage position|fov"):
+        load_fov_positions_um(tmp_path, {"A1": [0, 1]})
+
+
+def test_monkey_non_numeric_fov_raises_with_line_number(tmp_path):
+    (tmp_path / "coordinates.csv").write_text(_monkey_csv(["A1,oops,0,1.0,2.0,0,t"]))
+    with pytest.raises(ValueError, match="line 2"):
+        load_fov_positions_um(tmp_path, {"A1": [0]})
+
+
+def test_monkey_conflicting_positions_for_one_fov_raises(tmp_path):
+    """Same fov id at two DIFFERENT stage positions is a corrupt file, not a dedup case."""
+    (tmp_path / "coordinates.csv").write_text(_monkey_csv([
+        "A1,0,0,1.0,2.0,0,t", "A1,0,1,5.0,6.0,0,t",
+    ]))
+    with pytest.raises(ValueError, match="conflicting|differing"):
+        load_fov_positions_um(tmp_path, {"A1": [0]})
+
+
+def test_monkey_malformed_csv_still_yields_metadata(squid_dataset):
+    """The IMA-187 containment must hold for the new format too: identity survives, placement degrades."""
+    root, _ = squid_dataset
+    (root / "coordinates.csv").write_text(_monkey_csv(["B2,0,0,1.0,2.0,0,t"]))   # too few
+    with pytest.warns(UserWarning, match="unusable"):
+        meta = open_reader(root).metadata
+    assert meta["regions"] == ["B2", "B3"]
+    assert meta["channels"] and meta["dtype"] is not None
+    assert meta["fov_positions_um"] == {}
+
+
+# --- real data: both formats, real numbers ---------------------------------------------------
+
+_REAL_20X = Path.home() / "Downloads" / "synthetic_2x2_wellplate"
+_REAL_MONKEY = (Path.home() / "Downloads"
+                / "test_10x_laser_af_z_stack_2025-10-28_13-40-43.939945 yy")
+
+
+@pytest.mark.integration
+def test_real_20x_format_plate_span():
+    """synthetic_2x2_wellplate: 4 wells x 36 FOVs, 20x-style header. Known-good numbers."""
+    if not _REAL_20X.is_dir():
+        pytest.skip("synthetic_2x2_wellplate not present")
+    meta = open_reader(_REAL_20X).metadata
+    pos = meta["fov_positions_um"]
+    assert len(pos) == 144
+    xs = [p[0] for p in pos.values()]
+    ys = [p[1] for p in pos.values()]
+    assert max(xs) - min(xs) == pytest.approx(12526.1, abs=0.5)
+    assert max(ys) - min(ys) == pytest.approx(12526.1, abs=0.5)
+    a1 = [p for (r, _f), p in pos.items() if r == "A1"]
+    assert max(p[0] for p in a1) - min(p[0] for p in a1) == pytest.approx(3526.1, abs=0.5)
+    assert meta["pixel_size_um"] == pytest.approx(0.3728571, abs=1e-6)
+
+
+@pytest.mark.integration
+def test_real_monkey_format_parses_with_fov_column(tmp_path):
+    """original_coordinates_0.csv from the 10x z-stack: the monkey header, on real data.
+
+    Read-only: the real file is copied nowhere; it is read straight from Downloads and only its
+    parsed result is asserted. The reader is pointed at the acquisition root, whose FOV ids come
+    from the filenames, so this exercises the real cross-check too.
+    """
+    if not _REAL_MONKEY.is_dir():
+        pytest.skip("10x laser-af z-stack dataset not present")
+    src = _REAL_MONKEY / "original_coordinates" / "original_coordinates_0.csv"
+    if not src.exists():
+        pytest.skip("original_coordinates_0.csv not present")
+    header = src.read_text().splitlines()[0]
+    assert "fov" in [h.strip() for h in header.split(",")], "expected the monkey header"
+
+    fovs_per_region = open_reader(_REAL_MONKEY).metadata["fovs_per_region"]
+    # Parse the monkey file in isolation (link it into a scratch dir; the source is never written).
+    (tmp_path / "coordinates.csv").write_text(src.read_text())
+    pos = load_fov_positions_um(tmp_path, fovs_per_region)
+    assert len(pos) == sum(len(v) for v in fovs_per_region.values())
+    assert pos[("manual0", 0)] == pytest.approx((98224.18125, 10185.4))
