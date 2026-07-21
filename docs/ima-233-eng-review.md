@@ -386,6 +386,67 @@ above. Run with Claude Code or Codex; checkbox as you ship.
   - Files: —
   - Verify: harness default fixture path resolves under `~/CEPHLA/Data`
 
+## Implementation status (built 2026-07-21)
+
+Shipped and verified on the real `20x_scan` acquisition. `bench/` sits at the repo
+root, NOT inside `squidmip/` — `pyproject.toml` packages only `["squidmip"]`, so none
+of this reaches Nick's wheel and the runtime MIP pipeline gains no dependency.
+
+One improvement over the plan: the seam metric is implemented on numpy's FFT alone
+(`bench/metrics.py`), so it needs neither scipy/skimage (not SquidMIP deps) nor an
+import of `tilefusion`. That **removes** the R3 placement tension rather than working
+around it — the metric is self-contained.
+
+    bench/
+      dataset.py    Squid acquisition -> tiles + stage positions (both CSV layouts)
+      metrics.py    phase correlation, overlap strips, block gating, seam residual
+      sampler.py    process-tree peak RSS + disk low-water watchdog + kill_tree
+      runner.py     preflight -> spawn -> measure -> score -> reclaim -> row
+      report.py     CSV schema (no git_sha; per-tool version) + markdown table
+      adapters/     stage-baseline (control), tilefusion, ashlar
+      drivers/      subprocess drivers emitting the shared positions.json contract
+
+### Measured, on real data (region C5, 36 FOVs, 2084x2084, 0.3729 um/px)
+
+| Tool | Status | Wall (s) | Peak RSS (MB) | Seam resid median (px) | p90 | Seams |
+|---|---|---|---|---|---|---|
+| stage-baseline | OK | 0.07 | 4.4 | 39.05 | 40.40 | 47 |
+| tilefusion 0.1.0 | OK | 4.43 | 354.3 | 3.15 | 8.24 | 56 |
+| ashlar | MISSING_TOOL | n/a | n/a | n/a | n/a | 0 |
+
+The stage-baseline row is the no-registration control, added during implementation
+because it turned out to be the number that makes the table interpretable: Squid's
+stage alone leaves ~39 px (~14.6 um) of median seam misalignment, and tilefusion
+removes 92% of it for 4.4 s and 354 MB. A sweep of the pixel-size conversion confirmed
+the 39 px is genuine stage error, not a calibration artifact — the residual minimises
+exactly at the nominal 0.37286 um/px.
+
+The tilefusion driver registers only and never fuses (2.5 KB written, not a mosaic),
+following the position contract at `tilefusion/core.py:1102`:
+`solved_um = tile_positions + global_offsets * pixel_size`. Tile index is matched to
+Squid FOV by stage geometry rather than assumed from ordering, so a reader reordering
+surfaces as an error instead of silently mislabelled rows.
+
+### Tests: 244 passing, 0 failing
+
+Includes the two that make the metric trustworthy rather than merely green:
+`test_injected_misalignment_is_recovered` (lie about a tile position by 5 px, assert
+the metric reports 5 px) and `test_a_worse_stitcher_scores_worse` (the table can
+actually rank). Every status branch is covered end-to-end against real subprocesses:
+OK, MISSING_TOOL, CRASH, TIMEOUT, DISK_ABORT, QUALITY_NA.
+
+**The pre-existing red suite is fixed.** Ten integration tests were failing with
+`FileNotFoundError` because the `sim_*` guards checked `is_dir()` only, which passes on
+a directory full of dangling symlinks. One shared helper — `require_usable_dataset` in
+`tests/conftest.py` — now resolves a real plane before declaring a fixture usable, so
+those tests skip with an actionable message. 10 failures -> 0.
+
+### Still deferred
+
+MCmicro, BigStitcher and PetaKit5D, per "Start narrow". ASHLAR's adapter and driver are
+written but it is not installed here, so it reports `MISSING_TOOL` — install it and the
+row populates with no code change.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |

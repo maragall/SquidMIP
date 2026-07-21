@@ -33,13 +33,20 @@ def req(tmp_path):
 
 
 def test_builtin_registry_starts_narrow():
-    """IMA-233 ships tilefusion + ASHLAR only; the other three are deferred."""
+    """The control, the incumbent, then ASHLAR. MCmicro/BigStitcher/PetaKit5D deferred."""
     names = [a.name for a in BUILTIN_ADAPTERS]
-    assert names == ["tilefusion", "ashlar"]
+    assert names == ["stage-baseline", "tilefusion", "ashlar"]
 
 
 def test_build_adapters_default_returns_all():
-    assert len(build_adapters(None)) == 2
+    assert len(build_adapters(None)) == 3
+
+
+def test_stage_baseline_is_always_available():
+    """The control needs no third-party tool, so every run carries a reference row."""
+    from bench.adapters import StageBaselineAdapter
+
+    assert StageBaselineAdapter().is_available()
 
 
 def test_build_adapters_by_name():
@@ -53,7 +60,11 @@ def test_build_adapters_rejects_unknown_names():
 
 @pytest.mark.parametrize("cls", BUILTIN_ADAPTERS)
 def test_adapter_declares_full_measurability(cls):
-    """Both shipped tools are local Python: RSS, disk and quality are all measurable."""
+    """Every shipped adapter is local Python: RSS, disk and quality all measurable.
+
+    The deferred tools are the opposite case -- MCmicro's work happens in a Docker
+    cgroup and BigStitcher solves a non-rigid warp -- which is what these flags exist
+    to express when they land."""
     a = cls()
     assert a.measurable_rss
     assert a.measurable_output_bytes
@@ -140,7 +151,7 @@ def test_executable_available():
 # ----------------------------------------------------------------------- drivers
 
 
-@pytest.mark.parametrize("mod", ["tilefusion_driver", "ashlar_driver"])
+@pytest.mark.parametrize("mod", ["tilefusion_driver", "ashlar_driver", "stage_baseline_driver"])
 def test_driver_exits_3_when_its_tool_is_absent(mod, tmp_path, req):
     """Importing the driver must not require the tool; a clean exit 3 becomes a
     MISSING_TOOL row rather than a traceback in the operator's face."""

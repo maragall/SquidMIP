@@ -311,3 +311,15 @@ def test_rows_are_written_incrementally(acq, cfg, tmp_path):
     csv_path = tmp_path / "b.csv"
     run_benchmark([a, b], acq, cfg, tmp_path / "out", csv_path=csv_path, repo_root=REPO_ROOT)
     assert len(read_csv(csv_path)) == 2
+
+
+def test_stage_baseline_adapter_scores_the_synthetic_grid(acq, cfg, tmp_path):
+    """The control, end to end through the real runner: synthetic tiles were cut at
+    exactly their stage positions, so the residual must be ~0."""
+    from bench.adapters import StageBaselineAdapter
+
+    row = run_one(StageBaselineAdapter(), acq, cfg, tmp_path / "out", repo_root=REPO_ROOT)
+    assert row.status == STATUS_OK
+    assert row.tool == "stage-baseline"
+    assert row.n_seams_measured >= 4
+    assert row.resid_median_px < 0.5

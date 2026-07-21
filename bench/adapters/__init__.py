@@ -1,7 +1,7 @@
 """Stitcher adapters.
 
-Registry order is the order rows appear in the report. tilefusion is first because it
-is the incumbent -- the thing the other tools are being measured against.
+Registry order is the order rows appear in the report: the no-registration control
+first, then the incumbent, then the external tools being evaluated against them.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from bench.adapters.base import (
     StitchRequest,
     read_positions_json,
 )
+from bench.adapters.stage_baseline import StageBaselineAdapter
 from bench.adapters.tilefusion import TileFusionAdapter
 
 #: Adapters shipped today. IMA-233 deliberately starts narrow: both of these are
@@ -21,6 +22,7 @@ from bench.adapters.tilefusion import TileFusionAdapter
 #: ("Start narrow"). BigStitcher's non-rigid model makes the quality metric undefined,
 #: and PetaKit5D needs an unverified MATLAB/MCR licence.
 BUILTIN_ADAPTERS: tuple[type[StitcherAdapter], ...] = (
+    StageBaselineAdapter,
     TileFusionAdapter,
     AshlarAdapter,
 )
@@ -40,6 +42,7 @@ __all__ = [
     "AdapterOutcome",
     "AshlarAdapter",
     "BUILTIN_ADAPTERS",
+    "StageBaselineAdapter",
     "StitcherAdapter",
     "StitchRequest",
     "TileFusionAdapter",
