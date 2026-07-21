@@ -357,6 +357,67 @@ def run_all():
         w.close()
         return f"mean brightness global={a:.2f} -> per-region={b:.2f}"
 
+    @check("IMA-242", "DRAGGING the contrast slider repaints the plate (widget-driven)")
+    def _():
+        """Drive the real QSlider, not set_channel_window(). The whole reason this file exists is
+        that a handler-level test passes while the wiring is dead."""
+        w = open_window(PLATE)
+        ov, bar = w._overview, w._channel_bar
+        if bar is None or not bar._rows:
+            w.close(); raise SkipCheck("no channel bar")
+        settle()
+        base = rendered(ov)
+        _, s_lo, s_hi = bar._rows[0]
+        # A drag is a stream of valueChanged signals; emit them the way the widget does.
+        s_lo.setValue(int(0.55 * s_lo.maximum()))
+        s_hi.setValue(int(0.60 * s_hi.maximum()))
+        _app().processEvents()
+        after = rendered(ov)
+        latched = ov._contrast.is_manual(0)
+        win_after = ov.channel_windows()[0]
+        # "auto" must hand the channel back to the running histogram AND move the sliders back.
+        bar._auto(0)
+        _app().processEvents()
+        unlatched = not ov._contrast.is_manual(0)
+        w.close()
+        h = min(base.shape[0], after.shape[0]); wd = min(base.shape[1], after.shape[1])
+        changed = int((np.abs(base[:h, :wd] - after[:h, :wd]) > 0).sum())
+        assert changed > 0, "dragging the contrast slider changed nothing on screen"
+        assert latched, "a slider drag did not latch the channel manual"
+        assert unlatched, "'auto' did not unlatch the channel"
+        return (f"{changed} px changed on drag; window -> "
+                f"({win_after[0]:.0f}, {win_after[1]:.0f}); latch on drag + release on auto OK")
+
+    @check("IMA-242", "ONE contrast model: the loupe obeys the slider the plate obeys")
+    def _():
+        """The duplication this ticket collapsed: the loupe used to memoise its own window and its
+        own compositor, so a slider drag moved the plate and left the magnifier of that same plate
+        showing the pre-drag contrast."""
+        import squidmip._viewer as V
+        w = open_window(PLATE)
+        ov = w._overview
+        settle()
+        if ov._contrast is None:
+            w.close(); raise SkipCheck("no contrast model")
+        # The three renderers must agree about a LATCHED channel, whatever auto they each derive.
+        ov._contrast.set_manual(0, 123.0, 4567.0)
+        plate_win = ov.channel_windows()[0]
+        store = ov._store.get(ov._active)
+        cell_win = None
+        if store is not None and ov._tiles_by_layer.get(ov._active):
+            ri, ci = sorted(ov._tiles_by_layer[ov._active])[0]
+            cell_win = ov._cell_windows(store, ri, ci)[0]
+        loupe_win = ov._contrast.resolve(0, (0.0, 65535.0))   # the loupe's resolution path
+        w.close()
+        assert plate_win == (123.0, 4567.0), f"plate ignored the latch: {plate_win}"
+        assert loupe_win == (123.0, 4567.0), f"loupe ignored the latch: {loupe_win}"
+        if cell_win is not None:
+            assert cell_win == (123.0, 4567.0), f"per-region ignored the latch: {cell_win}"
+        assert not hasattr(V, "_composite_rgb") and not hasattr(V, "_percentile_window"), \
+            "a duplicate contrast implementation is back"
+        return (f"plate={plate_win} per-region={cell_win} loupe={loupe_win} — all one model; "
+                "both duplicate implementations gone")
+
     # ---------- operators ------------------------------------------------------------
     @check("IMA-210", "Operator registry exposes every shipped operator")
     def _():

@@ -2189,14 +2189,40 @@ def test_loupe_um_per_screen_px_refuses_to_guess():
 
 
 def test_composite_rgb_matches_manual_windowing():
-    planes = [np.array([[0.0, 10.0]]), np.array([[5.0, 5.0]])]
+    # IMA-242: the loupe's private `_composite_rgb` is gone; `composite` is the one compositor and
+    # the loupe goes through it, so this asserts against the survivor.
+    from squidmip._montage import composite
+    planes = np.array([[[0.0, 10.0]], [[5.0, 5.0]]])
     colors = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     wins = [(0.0, 10.0), (0.0, 10.0)]
-    out = V._composite_rgb(planes, colors, wins)
+    out = composite(planes, colors, wins).astype(float) / 255.0
     assert out.shape == (1, 2, 3)
-    assert out[0, 0, 0] == pytest.approx(0.0)      # ch0 at its window floor
-    assert out[0, 1, 0] == pytest.approx(1.0)      # ch0 at its window ceiling
-    assert out[0, 0, 1] == pytest.approx(0.5)      # ch1 mid-window, in green
+    assert out[0, 0, 0] == pytest.approx(0.0, abs=0.01)      # ch0 at its window floor
+    assert out[0, 1, 0] == pytest.approx(1.0, abs=0.01)      # ch0 at its window ceiling
+    assert out[0, 0, 1] == pytest.approx(0.5, abs=0.01)      # ch1 mid-window, in green
+
+
+def test_ima242_one_contrast_model_resolves_manual_over_auto():
+    """The precedence rule lives in ONE place and every renderer asks it the same question."""
+    rc = V._RunningContrast(2, 65535.0)
+    rc.add(0, np.full((8, 8), 1000, np.uint16))
+    rc.add(1, np.full((8, 8), 2000, np.uint16))
+    auto0 = rc._auto_window(0)
+    assert rc.resolve(0, auto0) == auto0            # untouched -> the caller's auto window stands
+    rc.set_manual(0, 111.0, 222.0)
+    # A latched channel keeps the user's window WHATEVER auto the caller derived -- this is the
+    # single rule the plate, the per-region cells and the loupe all consult.
+    assert rc.resolve(0, (9.0, 9999.0)) == (111.0, 222.0)
+    assert rc.window(0) == (111.0, 222.0)
+    assert rc.resolve(1, (9.0, 9999.0)) == (9.0, 9999.0)     # ch1 is not latched
+    rc.set_auto(0)
+    assert rc.resolve(0, (9.0, 9999.0)) == (9.0, 9999.0)     # unlatched -> auto again
+
+
+def test_ima242_no_second_contrast_implementation_survives():
+    """Guard the collapse: the twins must not grow back."""
+    assert not hasattr(V, "_composite_rgb"), "the loupe's private compositor came back"
+    assert not hasattr(V, "_percentile_window"), "the second percentile rule came back"
 
 
 def test_fov_seam_is_single_fov():

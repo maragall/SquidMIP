@@ -809,13 +809,29 @@ class _RunningContrast:
     def is_manual(self, ch: int) -> bool:
         return ch in self._manual
 
-    def window(self, ch: int) -> tuple[float, float]:
-        """(lo, hi) for this channel. A DEGENERATE window (hi <= lo) is returned DELIBERATELY when
-        both percentiles land in the same bin — ``_window``'s ``span <= 0`` guard renders that
-        black, which is the honest answer when there is no contrast.
+    def resolve(self, ch: int, auto: tuple[float, float]) -> tuple[float, float]:
+        """THE precedence rule: a channel the user latched keeps the user's window, whatever the
+        caller computed automatically (IMA-242).
+
+        Every renderer derives its own *auto* window legitimately — the plate from the running
+        histogram, a per-region cell from exact percentiles over that cell, the loupe from a
+        well's coarse plane. What they must NOT each decide for themselves is whether the user's
+        slider outranks that, because a renderer that forgets to ask is a renderer where dragging
+        the slider silently does nothing. One rule, one place, three callers.
         """
-        if ch in self._manual:      # latched: the user owns this channel's window (D4)
-            return self._manual[ch]
+        return self._manual.get(ch, auto)
+
+    def window(self, ch: int) -> tuple[float, float]:
+        """(lo, hi) for this channel: the latched manual window, else the running histogram's."""
+        return self.resolve(ch, self._auto_window(ch))
+
+    def _auto_window(self, ch: int) -> tuple[float, float]:
+        """The running histogram's window for *ch*, ignoring any latch.
+
+        A DEGENERATE window (hi <= lo) is returned DELIBERATELY when both percentiles land in the
+        same bin — ``_window``'s ``span <= 0`` guard renders that black, which is the honest
+        answer when there is no contrast.
+        """
         h = self._hist[ch]
         tot = h.sum()
         if tot == 0:
@@ -1026,27 +1042,20 @@ def _fmt_um(v: float) -> str:
     return f"{v:g} µm" if v >= 1 else f"{v * 1000:g} nm"
 
 
-def _composite_rgb(planes, colors, windows) -> np.ndarray:
-    """(C, y, x) planes -> (y, x, 3) float RGB in [0, 1], one window per channel.
-
-    The single definition of "channels to colour" for the viewer. Windowing stays with the
-    caller: the plate's three renderers legitimately source their window differently (streaming
-    running-contrast, per-well percentiles, the loupe mirroring a tile's window), and folding
-    that in here would force a policy where there isn't one."""
-    out = None
-    for c_i, plane in enumerate(planes):
-        lo, hi = windows[c_i]
-        contrib = _window(plane, lo, hi if hi > lo else lo + 1)[:, :, None] * colors[c_i][None, None, :]
-        out = contrib if out is None else out + contrib
-    if out is None:
-        return np.zeros((1, 1, 3), np.float32)
-    return np.clip(out, 0, 1)
-
-
-def _percentile_window(plane, pct=(1.0, 99.8)) -> tuple[float, float]:
-    """The plate's per-well contrast rule, in one place (mirrors _ComputedPlateWorker)."""
-    lo, hi = float(np.percentile(plane, pct[0])), float(np.percentile(plane, pct[1]))
-    return lo, hi if hi > lo else lo + 1
+# IMA-242: `_composite_rgb` and `_percentile_window` used to live here — a second compositor and a
+# second percentile rule, each a hand-synced twin of `composite` and `_pct_window`. They had drifted
+# apart in exactly the way that shape always drifts:
+#
+#   * `_percentile_window` widened a degenerate window to (lo, lo + 1); `_pct_window` deliberately
+#     does NOT, because +1 is one DATA unit and (v - lo)/1 clips to 1.0 — a blank or saturated
+#     channel rendered FULL WHITE and read as signal. The loupe had the bug the plate had fixed.
+#   * `_composite_rgb` took no channel mask, so unticking a channel removed it from the plate and
+#     left it in the loupe.
+#   * Neither consulted the manual latch, so dragging a contrast slider moved the plate and left
+#     the loupe showing the old window forever.
+#
+# Both are now gone. `composite` is the one compositor, `_pct_window` the one percentile rule, and
+# `_RunningContrast.resolve` the one place the manual-outranks-auto precedence is decided.
 
 
 _LOUPE_WIN_LOCK = threading.Lock()   # guards the per-source window memo (worker thread writes)
@@ -1091,7 +1100,7 @@ class _LoupeSource:
         if hit is not None:
             return hit
         coarse = self.coarse(well_id)
-        win = [_percentile_window(coarse[c]) for c in range(coarse.shape[0])]
+        win = [_pct_window(coarse[c]) for c in range(coarse.shape[0])]
         with _LOUPE_WIN_LOCK:
             cache[well_id] = win
         return win
@@ -1525,15 +1534,26 @@ class PlateOverview(QWidget):
         # Mirror the TILE's contrast rule on the WELL's pixels (computed by the source, per well)
         # — never percentiles of the crop under the cursor, which would make brightness lurch as
         # the cursor moves and make the inset look like different data.
-        win = window if window is not None else self._loupe_win.get(well_id)
-        if win is None:
-            win = [(0.0, 1.0)] * crop.shape[0]
-        self._loupe_win[well_id] = win
+        #
+        # That AUTO window is then resolved through the plate's one contrast model (IMA-242), so a
+        # channel the user latched with the slider shows the user's window here too. Before, the
+        # loupe kept its own memo and the inset went on displaying the pre-drag contrast — two
+        # representations of one truth, never synced.
+        auto = window if window is not None else self._loupe_win.get(well_id)
+        if auto is None:
+            auto = [(0.0, 1.0)] * crop.shape[0]
+        self._loupe_win[well_id] = auto              # memo the AUTO window, never the resolved one
+        win = ([self._contrast.resolve(c, auto[c]) for c in range(len(auto))]
+               if self._contrast is not None else list(auto))
         colors = self._loupe_colors
         if colors is None:
             colors = np.ones((crop.shape[0], 3), np.float32)
-        rgb = (_composite_rgb([crop[c].astype(np.float32) for c in range(crop.shape[0])],
-                              colors, win) * 255).astype(np.uint8)
+        # The same compositor the plate uses, with the same channel mask: unticking a channel must
+        # remove it from the inset as well, or the loupe contradicts the plate it sits on top of.
+        planes = np.stack([crop[c].astype(np.float32) for c in range(crop.shape[0])])
+        mask = self._mask if (self._mask is not None
+                              and len(self._mask) == crop.shape[0]) else None
+        rgb = composite(planes, colors, win, mask)
         rgb = np.ascontiguousarray(rgb)
         h, w = rgb.shape[:2]
         img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()   # copy: rgb is transient
@@ -1627,13 +1647,10 @@ class PlateOverview(QWidget):
         """
         y0, x0 = ri * _CELL, ci * _CELL
         cell = store[:, y0:y0 + _CELL, x0:x0 + _CELL]
-        out = []
-        for ch in range(cell.shape[0]):
-            if self._contrast is not None and self._contrast.is_manual(ch):
-                out.append(self._contrast.window(ch))
-            else:
-                out.append(_pct_window(cell[ch]))
-        return out
+        if self._contrast is None:
+            return [_pct_window(cell[ch]) for ch in range(cell.shape[0])]
+        return [self._contrast.resolve(ch, _pct_window(cell[ch]))
+                for ch in range(cell.shape[0])]
 
     def _composite_per_region(self, store: np.ndarray, step: int) -> np.ndarray:
         """Composite the plate one CELL at a time, each under its own window (SCOPE_PER_REGION).
@@ -1693,6 +1710,22 @@ class PlateOverview(QWidget):
         """
         self.recomposite(quick=True)
         self._full.start(150)
+        self._refresh_loupe()
+
+    def _refresh_loupe(self):
+        """Re-render the loupe inset under the contrast that just changed (IMA-242).
+
+        The inset holds a rendered QImage, so repainting the plate alone would leave it showing
+        the PRE-drag contrast until the cursor happened to move — the plate and the magnifier of
+        the plate disagreeing about the same pixels. Re-issuing the request is cheap: the worker
+        memoises crops, so this re-colours the bytes it already has and re-reads nothing.
+        """
+        if self._loupe is None or self._loupe_worker is None:
+            return
+        try:
+            self._request_loupe(self._loupe["x"], self._loupe["y"])
+        except Exception:
+            pass          # a contrast drag must never fail because the loupe could not re-render
 
     def _on_full_timeout(self):
         """The coalescing timer fired. Guarded: a pending recomposite must not outlive the widget
