@@ -41,6 +41,7 @@ Design notes:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sys
@@ -490,6 +491,45 @@ def resolve_plate_root(path) -> tuple[Path, bool]:
     return p, False
 
 
+def exploration_tab_key(acq_id: str, regions) -> str:
+    """Stable, CONTENT-ADDRESSED id for an exploration tab (IMA-205).
+
+    Same acquisition + same SET of regions -> the same key, whichever order the user selected
+    them in. That gives dedupe for free: re-selecting the same wells focuses the tab that is
+    already open instead of piling up duplicates on every stray drag.
+
+    ``acq_id`` is hashed in deliberately. Well ids repeat across plates ("B2" exists on every
+    one), so a key built from regions alone would let a selection on a NEW acquisition dedupe
+    onto a stale tab left over from the old one. ``ingest`` also closes exploration tabs, but
+    the key has to be safe on its own rather than relying on that.
+    """
+    uniq = sorted(set(regions))
+    if not uniq:
+        raise ValueError("an exploration tab needs at least one region")
+    digest = hashlib.sha1("\x1f".join([acq_id, *uniq]).encode("utf-8")).hexdigest()[:10]
+    return f"exp:{digest}"
+
+
+def exploration_tab_label(regions) -> str:
+    """Human-readable tab title — 'B2–B5 (4)'. The hash is the internal key, never the label."""
+    uniq = sorted(set(regions))
+    if not uniq:
+        return "exploration"
+    if len(uniq) == 1:
+        return uniq[0]
+    return f"{uniq[0]}–{uniq[-1]} ({len(uniq)})"
+
+
+def operator_layer_key(op_key: str, tab_key: Optional[str]) -> str:
+    """Layer id an operator's results are filed under.
+
+    Plate-wide runs keep the bare operator key ("mip") so existing behaviour is byte-identical.
+    A run scoped to an exploration tab gets "<op>@<tab_key>" — without this, two tabs running
+    the same operator both write into PlateOverview._op_canvas["mip"] and silently overwrite
+    each other's tiles."""
+    return f"{op_key}@{tab_key}" if tab_key else op_key
+
+
 class _RunningContrast:
     """Per-channel global contrast that updates as wells stream in (histogram over tiles so far)."""
 
@@ -616,6 +656,34 @@ class PlateOverview(QWidget):
         self._active = layer
         self._final = self._op_final.get(layer)   # None for "raw" -> falls back to the base canvas
         self._scaled = None
+        self.update()
+
+    def drop_layer(self, layer: str):
+        """Forget a layer entirely and FREE its canvas (IMA-205: an exploration tab's layers die
+        with the tab). ``_canvas_for`` lazily allocates a full plate-sized RGB888 image per layer
+        (nc*_CELL x nr*_CELL — tens of MB on a 1536wp), so without this a closed tab's montage
+        stays resident forever. Falls back to the base layer if the dropped one was showing."""
+        if layer == "raw":
+            return
+        self._op_canvas.pop(layer, None)
+        self._op_final.pop(layer, None)
+        self._tiles_by_layer.pop(layer, None)
+        self._tiles = set().union(*self._tiles_by_layer.values()) if self._tiles_by_layer else set()
+        if self._active == layer:
+            self.set_active_layer("raw")
+        else:
+            self.update()
+
+    def status_snapshot(self) -> dict:
+        """Copy of the per-well status map — the window saves one per exploration tab so a tab's
+        amber/failed dots follow its own run, not whatever ran last (IMA-205)."""
+        return dict(self._status)
+
+    def set_status_map(self, status: dict):
+        """Restore a snapshot. Foreign keys are ignored, same as ``set_status``."""
+        for rc, state in status.items():
+            if rc in self._status:
+                self._status[rc] = state
         self.update()
 
     def select(self, ri: int, ci: int):
@@ -1000,6 +1068,34 @@ class _ComputedPlateWorker(QThread):
 
 # --- main window: plate overview | embedded ndviewer ----------------------------------------
 
+class _ExplorationTab(QWidget):
+    """One 'exploration' tab: a saved FOV/region subset plus the operator UI scoped to it (IMA-205).
+
+    Multi-instance by design — one per selection — which is why it does NOT reuse an operator
+    tab's fixed key. Identity is content-addressed (``exploration_tab_key``), so re-selecting the
+    same wells focuses this tab instead of opening a second copy of it.
+
+        selection {B2,B3,B4}
+              |
+              v  exploration_tab_key(acq, regions) -> "exp:1a2b3c"
+        _ExplorationTab(regions)  --run--> run_operator(op, regions=..., tab_key="exp:1a2b3c")
+              |                                              |
+              |                                    layer "<op>@exp:1a2b3c"
+              +--close--> stop run, drop layers, free canvases
+    """
+
+    def __init__(self, regions: list, tab_key: str, parent=None):
+        super().__init__(parent)
+        self.regions = list(regions)
+        self.tab_key = tab_key
+        self.status: dict = {}      # this tab's plate dots, restored when it becomes active
+
+    def shutdown(self):
+        """Called by _close_op_tab (duck-typed, like the CLI terminal's). The window does the real
+        teardown in _discard_exploration — this exists so the hasattr(w, 'shutdown') path is safe."""
+        return
+
+
 class PlateWindow(QMainWindow):
     def __init__(self, initial_path: Optional[str] = None):
         super().__init__()
@@ -1045,14 +1141,25 @@ class PlateWindow(QMainWindow):
         self._layers_tab = None       # the Layers tab widget, once opened
         self._order = []              # well order = the detail's FOV-slider order
         self._op_tabs = {}            # key -> operator-UI widget currently open as a tab in _left_tabs
+        self._push_index = None       # global plate idx -> current run's slider position (None = identity)
+        self._active_exploration = None   # the exploration tab currently in front, if any
+        self._tabs_muted = False      # suppress _on_tab_changed during bulk teardown (ingest)
+        self._run_out_dir = None      # output dir of the in-flight SAVE run (for partial cleanup)
+        self._run_tab_key = None      # exploration tab that owns the in-flight run, if any
 
         # THREE-PANE layout. Tabs live ONLY inside the top-left pane (their bar sits at the pane's top,
         # like the plate pane's title bar) — never a global strip across the window:
         #   top-left  = the PROCESS console, a QTabWidget: a "Process wells" home tab (operator list),
-        #               and one tab per operator you open (MIP -> where-to-save UI; Record -> recorder
-        #               UI). The right pane stays a plain singleton, so operator UIs live here.
+        #               one tab per operator you open (MIP -> where-to-save UI; Record -> recorder
+        #               UI), and one EXPLORATION tab per selected FOV subset (IMA-205). Operator UIs
+        #               live here because the right pane holds a single viewer widget.
         #   bottom-left = the HCS PLATE view (<= half the display wide); its title bar names the plate.
-        #   right     = the ndviewer_light array viewer, full height (a singleton — no tabs).
+        #   right     = the ndviewer_light array viewer, full height. ONE widget instance (never
+        #               tabbed), but NOT plate-fixed: its FOV slider FOLLOWS the active tab — an
+        #               exploration tab re-points it at that tab's subset, the home tab restores the
+        #               whole plate (_on_tab_changed). ndviewer's only retarget seam is
+        #               start_acquisition, which resets the viewer, so computed frames do not
+        #               survive a tab switch; raw plane paths are re-registered so it isn't black.
 
         # top-left: the process console (build the home tab first — it owns self._readout, which
         # _make_detail_viewer writes to if ndviewer is unavailable).
@@ -1068,6 +1175,7 @@ class PlateWindow(QMainWindow):
         self._left_tabs.setStyleSheet(_TABS_DARK)
         self._left_tabs.setTabsClosable(True)
         self._left_tabs.tabCloseRequested.connect(self._close_op_tab)
+        self._left_tabs.currentChanged.connect(self._on_tab_changed)
         self._left_tabs.addTab(self._build_process_pane(), "Process wells")
         self._left_tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)  # home tab isn't closable
 
@@ -1234,6 +1342,8 @@ class PlateWindow(QMainWindow):
         if index == 0:                                     # 'Process wells' home tab — never closable
             return
         w = self._left_tabs.widget(index)
+        if isinstance(w, _ExplorationTab):                 # stop its run + free its layers FIRST
+            self._discard_exploration(w)
         self._left_tabs.removeTab(index)
         for k, v in list(self._op_tabs.items()):
             if v is w:
@@ -1244,6 +1354,123 @@ class PlateWindow(QMainWindow):
         if hasattr(w, "shutdown"):                         # a live terminal — kill its shell first
             w.shutdown()
         w.deleteLater()
+
+    def _discard_exploration(self, tab: "_ExplorationTab"):
+        """Tear down one exploration tab's work: stop its run if it owns the live one, then drop
+        every layer it produced and FREE the plate canvases behind them.
+
+        Without this the worker keeps computing into a layer nobody can reach, and each abandoned
+        layer keeps a full plate-sized RGB canvas resident (tens of MB on a 1536wp) — silent
+        growth on the app's headline gesture, with no error anywhere."""
+        stopped = False
+        if self._run_tab_key == tab.tab_key and self._busy():
+            self._stop_worker()          # _retire: disconnects signals, then lets the thread drain
+            self._note_partial_output()  # a stopped SAVE run leaves a half-written .hcs on disk
+            self._run_tab_key = None
+            stopped = True
+        gone = self._op_stack.remove_suffix(f"@{tab.tab_key}")
+        if self._overview is not None:
+            for layer in gone:
+                self._overview.drop_layer(layer)
+        if self._active_op_key in gone:
+            self._active_op_key = None
+            self._plate_mode = "raw"
+            if self._acq_name:
+                self._plate_title.setText(f"{self._acq_name}   ·   raw")
+        self._refresh_layers_tab()
+        if stopped:
+            self._readout.setText(f"stopped {exploration_tab_label(tab.regions)} — tab closed mid-run")
+
+    def _note_partial_output(self):
+        """A save run stopped mid-write leaves a partial `.hcs`. Drop an INCOMPLETE marker in it so
+        a later 'Open a computed MIP…' can refuse it instead of presenting a truncated plate as a
+        finished one (resolve_plate_root only looks for plate.ome.zarr, which a partial still has)."""
+        out = self._run_out_dir
+        self._run_out_dir = None
+        if not out:
+            return
+        try:
+            p = Path(out)
+            if p.exists():
+                (p / "INCOMPLETE").write_text(
+                    "This plate was stopped mid-write and is NOT complete.\n"
+                    "Re-run the operator to produce a full plate.\n")
+        except OSError:
+            pass       # best-effort: never let cleanup bookkeeping break teardown
+
+    def _close_exploration_tabs(self):
+        """Close every exploration tab. Called on ingest: a tab's regions belong to the acquisition
+        it was opened from, and _fov_index is about to be rebuilt for a different plate.
+
+        Muted: each removeTab emits currentChanged, and letting _on_tab_changed re-point the detail
+        at the OUTGOING acquisition mid-teardown is pure waste (ingest rebuilds it all anyway)."""
+        self._tabs_muted = True
+        try:
+            for i in range(self._left_tabs.count() - 1, 0, -1):
+                if isinstance(self._left_tabs.widget(i), _ExplorationTab):
+                    self._close_op_tab(i)
+        finally:
+            self._tabs_muted = False
+
+    def open_exploration_tab(self, regions) -> Optional[str]:
+        """Open (or focus) the exploration tab for ``regions``. Returns its key, or None.
+
+        This is the seam IMA-221 (marquee/shift selection) calls once it lands; until then it is
+        driven programmatically (and by tests). Identity is content-addressed, so calling it twice
+        with the same wells focuses the existing tab rather than opening a duplicate."""
+        if self._reader is None or self._overview is None:
+            self._readout.setText("open an acquisition first")
+            return None
+        regions = list(dict.fromkeys(regions))            # de-dupe, keep first-seen order
+        if not regions:
+            self._readout.setText("empty selection — nothing to explore")
+            return None
+        unknown = [r for r in regions if r not in self._fov_index]
+        if unknown:
+            self._readout.setText(f"{len(unknown)} region(s) are not in this acquisition: {unknown[:3]}")
+            return None
+        key = exploration_tab_key(self._acq_name, regions)
+        self._open_op_tab(key, exploration_tab_label(regions),
+                          lambda: self._build_exploration_tab(regions, key))
+        return key
+
+    def _on_tab_changed(self, index: int):
+        """The plate + detail follow the ACTIVE tab (IMA-205).
+
+        An exploration tab claims to be scoped to its subset, so the plate's status dots and the
+        detail's FOV slider have to agree with it — otherwise the tab says '4 wells' while the
+        viewer beside it lists all 1536, and scrubbing lands on wells the tab never selected.
+
+        Honest limitation: ndviewer's only retarget seam is ``start_acquisition``, which RESETS the
+        viewer. Computed frames pushed via register_array are in-memory and do not survive the
+        switch; we re-register the subset's RAW plane paths (cheap — paths only) so the pane shows
+        real imagery rather than black. Re-run the operator in the tab to recompute its frames."""
+        if self._reader is None or self._overview is None or self._tabs_muted:
+            return
+        if self._busy():
+            return           # never retarget the slider a live run is pushing into
+        w = self._left_tabs.widget(index)
+        prev = getattr(self, "_active_exploration", None)
+        if prev is not None and self._overview is not None:
+            prev.status = self._overview.status_snapshot()      # park the outgoing tab's dots
+        if isinstance(w, _ExplorationTab):
+            self._active_exploration = w
+            self._setup_raw_detail(order=w.regions)
+            self._overview.set_all_status("empty")
+            self._overview.set_status_map(w.status)
+            top = next((ly.key for ly in reversed(self._op_stack.layers())
+                        if ly.key.endswith(f"@{w.tab_key}")), None)
+            self._overview.set_active_layer(top or "raw")
+            # NB: do NOT reset _push_index here — _setup_raw_detail just built the subset map for
+            # this tab's slider, and clearing it would send register_image straight back to global
+            # plate indices (the exact off-by-a-lot this whole path exists to prevent).
+        else:
+            if prev is None:
+                return                   # home -> operator tab: the plate is already plate-wide
+            self._active_exploration = None
+            self._setup_raw_detail(order=None)
+            self._overview.set_all_status("empty")
+            self._overview.set_active_layer(self._active_op_key or "raw")
 
     def _activate_operator(self, key: str):
         """Operator card / menu clicked: open the operator's UI tab. Fully generic — driven by the
@@ -1319,7 +1546,9 @@ class PlateWindow(QMainWindow):
                 dest = state["dir"] or QFileDialog.getExistingDirectory(self, f"Save {op.label} preview to folder")
                 if not dest:
                     return
-            self.run_operator(op.key, out_parent=dest, preview_limit=spin.value(), save=save)
+            # "first N wells" is just one way to build a region list, so the prefix policy lives
+            # here (in the UI that owns the spinner) rather than as a second subset parameter.
+            self.run_operator(op.key, out_parent=dest, regions=self._order[:spin.value()], save=save)
 
         prev.clicked.connect(do_preview)
         v.addWidget(prev)
@@ -1327,6 +1556,65 @@ class PlateWindow(QMainWindow):
         # both run buttons enable once an acquisition is open (the tab is only reachable then, but be safe)
         for b in (run, prev):
             b.setEnabled(self._reader is not None)
+        return w
+
+    def _build_exploration_tab(self, regions: list, tab_key: str) -> QWidget:
+        """The exploration tab body: the selection, an operator menu scoped to it, and the Minerva
+        hook. Operators run in PREVIEW (save=False) by default — exploring a subset should cost
+        compute, not disk. 'Save this subset' persists just these wells."""
+        w = _ExplorationTab(regions, tab_key)
+        w.setStyleSheet(f"background:{_BG};color:#e6edf3;")
+        v = QVBoxLayout(w)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(9)
+        t = QLabel(f"Exploration · {exploration_tab_label(regions)}")
+        t.setStyleSheet("font-size:16px;font-weight:800;")
+        v.addWidget(t)
+        b = QLabel(f"{len(regions)} region(s) selected. Operators here run on this subset only.")
+        b.setWordWrap(True)
+        b.setStyleSheet("color:#8b98ad;font-size:12px;")
+        v.addWidget(b)
+
+        listing = QLabel(", ".join(regions))       # the tab must LIST exactly what it is scoped to
+        listing.setWordWrap(True)
+        listing.setStyleSheet("color:#57606a;font-size:11px;")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        scroll.setWidget(listing)
+        scroll.setMaximumHeight(90)
+        v.addWidget(scroll)
+        w.listing = listing                        # tests assert the tab lists exactly its regions
+
+        v.addWidget(_hline())
+        lab = QLabel("RUN ON THIS SUBSET")
+        lab.setStyleSheet("color:#57606a;font-size:10px;font-weight:800;letter-spacing:1.5px;padding-top:4px;")
+        v.addWidget(lab)
+        for op in _OPERATIONS:
+            btn = QPushButton(f"{op.label} (preview)")
+            btn.setStyleSheet(_BTN_QSS)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(
+                lambda _=False, k=op.key: self.run_operator(k, regions=regions, save=False,
+                                                            tab_key=tab_key))
+            v.addWidget(btn)
+
+        save_btn = QPushButton("Save this subset to disk…")
+        save_btn.setStyleSheet(_BTN_QSS)
+        save_btn.clicked.connect(
+            lambda: self.run_operator(_OPERATIONS[0].key, regions=regions, save=True, tab_key=tab_key))
+        v.addWidget(save_btn)
+
+        v.addWidget(_hline())
+        minerva = QPushButton("Open in Minerva")
+        minerva.setStyleSheet(_BTN_QSS + "QPushButton:disabled{color:#57606a;border-style:dashed;}")
+        minerva.setEnabled(False)     # IMA-228 owns the squid2minerva bridge; this is its mount point
+        minerva.setToolTip("Coming with IMA-228 — exports the selection as OME-TIFF and launches "
+                           "minerva-author")
+        v.addWidget(minerva)
+        w.minerva_btn = minerva
+        v.addStretch(1)
         return w
 
     def _build_layers_tab(self) -> QWidget:
@@ -1493,6 +1781,12 @@ class PlateWindow(QMainWindow):
         # stop any in-flight run/preview and clear prior state before opening a new acquisition
         self._stop_worker()
         self._stop_preview()
+        # Exploration tabs belong to the acquisition they were opened from: their region sets and
+        # layer keys point at a _fov_index that is about to be rebuilt for a different plate.
+        self._close_exploration_tabs()
+        self._active_exploration = None
+        self._push_index = None
+        self._run_tab_key = None
         self._reader = self._meta = None
         self._fov_index = {}
         self._pushed = set()
@@ -1588,22 +1882,28 @@ class PlateWindow(QMainWindow):
         note = (f" · {multi} multi-FOV well(s): sampling 1 FOV/well (stitching TBD)" if multi else "")
         self._readout.setText(f"live · {len(self._fov_index)} wells · double-click to open{note}")
 
-    def _setup_raw_detail(self):
-        """Point the detail viewer at the RAW acquisition: full z-stack, full frame, whole-plate FOV
-        slider. Registers every well's raw plane PATHS up front (cheap — paths only, no image I/O) so
-        scrubbing shows a real (lazily read + cached) image per well instead of black. Shared by open
-        (ingest) and 'Return to raw view'."""
+    def _setup_raw_detail(self, order: Optional[list] = None):
+        """Point the detail viewer at the RAW acquisition: full z-stack, full frame, FOV slider.
+
+        ``order=None`` is the whole plate (open / 'Return to raw view'). An exploration tab passes
+        its own region subset so the slider lists exactly the wells that tab is scoped to.
+        Registers each well's raw plane PATHS up front (cheap — paths only, no image I/O) so
+        scrubbing shows a real (lazily read + cached) image per well instead of black."""
         if self._detail is None or self._reader is None:
             return
-        meta, reader, order = self._meta, self._reader, self._order
+        meta, reader = self._meta, self._reader
+        order = self._order if order is None else list(order)
         h, w = meta["frame_shape"]
         channels = [c["name"] for c in meta["channels"]]
         self._detail.start_acquisition(channels, meta["n_z"], h, w, [f"{r}:0" for r in order])
         self._pushed = set()
+        # the raw slider is 1:1 with `order`, so pushes must map into THAT, not the plate index
+        self._push_index = (None if order == self._order
+                            else {self._fov_index[r]["idx"]: pos for pos, r in enumerate(order)})
         if hasattr(self._detail, "register_images_bulk"):
             entries = []
-            for well in order:
-                w_idx = self._fov_index[well]["idx"]
+            for pos, well in enumerate(order):
+                w_idx = pos            # position IN THIS SLIDER (== plate idx only for a full plate)
                 fov = meta["fovs_per_region"][well][0]
                 for z_i, z in enumerate(meta["z_levels"]):
                     for ch in channels:
@@ -1656,6 +1956,13 @@ class PlateWindow(QMainWindow):
         if not (zroot / "zarr.json").exists():
             self._readout.setText("not an .hcs plate — pick a folder containing plate.ome.zarr")
             return
+        # A run stopped mid-write leaves a real-looking plate.ome.zarr with only some wells in it.
+        # Refuse it by name rather than silently presenting a truncated plate as a finished one.
+        if (base / "INCOMPLETE").exists():
+            self._readout.setText(
+                f"{base.name} was stopped mid-write and is incomplete — re-run the operator "
+                f"(delete the INCOMPLETE marker to open it anyway)")
+            return
         try:
             plate = json.loads((zroot / "zarr.json").read_text())["attributes"]["ome"]["plate"]
             rows = [r["name"] for r in plate["rows"]]
@@ -1682,6 +1989,12 @@ class PlateWindow(QMainWindow):
         self._reader = None                       # a computed plate has no raw reader
         self._meta = {"channels": channels, "z_levels": [0], "n_z": 1, "n_t": 1,
                       "regions": [f"{rows[w['rowIndex']]}{cols[w['columnIndex']]}" for w in wells_meta]}
+        # a computed plate replaces the whole session: drop exploration tabs (their regions belong
+        # to the raw acquisition) and go back to identity push indexing over the full plate.
+        self._close_exploration_tabs()
+        self._active_exploration = None
+        self._push_index = None
+        self._run_tab_key = None
         wells_rc, self._fov_index, self._order, worker_wells = {}, {}, [], []
         for idx, w in enumerate(wells_meta):
             ri, ci = w["rowIndex"], w["columnIndex"]
@@ -1727,23 +2040,53 @@ class PlateWindow(QMainWindow):
         self._worker.start()
 
     # -- run a post-processing operator over the whole plate (persists a navigable OME-Zarr plate) --
-    def run_operator(self, key: str, out_parent: Optional[str] = None,
-                     preview_limit: Optional[int] = None, save: bool = True):
-        """Run a projector operator (MIP / reference) over the plate.
+    def _busy(self) -> bool:
+        """True while ANY operator run is still alive — including one that was STOPPED but is
+        still draining.
 
-        preview_limit=N runs on only the first N wells (a subset) — a cheap way to test an operator.
+        ``_stop_worker`` clears ``self._worker`` immediately, while ``_retire`` keeps the thread
+        running (and referenced in ``self._retired``) until it finishes its in-flight well —
+        destroying a running QThread aborts the app, so it cannot do otherwise. Checking
+        ``self._worker`` alone therefore lets a second run start against the same reader the
+        moment a tab is closed, which is exactly the routine path IMA-205 introduces."""
+        if self._worker is not None and self._worker.isRunning():
+            return True
+        return any(w.isRunning() for w in self._retired)
+
+    def run_operator(self, key: str, out_parent: Optional[str] = None,
+                     regions: Optional[list] = None, save: bool = True,
+                     tab_key: Optional[str] = None):
+        """Run a projector operator (MIP / reference) over the plate, or over a subset of it.
+
+        ``regions=None`` runs the whole plate. A list runs exactly those regions, in that order —
+        this is the ONE way to express a subset (the old ``preview_limit=N`` was a prefix-only
+        special case of it; the preview spinner now passes ``self._order[:n]`` itself).
+
         save=False is PREVIEW: compute + stream results into the plate + ndviewer slider, writing
         NOTHING to disk (no folder, no disk-space cost). save=True persists a navigable OME-Zarr;
-        combined with preview_limit it saves just that subset. Tests pass out_parent to skip the dialog.
+        combined with a subset it saves just those regions. Tests pass out_parent to skip the dialog.
+
+        ``tab_key`` scopes the run to an exploration tab: results are filed under the layer
+        ``<op>@<tab_key>`` so two tabs running the same operator do not overwrite each other.
         """
         if self._reader is None or self._overview is None:
             return
-        if self._worker is not None and self._worker.isRunning():
+        if self._busy():
             self._readout.setText("already processing — let the current run finish first")
             return
         label = _OPERATIONS_BY_KEY[key].label
-        regions = self._order[:preview_limit] if preview_limit is not None else None
-        scope = f"first {len(regions)} wells" if regions is not None else "the whole plate"
+        if regions is not None:
+            regions = list(regions)
+            if not regions:
+                self._readout.setText("empty selection — nothing to run")
+                return
+            unknown = [r for r in regions if r not in self._fov_index]
+            if unknown:      # fail NAMED, not with a bare KeyError out of the status loop below
+                self._readout.setText(
+                    f"{len(unknown)} region(s) are not in this acquisition: {unknown[:3]}")
+                return
+        scope = ("the whole plate" if regions is None
+                 else f"{len(regions)} well" + ("s" if len(regions) != 1 else ""))
         out_dir = est_gb = None
         if save:
             # Ask WHERE to persist: output can be hundreds of GB, so let the user aim it at a roomy
@@ -1753,8 +2096,11 @@ class PlateWindow(QMainWindow):
                 if not out_parent:
                     return
             out_dir = Path(out_parent) / f"{self._acq_name}.hcs"
-            ok, est_gb, msg = self._check_disk(out_dir)   # whole-plate estimate; a subset only uses less
-            if not ok and regions is None:
+            # Estimate the bytes THIS RUN writes: a subset writes len(regions)/n_wells of a plate.
+            # Previously the guard was computed plate-wide and then skipped entirely for subsets
+            # (`if not ok and regions is None`), so a 500-well subset save got no check at all.
+            ok, est_gb, msg = self._check_disk(out_dir, n_regions=None if regions is None else len(regions))
+            if not ok:
                 self._readout.setText(msg)
                 return
         self._stop_preview()                                 # the operator supersedes the raw preview
@@ -1764,18 +2110,31 @@ class PlateWindow(QMainWindow):
         else:
             self._overview.set_all_status("processing")      # amber across the plate
         self._plate_mode = label                             # plate now shows this operator's result
-        self._plate_title.setText(f"{self._acq_name}   ·   {label}")
-        self._active_op_key = key                            # tiles stream into this layer
+        self._plate_title.setText(f"{self._acq_name}   ·   {label}"
+                                 + (f"   ·   {exploration_tab_label(regions)}" if tab_key else ""))
+        layer_key = operator_layer_key(key, tab_key)
+        self._active_op_key = layer_key                      # tiles stream into this layer
         if getattr(self, "_raw_btn", None):
             self._raw_btn.show()                             # now there's a processed view to return from
-        self._op_stack.add(key, label)                       # push the operator layer onto the stack
-        self._overview.set_active_layer(key)                 # show it
+        stack_label = label if not tab_key else f"{label} · {exploration_tab_label(regions)}"
+        self._op_stack.add(layer_key, stack_label)           # push the operator layer onto the stack
+        self._overview.set_active_layer(layer_key)           # show it
         self._refresh_layers_tab()
         # switch the detail to processed mode: z collapsed (nz=1 -> ndv drops the z-slider), frames at
-        # the push size, same well order. Each computed well is pushed into the growing slider below.
+        # the push size. The slider lists THIS RUN's regions — for a subset that is the subset, not the
+        # whole plate (it used to always be self._order, so a subset preview built a 1536-entry slider
+        # of which 4 were ever filled).
+        run_order = self._order if regions is None else regions
+        # _OperatorWorker emits the GLOBAL plate index (fov_index[region]["idx"]) with every push.
+        # The slider we just built is indexed 0..len(run_order)-1, so translate on the way in —
+        # without this every push on a subset run lands at the wrong slot or out of range.
+        self._push_index = (None if regions is None
+                            else {self._fov_index[r]["idx"]: pos for pos, r in enumerate(run_order)})
         if self._detail is not None:
             self._detail.start_acquisition([c["name"] for c in self._meta["channels"]], 1,
-                                           _PUSH_PX, _PUSH_PX, [f"{r}:0" for r in self._order])
+                                           _PUSH_PX, _PUSH_PX, [f"{r}:0" for r in run_order])
+        self._run_out_dir = str(out_dir) if (save and out_dir) else None   # for partial-output cleanup
+        self._run_tab_key = tab_key
         self._worker = _OperatorWorker(key, self._reader, self._meta, self._fov_index,
                                        self._overview._nr, self._overview._nc,
                                        str(out_dir) if out_dir else "", regions=regions, save=save)
@@ -1791,10 +2150,13 @@ class PlateWindow(QMainWindow):
         self._worker.failed.connect(self._on_failed)
         self._worker.finished_ok.connect(lambda: self._readout.setText(
             f"✓ {label} · {scope}{dest}" + ("  (re-openable OME-Zarr)" if save else "")))
+        # a run that FINISHED wrote a complete plate — forget the path so a later stop can never
+        # retroactively flag it incomplete
+        self._worker.finished_ok.connect(lambda: setattr(self, "_run_out_dir", None))
         self._readout.setText(f"● {label} · {scope}{dest} …")
         self._worker.start()
 
-    def _check_disk(self, out_dir) -> tuple[bool, float, str]:
+    def _check_disk(self, out_dir, n_regions: Optional[int] = None) -> tuple[bool, float, str]:
         """Estimate the persisted plate size and refuse if it won't fit (with headroom). Returns
         (ok, estimate_GB, message). Estimate = per-well projection (T·C·Y·X·itemsize) × 1.34 (the exact
         4/3 geometric sum of the 2× pyramid tail), UNCOMPRESSED. The projection collapses Z only, so
@@ -1806,7 +2168,10 @@ class PlateWindow(QMainWindow):
         import shutil
         m = self._meta
         ny, nx = m["frame_shape"]
-        est = int(len(self._fov_index) * m.get("n_t", 1) * len(m["channels"]) * ny * nx
+        # n_regions=None means the whole plate. A subset writes only its own wells, so scale by the
+        # count — the guard must still RUN for subsets (a 500-well subset is not a rounding error).
+        n_wells = len(self._fov_index) if n_regions is None else max(0, n_regions)
+        est = int(n_wells * m.get("n_t", 1) * len(m["channels"]) * ny * nx
                   * np.dtype(m["dtype"]).itemsize * 1.34)
         gb = 1024 ** 3
         try:
@@ -1814,7 +2179,8 @@ class PlateWindow(QMainWindow):
         except OSError:
             return True, est / gb, ""      # can't stat the disk — don't block
         if est > free * 0.9:
-            return False, est / gb, (f"MIP would persist ~{est/gb:.0f} GB to {Path(out_dir).parent} "
+            what = "MIP" if n_regions is None else f"this {n_wells}-well run"
+            return False, est / gb, (f"{what} would persist ~{est/gb:.0f} GB to {Path(out_dir).parent} "
                                      f"but only {free/gb:.0f} GB free — free space or pick another disk.")
         return True, est / gb, ""
 
@@ -1834,13 +2200,22 @@ class PlateWindow(QMainWindow):
 
     def _on_push(self, fov_idx, planes):
         """A computed well's ~512px channels -> the ndviewer growing slider (in-memory register_array,
-        LRU bounded). z collapsed (nz=1). No-op if the detail has no register_array (older ndv / stub)."""
+        LRU bounded). z collapsed (nz=1). No-op if the detail has no register_array (older ndv / stub).
+
+        ``fov_idx`` is the GLOBAL plate index. The slider is built from the CURRENT RUN's regions,
+        so for a subset run it is only len(regions) long and the global index has to be translated
+        (``_push_index``). Dropping an untranslatable push is deliberate: a push whose position we
+        cannot resolve belongs to a run whose slider is gone, and guessing would paint one well's
+        image onto another well's slot — silently, since register_array errors are swallowed below."""
         if self._detail is None or not hasattr(self._detail, "register_array"):
+            return
+        pos = fov_idx if self._push_index is None else self._push_index.get(fov_idx)
+        if pos is None:
             return
         channels = [c["name"] for c in self._meta["channels"]]
         for c_i, plane in enumerate(planes):
             try:
-                self._detail.register_array(0, fov_idx, 0, channels[c_i], plane)
+                self._detail.register_array(0, pos, 0, channels[c_i], plane)
             except Exception:
                 pass   # one bad push must not break the run
 
@@ -1866,6 +2241,19 @@ class PlateWindow(QMainWindow):
         base = f"{self._acq_name or 'well plate'}   ·   {self._plate_mode}"
         self._plate_title.setText(f"{base}   ·   {text}" if text else base)
 
+    def _slider_pos(self, well_id: str) -> Optional[int]:
+        """Where ``well_id`` sits in the detail's CURRENT FOV slider, or None if it isn't in it.
+
+        The slider is whole-plate by default (position == plate index) but an exploration tab
+        scopes it to a subset, where the two diverge. Everything that hands ndviewer an index —
+        register_image, register_array, go-to — has to translate through here."""
+        info = self._fov_index.get(well_id)
+        if info is None:
+            return None
+        if self._push_index is None:
+            return info["idx"]
+        return self._push_index.get(info["idx"])
+
     def activate_well(self, well_id: str, fov_index: int):
         """Double-click -> show the well in the ndviewer. In RAW mode (no operator run yet) push the
         well's raw z-stack lazily (the true z-stack, zero bytes copied). In PROCESSED mode (an operator
@@ -1875,7 +2263,9 @@ class PlateWindow(QMainWindow):
         self._current_well = well_id
         if self._overview is not None:                 # current well at view = the red BOX
             self._overview.select(*self._fov_index[well_id]["rc"])
-        idx = self._fov_index[well_id]["idx"]
+        idx = self._slider_pos(well_id)
+        if idx is None:
+            return       # not in the slider the detail is currently showing (e.g. a subset tab)
         if self._active_op_key is not None or self._reader is None:   # processed/computed: already pushed
             try:
                 row, col = parse_well_id(well_id)

@@ -27,6 +27,24 @@ class OperationStack:
         self._layers = [ly for ly in self._layers if ly.key != key]
         self._layers.append(Layer(key, label, True))
 
+    def remove(self, key: str) -> bool:
+        """Drop an operation layer. Returns True if it was there. The base ('raw') is never
+        removable — closing an exploration tab drops that tab's layers, and the plate must
+        always keep a base to fall back to."""
+        if key == "raw":
+            return False
+        before = len(self._layers)
+        self._layers = [ly for ly in self._layers if ly.key != key]
+        return len(self._layers) != before
+
+    def remove_suffix(self, suffix: str) -> list[str]:
+        """Drop every layer whose key ends with ``suffix`` (an exploration tab owns the layers
+        keyed ``<op>@<tab_key>``, one per operator it ran). Returns the removed keys."""
+        gone = [ly.key for ly in self._layers if ly.key != "raw" and ly.key.endswith(suffix)]
+        if gone:
+            self._layers = [ly for ly in self._layers if ly.key not in gone]
+        return gone
+
     def toggle(self, key: str, enabled: bool) -> None:
         for ly in self._layers:
             if ly.key == key:
