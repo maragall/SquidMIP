@@ -3,6 +3,22 @@
 Deferred work captured during plan-eng-reviews. Each item records the reasoning
 so a future session doesn't rediscover it from zero.
 
+## docs/*.html are hand-maintained with no generator → future ticket
+- **What:** `docs/architecture.html` and `docs/plate-view.html` are checked-in HTML artifacts. Grepping the repo for either filename finds no script that produces them, so they are edited by hand and drift silently from the code they describe.
+- **Why:** IMA-213 had to hand-edit both to complete the rename. Any future structural change has the same tax, and nothing fails when they go stale.
+- **Pros:** Either generating them from source or deleting them removes a class of silent documentation drift.
+- **Cons:** Writing a generator for two pages may cost more than it saves; deleting them loses artifacts someone may be linking to.
+- **Context:** Surfaced by /plan-eng-review on IMA-213 (2026-07-20) while inventorying the 216 `squidmip` occurrences. The IMA-213 rename guard test will keep them free of the *old name*, but nothing keeps them accurate about anything else.
+- **Depends on / blocked by:** Nothing. Decide generate-vs-delete first.
+
+## GitHub redirect is fragile — never recreate maragall/SquidMIP → standing constraint
+- **What:** After IMA-213 renames the repo to `SquidHCS`, GitHub serves a permanent redirect from the old URL. That redirect dies the instant anyone creates a new repository named `maragall/SquidMIP`.
+- **Why:** The rename's whole no-breakage argument for downstream users rests on that redirect. Nick's existing clone, his `git pull`, and any `pip install git+https://github.com/maragall/SquidMIP` all ride on it.
+- **Pros:** Recording it means the constraint outlives the memory of whoever ran the rename.
+- **Cons:** No mechanism can enforce it; it is documentation only.
+- **Context:** Confirmed during the IMA-213 eng review (2026-07-20) by the outside voice, which also verified the repo has no forks and no GitHub Pages, so there are no other redirect edge cases.
+- **Depends on / blocked by:** IMA-213 landing.
+
 ## Scale-test fixture generator → IMA-188
 - **What:** A generator that fans the 48 real hongquan FOVs across a 1536-well plate via **symlinks** (Squid layout), synthesizing 20 z (cycling the real 3) × 4 channels. On-disk ≈ source (~19 GB); logical read ≈ 1536×20×4×33 MB ≈ **4 TB** (served from OS cache — proves scale/parse/decode/memory, NOT raw disk bandwidth; that needs Nick's real storage).
 - **Why:** It's the harness for the IMA-188 high-throughput scale test, not ingest. Building it in 189 bloats the keystone and risks CI breakage.
