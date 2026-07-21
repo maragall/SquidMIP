@@ -1,9 +1,15 @@
 """SquidMIP reader: format-aware ingest for Squid individual-TIFF acquisitions.
 
-``open_reader(path)`` dispatches on the on-disk format and returns a reader. Only the
-individual-TIFFs layout is implemented (IMA-189); the other Squid output formats
-(multi-page TIFF, OME-TIFF, Zarr) are detected and rejected with a clear message, marking
-the seam where future readers plug in.
+``open_reader(path)`` dispatches on the on-disk format and returns a reader. Three formats are
+served, all behind ONE interface — ``metadata`` (identical key set, micrometres, ``_um``-suffixed)
+plus ``read(region, fov, channel, z, t)`` returning a 2-D native-dtype plane:
+
+    individual TIFFs   :class:`SquidReader`      (IMA-189)   ``<acq>/{t}/{region}_{fov}_{z}_{ch}.tiff``
+    OME-TIFF           :class:`SquidOMEReader`               ``<acq>/ome_tiff/{region}_{fov}.ome.tiff``
+    OME-NGFF Zarr      :class:`SquidZarrReader`  (IMA-229)   ``<acq>/plate.ome.zarr/…`` or ``<acq>/zarr/…``
+
+The interface IS the seam: engine, CLI and viewer consume any of them with no ``isinstance``
+check and no parallel API. Multi-page TIFF remains unimplemented.
 
 Individual-TIFFs layout (one channel per file), verified against real data::
 
@@ -55,6 +61,7 @@ here, at the producer, and the metadata key is ``fov_positions_um``.
 
 from __future__ import annotations
 
+import json
 import re
 import warnings
 from pathlib import Path
@@ -64,7 +71,7 @@ import numpy as np
 import tifffile
 
 from squidmip._acquisition import load_acquisition_metadata
-from squidmip._channels import load_channel_yaml, resolve_channels
+from squidmip._channels import fallback_color, load_channel_yaml, resolve_channels
 
 # region has no underscore; fov and z are ints; channel is the remainder (may contain _ and -).
 _STEM_RE = re.compile(r"^(?P<region>[^_]+)_(?P<fov>\d+)_(?P<z>\d+)_(?P<channel>.+)$")
@@ -362,11 +369,34 @@ def open_reader(path) -> "SquidReader":
     # shadow the individual-TIFF reader.
     if ome.is_dir() and any(ome.rglob("*.ome.tif*")):
         return SquidOMEReader(path)
-    if (path / "zarr.json").exists() or any(path.glob("*.zarr")):
-        raise NotImplementedError(
-            "Zarr layout detected. Not implemented in IMA-189; format-dispatch seam."
-        )
+    store = _find_zarr_store(path)
+    if store is not None:
+        return SquidZarrReader(store, acquisition_root=path)
     return SquidReader(path)
+
+
+def _find_zarr_store(path: Path):
+    """The Zarr root to read at/under *path*, or ``None`` if this is not a Zarr acquisition.
+
+    Recognised (IMA-229), in priority order:
+
+    * *path* IS a zarr group — an ``…​.ome.zarr`` plate or image group handed in directly;
+    * ``<path>/plate.ome.zarr`` — Squid's (and SquidMIP's own writer's) canonical HCS output;
+    * ``<path>/*.zarr`` — any other single ``.zarr`` sibling, e.g. a renamed plate;
+    * ``<path>/zarr/`` — the non-HCS layout, one image group per ``{region_id}``.
+    """
+    if _is_zarr_group(path):
+        return path
+    plate = path / "plate.ome.zarr"
+    if _is_zarr_group(plate):
+        return plate
+    for candidate in sorted(path.glob("*.zarr")):
+        if _is_zarr_group(candidate):
+            return candidate
+    bare = path / "zarr"
+    if bare.is_dir() and any(_is_zarr_group(d) for d in bare.iterdir() if d.is_dir()):
+        return bare
+    return None
 
 
 class SquidReader:
@@ -663,3 +693,449 @@ def _ome_channel_names(tif) -> list:
     except Exception:
         return []
 
+
+# ==================================================================================================
+# IMA-229: Zarr input (OME-NGFF)
+# ==================================================================================================
+#
+# PRIOR ART, and what was adopted. The layout below is not invented; it is read straight from the
+# OME-NGFF specification sources (github.com/ome/ngff-spec, branches 0.4 and 0.5 — index.bs, the
+# JSON schemas and the published examples) and cross-checked against what SquidMIP's OWN writer
+# (``squidmip/_output.py``, already validated against the official ``ome-zarr-models`` pydantic
+# schema in ``tests/ngff_check.py``) emits. Anything a real NGFF reader (ome-zarr-py, ngio, napari)
+# cannot open would be a bug here.
+#
+#   HCS plate      ``plate.ome.zarr/{row}/{col}/{fov}/{level}``
+#     plate group   ``plate`` -> ``rows``/``columns``/``wells``; each well entry has ``path``
+#                   ("A/1" — the row NAME then the column NAME, regex ^[A-Za-z0-9]+/[A-Za-z0-9]+$),
+#                   ``rowIndex``, ``columnIndex``. The region id is the concatenation ``row+col``
+#                   ("B" + "2" = "B2"), the exact inverse of ``_output.parse_well_id``.
+#     well group    ``well`` -> ``images``: a list of ``{"path": ...}``. The spec allows ANY
+#                   alphanumeric field path, so the listed paths are used verbatim rather than
+#                   assuming 0..n-1 — Squid writes the raw (possibly non-contiguous) FOV id there.
+#     image group   ``multiscales`` (+ optional ``omero``) — see below.
+#
+#   non-HCS        ``zarr/{region_id}/{level}`` — a bare image group per region, no plate node.
+#                  Each region gets the single FOV 0; there is no well/field level to read.
+#
+#   multiscales    ``axes`` (2-5 entries, ordered time, then channel, then space z,y,x) and
+#                  ``datasets`` (ordered highest -> lowest resolution; each has ``path`` and
+#                  ``coordinateTransformations`` = exactly one ``scale``, optionally followed by
+#                  one ``translation``). Level 0 (``datasets[0]``) is the full-resolution array and
+#                  is the only one this reader serves — a MIP must never be computed from a
+#                  downsampled level. Array SHAPES come from the arrays, never from a scale factor:
+#                  the writer's 2x2 block-mean crops odd axes, so level shapes are floor(prev/2).
+#
+#   VERSIONS       v0.4 is zarr v2 — group metadata is a ``.zattrs`` file with ``plate`` / ``well``
+#                  / ``multiscales`` at the TOP level. v0.5 is zarr v3 — a single ``zarr.json`` with
+#                  the same payload namespaced under ``attributes.ome``. Both are read; refusing
+#                  either would lock out half the real stores. ``_group_attrs`` is the one place
+#                  that difference lives.
+#
+#   POSITIONS      The dataset-level ``translation`` (applied AFTER ``scale``, so it is already in
+#                  physical units) is the ONLY position mechanism the spec defines — there is no
+#                  well-level or plate-level stage metadata in either version. SquidMIP's writer
+#                  emits no translation, so a sibling ``coordinates.csv`` is the documented
+#                  fallback, and either way the result lands in ``fov_positions_um``.
+#
+#   UNITS          ``axes[].unit`` is a UDUNITS-2 string and is only a SHOULD, so it can be absent.
+#                  Every physical value taken out of a store (pixel size, dz, translation) is
+#                  converted to MICROMETRES HERE, at this single producer, by the axis's own unit —
+#                  a store written in millimetres must not reach a ``_um`` key as millimetres. That
+#                  is the same failure that was fixed on main; there is exactly one conversion and
+#                  no consumer compensates for it.
+
+_ZARR_V3_META = "zarr.json"
+_ZARR_V2_GROUP = ".zgroup"
+_ZARR_V2_ATTRS = ".zattrs"
+_ZARR_V2_ARRAY = ".zarray"
+
+# UDUNITS-2 length units -> micrometres. Absent/unknown units are treated as micrometres (the
+# de-facto microscopy default) rather than guessed at, and never silently rescaled.
+_UNIT_TO_UM = {
+    "angstrom": 1e-4, "nanometer": 1e-3, "micrometer": 1.0, "micron": 1.0,
+    "millimeter": 1e3, "centimeter": 1e4, "meter": 1e6,
+}
+
+
+def _is_zarr_group(path: Path) -> bool:
+    """True if *path* is a zarr GROUP node — v3 (``zarr.json``) or v2 (``.zgroup``)."""
+    path = Path(path)
+    if not path.is_dir():
+        return False
+    if (path / _ZARR_V2_GROUP).exists():
+        return True
+    meta = path / _ZARR_V3_META
+    if not meta.exists():
+        return False
+    try:
+        return json.loads(meta.read_text()).get("node_type") == "group"
+    except (ValueError, OSError):
+        return False
+
+
+def _group_attrs(path: Path) -> dict:
+    """The OME metadata payload of a zarr group, normalising the v0.4 / v0.5 difference.
+
+    v0.5 (zarr v3) nests it as ``zarr.json -> attributes -> ome``; v0.4 (zarr v2) puts the same
+    keys at the top level of ``.zattrs``. Callers then read ``plate`` / ``well`` / ``multiscales``
+    without caring which version wrote the store. A v3 group whose attributes carry no ``ome``
+    namespace (e.g. a bioformats2raw-style store) falls back to the raw attributes.
+    """
+    path = Path(path)
+    v2 = path / _ZARR_V2_ATTRS
+    if v2.exists():
+        return json.loads(v2.read_text() or "{}")
+    v3 = path / _ZARR_V3_META
+    if v3.exists():
+        attrs = json.loads(v3.read_text() or "{}").get("attributes") or {}
+        ome = attrs.get("ome")
+        return ome if isinstance(ome, dict) else attrs
+    return {}
+
+
+def _open_zarr_array(path: Path):
+    """Open one zarr array (v2 or v3) as a lazy tensorstore handle — no data is read here."""
+    import tensorstore as ts
+
+    path = Path(path)
+    driver = "zarr" if (path / _ZARR_V2_ARRAY).exists() else "zarr3"
+    return ts.open(
+        {"driver": driver, "kvstore": {"driver": "file", "path": str(path)}}, open=True
+    ).result()
+
+
+def _unit_to_um(unit) -> float:
+    """Scale factor from an axis's declared unit to micrometres (1.0 when unit is absent)."""
+    if not unit:
+        return 1.0
+    factor = _UNIT_TO_UM.get(str(unit).strip().lower().rstrip("s"))
+    if factor is None:
+        warnings.warn(
+            f"OME-NGFF space axis unit {unit!r} is not a length this reader converts; treating "
+            "the value as micrometres. Physical placement may be wrong — check the store."
+        )
+        return 1.0
+    return factor
+
+
+class _Multiscale:
+    """The parsed ``multiscales[0]`` of one image group: axis order, level-0 path, scale, offset.
+
+    Everything physical it exposes is already in MICROMETRES (see the UNITS note above).
+    """
+
+    def __init__(self, group: Path) -> None:
+        attrs = _group_attrs(group)
+        multiscales = attrs.get("multiscales") or []
+        if not multiscales:
+            raise ValueError(
+                f"{group!s} is not an OME-NGFF image group: no 'multiscales' metadata. "
+                "Expected a field/image group written by Squid or any NGFF writer."
+            )
+        ms = multiscales[0]
+        self.group = group
+        self.omero = attrs.get("omero") or {}
+        axes = ms.get("axes") or []
+        # Axis NAMES are the dimension order; the spec fixes the ORDER (t, c, then z, y, x) but
+        # not which axes are present, so a 2-D or 4-D store is legal and must still map cleanly.
+        self.axis_names = [str(a.get("name", "")).lower() for a in axes]
+        self.units = {n: a.get("unit") for n, a in zip(self.axis_names, axes)}
+
+        datasets = ms.get("datasets") or []
+        if not datasets:
+            raise ValueError(f"{group!s}: multiscales has no 'datasets' (no resolution levels).")
+        level0 = datasets[0]        # datasets are ordered highest -> lowest resolution
+        self.array_path = group / str(level0["path"])
+
+        transforms = level0.get("coordinateTransformations") or []
+        scale = next((t.get("scale") for t in transforms if t.get("type") == "scale"), None)
+        translation = next(
+            (t.get("translation") for t in transforms if t.get("type") == "translation"), None
+        )
+        self._scale = list(scale) if scale else [1.0] * len(self.axis_names)
+        self._translation = list(translation) if translation else None
+
+    def _axis(self, name: str) -> Optional[int]:
+        return self.axis_names.index(name) if name in self.axis_names else None
+
+    def _physical(self, values, name: str) -> Optional[float]:
+        i = self._axis(name)
+        if i is None or values is None or i >= len(values):
+            return None
+        return float(values[i]) * _unit_to_um(self.units.get(name))
+
+    @property
+    def pixel_size_um(self) -> Optional[float]:
+        return self._physical(self._scale, "x")
+
+    @property
+    def dz_um(self) -> Optional[float]:
+        return self._physical(self._scale, "z")
+
+    @property
+    def position_um(self) -> Optional[tuple]:
+        """``(x_um, y_um)`` from the dataset ``translation``, or ``None`` when it carries none."""
+        if self._translation is None:
+            return None
+        x, y = self._physical(self._translation, "x"), self._physical(self._translation, "y")
+        return None if x is None or y is None else (x, y)
+
+    def index(self, shape, t: int, c: int, z: int) -> tuple:
+        """The tensorstore index tuple selecting the single ``(y, x)`` plane at (t, c, z)."""
+        picks = {"t": t, "c": c, "z": z}
+        return tuple(
+            slice(None) if n in ("y", "x") else picks.get(n, 0)
+            for n in self.axis_names[: len(shape)]
+        )
+
+    def size(self, shape, name: str, default: int = 1) -> int:
+        i = self._axis(name)
+        return int(shape[i]) if i is not None and i < len(shape) else default
+
+
+class SquidZarrReader:
+    """Lazy reader over an OME-NGFF Zarr acquisition — HCS plate or bare per-region image groups.
+
+    Presents the SAME interface as :class:`SquidReader` and :class:`SquidOMEReader`: the identical
+    ``metadata`` key set with the identical meanings (micrometres, ``_um``-suffixed), and
+    ``read(region, fov, channel, z, t)`` returning one 2-D native-dtype plane. The reader interface
+    IS the seam — the engine, CLI and viewer take a Zarr acquisition with no change and no
+    ``isinstance`` check. See the module-level IMA-229 block for the layout and its spec citations.
+
+    Only resolution level 0 is served. The pyramid exists for navigation; a projection computed
+    from a downsampled level would be silently wrong, so the coarse levels are never read.
+    """
+
+    def __init__(self, path, acquisition_root=None) -> None:
+        self._path = Path(path)
+        # Sidecars (acquisition.yaml, coordinates.csv) live beside the store, not inside it:
+        # ``<acq>/plate.ome.zarr`` and ``<acq>/zarr/`` are both children of the acquisition folder.
+        self._root = Path(acquisition_root) if acquisition_root is not None else self._path.parent
+        self._fields: Optional[dict] = None      # {(region, fov): Path to the image group}
+        self._ms: dict = {}                      # image group Path -> _Multiscale (cached)
+        self._arrays: dict = {}                  # image group Path -> open tensorstore (cached)
+        self._meta: Optional[dict] = None
+
+    # -- discovery ---------------------------------------------------------
+    def _discover(self) -> dict:
+        if self._fields is not None:
+            return self._fields
+        attrs = _group_attrs(self._path)
+        fields = (
+            self._discover_hcs(attrs["plate"]) if isinstance(attrs.get("plate"), dict)
+            else self._discover_flat()
+        )
+        if not fields:
+            raise ValueError(
+                f"{self._path!s} contains no readable OME-NGFF images: the plate lists no wells "
+                "and no per-region image groups were found."
+            )
+        self._fields = fields
+        return fields
+
+    def _discover_hcs(self, plate: dict) -> dict:
+        """``plate.wells[].path`` -> well group -> ``well.images[].path`` -> field image groups."""
+        fields: dict = {}
+        for well in plate.get("wells") or []:
+            rel = str(well.get("path", "")).strip("/")
+            if not rel:
+                continue
+            # The region id is the row NAME + column NAME, the inverse of _output.parse_well_id
+            # (which writes B2 -> B/2, never B/02, so concatenation restores the true well id).
+            region = "".join(rel.split("/"))
+            well_dir = self._path / rel
+            images = (_group_attrs(well_dir).get("well") or {}).get("images") or []
+            for i, image in enumerate(images):
+                name = str(image.get("path", ""))
+                if not name:
+                    continue
+                # Field paths are arbitrary alphanumerics per spec; Squid writes the raw FOV id.
+                # A non-numeric path still needs an int FOV for the shared interface, so it falls
+                # back to its position in the list.
+                fields[(region, int(name) if name.isdigit() else i)] = well_dir / name
+        return fields
+
+    def _discover_flat(self) -> dict:
+        """Non-HCS: every child group of ``zarr/`` is one region's single image (FOV 0)."""
+        fields: dict = {}
+        for child in sorted(self._path.iterdir()):
+            if child.is_dir() and _is_zarr_group(child) and "multiscales" in _group_attrs(child):
+                fields[(child.name, 0)] = child
+        # A store that IS a single image group (handed in directly) is that one region.
+        if not fields and "multiscales" in _group_attrs(self._path):
+            fields[(self._path.name.replace(".ome.zarr", "").replace(".zarr", ""), 0)] = self._path
+        return fields
+
+    def _multiscale(self, group: Path) -> _Multiscale:
+        ms = self._ms.get(group)
+        if ms is None:
+            ms = self._ms[group] = _Multiscale(group)
+        return ms
+
+    def _array(self, group: Path):
+        arr = self._arrays.get(group)
+        if arr is None:
+            arr = self._arrays[group] = _open_zarr_array(self._multiscale(group).array_path)
+        return arr
+
+    # -- metadata ----------------------------------------------------------
+    @property
+    def metadata(self) -> dict:
+        if self._meta is not None:
+            return self._meta
+        fields = self._discover()
+
+        fovs: dict[str, set] = {}
+        for (region, fov) in fields:
+            fovs.setdefault(region, set()).add(fov)
+        regions = sorted(fovs, key=_plate_key)
+        fovs_per_region = {r: sorted(fovs[r]) for r in regions}
+
+        sample_group = fields[(regions[0], fovs_per_region[regions[0]][0])]
+        ms = self._multiscale(sample_group)
+        arr = self._array(sample_group)
+        shape, dtype = arr.shape, np.dtype(arr.dtype.numpy_dtype)
+        if dtype not in _SUPPORTED_DTYPES:
+            raise ValueError(
+                f"{ms.array_path!s} has dtype {dtype}; Squid writes uint8 (MONO8) or uint16 "
+                "(MONO12/MONO16). An unexpected dtype usually means the store is not a raw Squid "
+                "capture; refused rather than silently projected."
+            )
+        n_z = ms.size(shape, "z")
+        n_t = ms.size(shape, "t")
+
+        self._meta = {
+            "regions": regions,
+            "fovs_per_region": fovs_per_region,
+            "fov_positions_um": self._positions_um(fields, fovs_per_region),
+            "channels": self._channels(ms, ms.size(shape, "c")),
+            "n_z": n_z,
+            "z_levels": list(range(n_z)),
+            "dz_um": ms.dz_um,
+            "pixel_size_um": ms.pixel_size_um,
+            "wellplate_format": self._wellplate_format(regions),
+            "frame_shape": (ms.size(shape, "y", shape[-2]), ms.size(shape, "x", shape[-1])),
+            "dtype": dtype,
+            "n_t": n_t,
+        }
+        return self._meta
+
+    def _positions_um(self, fields: dict, fovs_per_region: dict) -> dict:
+        """Stage positions in MICROMETRES: dataset ``translation`` first, coordinates.csv second.
+
+        The NGFF spec defines no other position mechanism, and SquidMIP's own writer emits no
+        translation — so a store round-tripped through this package legitimately has none, and the
+        sibling ``coordinates.csv`` (both schemas, IMA-215) is the documented fallback. When
+        neither exists the value is ``{}``: present but empty, exactly as on the TIFF readers, so
+        consumers degrade to single-tile rendering instead of hitting a KeyError.
+        """
+        from_store = {}
+        for key, group in fields.items():
+            position = self._multiscale(group).position_um
+            if position is not None:
+                from_store[key] = position
+        if from_store:
+            return from_store
+        return _fov_positions_um_or_empty(self._root, fovs_per_region)
+
+    def _channels(self, ms: _Multiscale, n_c: int) -> list:
+        """Channel list from ``omero.channels`` (labels + colours), the NGFF rendering metadata.
+
+        Falls back to a sibling ``acquisition_channels.yaml``, then to generic ``C{i}`` labels with
+        the shared wavelength/brightfield colour resolution. A store with neither is still opened —
+        a legal NGFF image need not carry ``omero`` — but the colours are then a best effort, so the
+        loss is announced rather than passed off as acquisition truth.
+        """
+        yaml_map = load_channel_yaml(self._root)
+        omero_channels = (ms.omero.get("channels") or [])[:n_c]
+        if len(omero_channels) == n_c and n_c:
+            out = []
+            for entry in omero_channels:
+                label = str(entry.get("label") or "")
+                name = _normalize_local(label) if label else ""
+                colour = str(entry.get("color") or "").strip()
+                info = yaml_map.get(name)
+                out.append({
+                    "name": name,
+                    "display_name": (info["display_name"] if info else None) or label or name,
+                    "display_color": ("#" + colour.lstrip("#")) if colour
+                                     else (info["display_color"] if info else None)
+                                     or fallback_color(name) or "#FFFFFF",
+                    "ex": info["ex"] if info else None,
+                })
+            return out
+        names = list(yaml_map.keys())
+        if len(names) != n_c:
+            warnings.warn(
+                f"Zarr store declares C={n_c} but carries no usable omero channel metadata and no "
+                "matching acquisition_channels.yaml; falling back to generic channel labels."
+            )
+            names = [f"C{i}" for i in range(n_c)]
+        try:
+            return resolve_channels(names, yaml_map)
+        except ValueError:
+            return [{"name": n, "display_name": n, "display_color": "#FFFFFF", "ex": None}
+                    for n in names]
+
+    def _wellplate_format(self, regions: list):
+        """Declared (sibling acquisition.yaml) beats inferred — the IMA-219 D1 precedence."""
+        try:
+            declared = load_acquisition_metadata(self._root)["wellplate_format"]
+        except (FileNotFoundError, ValueError):
+            declared = None                     # a Zarr store need not ship acquisition.yaml
+        if declared:
+            return declared
+        from squidmip._plate_shape import infer_plate_format
+
+        try:
+            return infer_plate_format(regions)
+        except Exception:
+            return None
+
+    # -- read --------------------------------------------------------------
+    def _field(self, region, fov) -> Path:
+        fields = self._discover()
+        key = (str(region), int(fov))
+        if key not in fields:
+            raise KeyError(
+                f"No such well/FOV region={region!r} fov={fov}. "
+                f"Known regions={sorted({k[0] for k in fields})}."
+            )
+        return fields[key]
+
+    def _channel_index(self, channel) -> int:
+        names = [c["name"] for c in self.metadata["channels"]]
+        if str(channel) not in names:
+            raise KeyError(f"No such channel {channel!r}. Known channels={names}.")
+        return names.index(str(channel))
+
+    def read(self, region, fov, channel, z, t=0):
+        """Return one plane as a 2D array in its native dtype.
+
+        Lazy in the sense that matters for a plate-scale store: tensorstore reads only the chunks
+        covering this ``(t, c, z)`` plane, never the whole ``(T, C, Z, Y, X)`` field.
+        """
+        group = self._field(region, fov)
+        meta = self.metadata
+        z, t = int(z), int(t)
+        if not 0 <= z < meta["n_z"]:
+            raise IndexError(f"z={z} out of range (n_z={meta['n_z']}).")
+        if not 0 <= t < meta["n_t"]:
+            raise IndexError(f"t={t} out of range (n_t={meta['n_t']}).")
+        arr = self._array(group)
+        idx = self._multiscale(group).index(arr.shape, t, self._channel_index(channel), z)
+        plane = np.asarray(arr[idx].read().result())
+        return _validate_plane(plane, self._multiscale(group).array_path)
+
+    def plane_ref(self, region, fov, channel, z, t=0) -> tuple:
+        """``(path, 0)`` for one plane, where *path* is the field's NGFF **image group**.
+
+        The TIFF readers return a file plus an IFD page because a TIFF plane is addressable that
+        way. A Zarr plane is not a file — it is a slice spread over chunk files — so the honest
+        referent is the image group itself: a valid NGFF node that ndviewer and every ome-zarr
+        reader can open directly, with no bytes copied. The page index is 0 to keep the tuple
+        shape identical for callers.
+        """
+        self._channel_index(channel)            # validate like the TIFF readers do
+        return str(self._field(region, fov)), 0
