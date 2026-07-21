@@ -145,6 +145,31 @@ def test_fit_cell_always_returns_cell_shape():
     assert V._fit_cell(np.zeros((40, 40), np.float32)).shape == (V._CELL, V._CELL)  # tiny frame upscaled
 
 
+def test_running_contrast_latch_holds_against_new_wells():
+    # IMA-206 D4: the running histogram must not stomp a window the user set. Channel 0 is latched
+    # manual, channel 1 is left on auto; a new well then moves channel 1 and leaves channel 0 alone.
+    rc = V._RunningContrast(2, 1000.0)
+    for ch in (0, 1):
+        rc.add(ch, np.full((8, 8), 100.0))
+    rc.set_manual(0, 10.0, 20.0)
+    assert rc.is_manual(0) and not rc.is_manual(1)
+    before = rc.window(1)
+    for ch in (0, 1):
+        rc.add(ch, np.full((8, 8), 900.0))     # a much brighter well lands
+    assert rc.window(0) == (10.0, 20.0)        # latched: untouched
+    assert rc.window(1) != before              # auto: followed the new well
+    rc.set_auto(0)                             # reset-to-auto -> back on the running window
+    assert not rc.is_manual(0) and rc.window(0) == rc.window(1)
+
+
+def test_running_contrast_manual_window_never_degenerate():
+    # a user can drag both handles together; hi must stay above lo so _window can't divide by zero
+    rc = V._RunningContrast(1, 1000.0)
+    rc.set_manual(0, 500.0, 500.0)
+    lo, hi = rc.window(0)
+    assert hi > lo
+
+
 def test_resolve_plate_root(tmp_path):
     (tmp_path / "plate.ome.zarr").mkdir()
     _, is_plate = V.resolve_plate_root(tmp_path)
@@ -153,6 +178,219 @@ def test_resolve_plate_root(tmp_path):
     acq.mkdir()
     _, is_plate = V.resolve_plate_root(acq)
     assert not is_plate
+
+
+# --- per-channel plate store / channel toggle / contrast (IMA-206) --------------------------
+
+_RED_BLUE = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], np.float32)   # a red and a blue channel
+
+
+def _overview(qapp, n_ch=2):
+    """A 1x2 plate (A1, A2) with *n_ch* channels declared — the store/mask/contrast are live."""
+    ov = V.PlateOverview(["A"], ["1", "2"], {(0, 0): "A1", (0, 1): "A2"})
+    ov.set_channels([f"c{i}" for i in range(n_ch)], _RED_BLUE[:n_ch], np.uint16)
+    return ov
+
+
+def _tile(levels):
+    """(C, cell, cell) uint16 ramp per channel — a flat tile would window down to black."""
+    grad = np.linspace(0.0, 1.0, V._CELL * V._CELL).reshape(V._CELL, V._CELL)
+    return np.stack([(grad * lv).astype(np.uint16) for lv in levels])
+
+
+def _rgb(ov) -> np.ndarray:
+    """Whatever the plate is currently showing, as an (H, W, 3) uint8 array."""
+    img = ov._active_source()
+    ptr = img.bits()
+    ptr.setsize(img.byteCount())
+    row = np.frombuffer(ptr, np.uint8).reshape(img.height(), img.bytesPerLine())
+    return row[:, : img.width() * 3].reshape(img.height(), img.width(), 3)
+
+
+def test_add_tile_retains_the_channel_axis(qapp):
+    ov = _overview(qapp)
+    ov.add_tile(0, 0, "A1", _tile([1000, 0]))
+    store = ov._store["raw"]
+    assert store.shape == (2, V._CELL, 2 * V._CELL) and store.dtype == np.uint16
+    assert store[0, :, : V._CELL].max() > 0        # channel 0 landed in A1's cell
+    assert store[1].max() == 0                     # channel 1 was dark, and stayed dark
+    assert store[:, :, V._CELL :].max() == 0       # A2 never got a tile
+    assert _rgb(ov)[:, : V._CELL].max() > 0        # ...and the cell composited onto the plate
+
+
+def test_stale_or_foreign_cell_is_ignored(qapp):
+    ov = _overview(qapp)
+    ov.add_tile(9, 9, "Z9", _tile([1000, 1000]))   # a tile from a retired run / off-plate cell
+    assert "raw" not in ov._store and not ov._tiles
+
+
+def test_channel_toggle_removes_only_that_channel(qapp):
+    ov = _overview(qapp)
+    ov.add_tile(0, 0, "A1", _tile([1000, 1000]))
+    ov.recomposite()
+    both = _rgb(ov).copy()
+    assert both[:, :, 0].max() > 0 and both[:, :, 2].max() > 0
+    ov.set_channel_visible(1, False)               # blue off -> the single-channel mosaic (P1)
+    only_red = _rgb(ov)
+    assert only_red[:, :, 2].max() == 0            # blue's contribution is gone
+    np.testing.assert_array_equal(only_red[:, :, 0], both[:, :, 0])   # red is untouched
+    ov.set_channel_visible(1, True)                # ...and it comes back
+    np.testing.assert_array_equal(_rgb(ov), both)
+
+
+def test_all_channels_off_is_black_and_does_not_crash(qapp):
+    ov = _overview(qapp)
+    ov.add_tile(0, 0, "A1", _tile([1000, 1000]))
+    for ch in (0, 1):
+        ov.set_channel_visible(ch, False)
+    assert _rgb(ov).sum() == 0
+
+
+def test_single_channel_acquisition_toggles_to_black(qapp):
+    # C=1: turning the only channel off is allowed (a mask, not an exclusive swap) and is black.
+    ov = _overview(qapp, n_ch=1)
+    ov.add_tile(0, 0, "A1", _tile([1000]))
+    assert _rgb(ov).max() > 0
+    ov.set_channel_visible(0, False)
+    assert _rgb(ov).sum() == 0
+
+
+def test_rewindow_repaints_without_touching_the_store(qapp):
+    ov = _overview(qapp)
+    ov.add_tile(0, 0, "A1", _tile([1000, 1000]))
+    ov.recomposite()
+    before_px, before_store = _rgb(ov).copy(), ov._store["raw"].copy()
+    ov.set_channel_window(0, 0.0, 50.0)            # a much tighter window -> channel 0 saturates
+    assert not np.array_equal(_rgb(ov), before_px)
+    np.testing.assert_array_equal(ov._store["raw"], before_store)   # retained pixels, not re-read
+    assert ov._contrast.is_manual(0) and not ov._contrast.is_manual(1)
+
+
+def test_latched_channel_survives_a_new_well_and_auto_restores_it(qapp):
+    ov = _overview(qapp)
+    ov.add_tile(0, 0, "A1", _tile([1000, 1000]))
+    ov.set_channel_window(0, 0.0, 50.0)            # latch channel 0 mid-stream
+    auto_before = ov._contrast.window(1)
+    ov.add_tile(0, 1, "A2", _tile([60000, 60000]))  # a much brighter well lands
+    assert ov.channel_windows()[0] == (0.0, 50.0)   # latched: the user's window held (D4)
+    assert ov.channel_windows()[1] != auto_before   # unlatched: kept auto-scaling
+    ov.set_channel_auto(0)
+    assert ov.channel_windows()[0] == ov.channel_windows()[1]   # back on the running window
+
+
+def test_recomposited_backing_array_outlives_its_qimage(qapp):
+    # OV11: QImage WRAPS the numpy buffer. If the widget drops the reference the canvas is a
+    # use-after-free, not a bug — so force a GC and read the plate back.
+    import gc
+    ov = _overview(qapp)
+    ov.add_tile(0, 0, "A1", _tile([1000, 1000]))
+    ov.recomposite()
+    expected = _rgb(ov).copy()
+    gc.collect()
+    np.testing.assert_array_equal(_rgb(ov), expected)
+
+
+def test_recomposite_is_global_so_wells_stay_comparable(qapp):
+    # D6 regression: one bright well and one dim well must KEEP their relative brightness. A
+    # per-well window (what the reopen path used to do) would wrongly equalize them.
+    ov = _overview(qapp)
+    ov.add_tile(0, 0, "A1", _tile([4000, 0]))
+    ov.add_tile(0, 1, "A2", _tile([400, 0]))
+    ov.recomposite()
+    rgb = _rgb(ov)
+    assert rgb[:, : V._CELL].max() > rgb[:, V._CELL :].max()
+
+
+def test_quick_recomposite_matches_the_full_one_at_fit_zoom(qapp):
+    # A gesture composites a strided view at DISPLAY resolution; at 1:1 zoom that is the full pass.
+    ov = _overview(qapp)
+    ov.add_tile(0, 0, "A1", _tile([1000, 1000]))
+    ov.recomposite(quick=True)
+    quick = _rgb(ov).copy()
+    ov.recomposite(quick=False)
+    np.testing.assert_array_equal(_rgb(ov), quick)
+
+
+# --- mosaic (IMA-187) x per-channel store (IMA-206) -----------------------------------------
+#
+# IMA-187 composites MANY FOVs into one 88px cell, zero-padding wherever no field lands. Those
+# zeros are NOT data. If they reach the running histogram the 1st percentile pins to 0 for the
+# WHOLE plate and every well renders washed out — silently, with the mosaic still looking correct.
+# These tests hold that line, and hold the sub-cell placement the mosaic depends on.
+
+def _box_tile(levels, h, w):
+    """(C, h, w) uint16 ramp — one FIELD's worth of pixels, sized to its box, not to the cell."""
+    grad = np.linspace(0.2, 1.0, h * w).reshape(h, w)
+    return np.stack([(grad * lv).astype(np.uint16) for lv in levels])
+
+
+def test_mosaic_tile_lands_at_its_box_offset(qapp):
+    ov = _overview(qapp, n_ch=1)
+    h = w = V._CELL // 3
+    ov.add_tile(0, 0, "A1", _box_tile([4000], h, w), box=(h, w, h, w))   # the middle sub-cell
+    store = ov._store["raw"]
+    assert store[0, h:h + h, w:w + w].max() > 0          # the field landed inside its box...
+    assert store[0, :h, :].max() == 0                    # ...and nowhere else in the cell
+    assert store[0, :, :w].max() == 0
+
+
+def test_mosaic_fields_accumulate_in_one_cell_and_seams_recomposite(qapp):
+    # A 36-FOV well is built from 36 arrivals, not 36 overwrites, and each arrival re-composites
+    # the WHOLE cell so the seam against its already-landed neighbour updates.
+    ov = _overview(qapp, n_ch=1)
+    h = w = V._CELL // 4
+    ov.add_tile(0, 0, "A1", _box_tile([4000], h, w), box=(0, 0, h, w))
+    first = _rgb(ov)[:, :V._CELL].copy()
+    ov.add_tile(0, 0, "A1", _box_tile([4000], h, w), box=(0, w, h, w))   # the neighbour to its right
+    store = ov._store["raw"]
+    assert store[0, :h, :w].max() > 0 and store[0, :h, w:2 * w].max() > 0   # BOTH still present
+    assert not np.array_equal(_rgb(ov)[:, :V._CELL], first)                # the cell repainted
+
+
+def test_contrast_ignores_the_mosaic_zero_padding(qapp):
+    # THE regression. A sparse mosaic: one small bright field in a mostly-empty 88px cell. The
+    # window must be the one the FIELD's pixels alone imply — feeding the padded cell instead
+    # drags the 1st percentile to 0 and washes the plate out.
+    ov = _overview(qapp, n_ch=1)
+    h = w = V._CELL // 4                      # the field covers 1/16 of the cell; 15/16 is padding
+    tile = _box_tile([50000], h, w)
+    ov.add_tile(0, 0, "A1", tile, box=(0, 0, h, w))
+    got = ov.channel_windows()[0]
+
+    ref = V._RunningContrast(1, float(np.iinfo(np.uint16).max))
+    ref.add(0, tile[0])                       # the boxes alone — no padding
+    assert got == ref.window(0)
+
+    poisoned = V._RunningContrast(1, float(np.iinfo(np.uint16).max))
+    poisoned.add(0, ov._store["raw"][0, :V._CELL, :V._CELL])   # the cell INCLUDING its zeros
+    assert poisoned.window(0)[0] < got[0]     # ...which is strictly darker-pinned: the bug
+    assert poisoned.window(0) != got
+
+
+def test_dim_mosaic_well_is_not_washed_out_by_padding(qapp):
+    # The user-visible consequence, end to end: a dim well next to a bright one, both sparse
+    # mosaics. With the padding poisoning the histogram the dim well's rendered range collapses.
+    ov = _overview(qapp, n_ch=1)
+    h = w = V._CELL // 4
+    ov.add_tile(0, 0, "A1", _box_tile([60000], h, w), box=(0, 0, h, w))    # bright well
+    ov.add_tile(0, 1, "A2", _box_tile([3000], h, w), box=(0, 0, h, w))     # dim well
+    ov.recomposite()
+    rgb = _rgb(ov)
+    dim = rgb[:h, V._CELL:V._CELL + w, 0]
+    assert dim.max() > 0                      # the dim well is still visible at all...
+    assert rgb[:h, :w, 0].max() > dim.max()   # ...and still reads as dimmer than the bright one
+
+
+def test_reset_layer_frees_the_store_so_a_shorter_rerun_leaves_nothing(qapp):
+    # A re-run that lands FEWER fields must not composite on top of the last run's pixels.
+    ov = _overview(qapp, n_ch=1)
+    h = w = V._CELL // 4
+    ov.add_tile(0, 0, "A1", _box_tile([4000], h, w), box=(0, 0, h, w))
+    ov.add_tile(0, 0, "A1", _box_tile([4000], h, w), box=(h, 0, h, w))
+    ov.reset_layer("raw")
+    assert "raw" not in ov._store and not ov._tiles_by_layer.get("raw")
+    ov.add_tile(0, 0, "A1", _box_tile([4000], h, w), box=(0, 0, h, w))     # the shorter re-run
+    assert ov._store["raw"][0, h:2 * h, :w].max() == 0      # the old second field is GONE
 
 
 # --- GUI behavior (offscreen; embedded viewer stubbed) --------------------------------------
@@ -246,8 +484,11 @@ def test_run_operator_fills_tiles_and_hue_status(qapp, stub_detail, squid_datase
     # both wells processed -> tiled + hue-coded "done"
     assert win._overview._tiles == set(win._fov_index[w]["rc"] for w in ("B2", "B3"))
     assert set(win._overview._status.values()) == {"done"}
-    # bounded memory: the worker keeps one 88px tile per well, not the acquisition
-    assert len(win._worker._raw) == 2
+    # bounded memory: the plate keeps one 88px per-channel tile per well, not the acquisition
+    store = win._overview._store["mip"]
+    assert store.shape == (len(win._meta["channels"]), win._overview._nr * V._CELL,
+                           win._overview._nc * V._CELL)
+    assert store.dtype == np.dtype(win._meta["dtype"])       # native dtype, not float32
     win._stop_worker()
     win.close()
 
@@ -633,6 +874,66 @@ def test_float_survives_second_ingest(qapp, stub_detail, squid_dataset):
     qapp.processEvents()
     assert win._floating["stub"].isVisible()                 # still floating, registry intact
     assert "stub" not in win._op_tabs
+    win.close()
+
+
+def test_channel_toggle_after_preview_reads_nothing(qapp, stub_detail, squid_dataset):
+    # OV10 defines "no recompute": no reader I/O and no projection. Assert it with a SPY on the
+    # reader, not by timing — the toggle must recomposite purely from the retained store.
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    assert _drain_until(qapp, lambda: len(win._overview._tiles) == 2)   # preview filled the store
+    win._stop_preview()                       # the preview owns the only other reader traffic
+    qapp.processEvents()
+
+    reads = []
+    real_read = win._reader.read
+    win._reader.read = lambda *a, **k: (reads.append(a), real_read(*a, **k))[1]
+
+    before = _rgb(win._overview).copy()
+    win._overview.set_channel_visible(0, False)
+    qapp.processEvents()
+    assert not np.array_equal(_rgb(win._overview), before)   # the plate really changed
+    assert reads == []                                       # ...and nothing was read/projected
+    assert win._worker is None                               # no operator run was triggered
+    win.close()
+
+
+def test_channel_bar_drives_the_plate(qapp, stub_detail, squid_dataset):
+    # The UI seam: one row per channel, checkbox -> mask, slider -> latched manual window, auto ->
+    # back to the running one. The bar is built from the acquisition's RESOLVED display_color.
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    bar = win._channel_bar
+    assert bar is not None and len(bar._rows) == len(win._meta["channels"])
+
+    box, s_lo, s_hi = bar._rows[0]
+    box.setChecked(False)
+    assert win._overview._mask[0] == False        # noqa: E712 — numpy bool, not python bool
+    box.setChecked(True)
+    s_hi.setValue(s_hi.value() // 2)              # dragging a handle latches the channel manual
+    assert win._overview._contrast.is_manual(0)
+    bar._auto(0)
+    assert not win._overview._contrast.is_manual(0)
+    win.close()
+
+
+def test_channel_store_survives_an_operator_run(qapp, stub_detail, squid_dataset, tmp_path):
+    # D3: the store lives in the widget, so the toggle works on the operator layer too — not just
+    # on the raw preview. Both layers keep their own (C, H, W) store.
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("mip", out_parent=str(tmp_path))
+    assert _drain_until(qapp, lambda: "mip" in win._overview._store
+                        and len(win._overview._tiles_by_layer.get("mip", ())) == 2)
+    assert set(win._overview._store) >= {"mip"}        # the operator layer has its own store
+    before = _rgb(win._overview).copy()
+    win._overview.set_channel_visible(0, False)
+    assert not np.array_equal(_rgb(win._overview), before)
+    win._stop_worker()
     win.close()
 
 

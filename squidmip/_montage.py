@@ -25,7 +25,10 @@ Flow (single streaming pass — peak memory is the montage canvas + ONE well, ne
                      (one window per channel across all wells, so wells stay comparable)
         window each channel to [0,1], composite additively via display_color ─► RGB uint8
         write plate_montage.png  +  plate_montage.json (region-jump: well id -> cell bbox)
-                                 +  plate_montage.html (zero-dep viewer: hover a cell -> well id)
+                                 +  plate_montage.html (zero-dep viewer: hover a cell -> well id,
+                                                        legend doubles as the channel toggle)
+        per_channel=True: also composite ONE channel at a time -> plate_montage_<channel>.png
+                          (IMA-206; same canvas, same global window, its own LUT color)
 
 Why global-per-channel contrast: a montage is for comparing wells at a glance; a per-well
 window would make a dim well and a bright well look identical. The montage downsamples
@@ -39,6 +42,7 @@ channel with no resolvable color is refused, never rendered as a silent blank/bl
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -154,6 +158,34 @@ def _hex_to_rgb01(hex_color: str) -> np.ndarray:
     return np.array([int(h[i : i + 2], 16) for i in (0, 2, 4)], dtype=np.float32) / 255.0
 
 
+def composite(store: np.ndarray, colors: np.ndarray, windows, mask=None) -> np.ndarray:
+    """Window each channel of a ``(C, H, W)`` stack and add it into one ``(H, W, 3)`` uint8 RGB.
+
+    The single home of the window-multiply-sum loop (IMA-206): the montage, the per-channel PNGs
+    and the plate overview's live recomposite all go through here, so what is on screen and what
+    is exported cannot drift apart. *windows* is one ``(lo, hi)`` per channel; *mask* is a
+    per-channel bool (None = every channel on) — a masked-off channel contributes nothing, so an
+    all-off mask is plain black, never a NaN or a divide-by-zero.
+    """
+    n_ch, h, w = store.shape
+    rgb = np.zeros((h, w, 3), dtype=np.float32)
+    for ch in range(n_ch):
+        if mask is not None and not mask[ch]:
+            continue
+        lo, hi = windows[ch]
+        rgb += _window(store[ch], lo, hi)[:, :, None] * colors[ch][None, None, :]
+    # clip/scale IN PLACE — avoids three canvas-sized float32 copies (a ~430 MB transient on a 1536wp)
+    np.clip(rgb, 0.0, 1.0, out=rgb)
+    rgb *= 255.0
+    return rgb.astype(np.uint8)
+
+
+def _channel_slug(label, index: int) -> str:
+    """Filename-safe tag for ``plate_montage_<slug>.png``; falls back to ``ch<i>`` on a blank label."""
+    slug = re.sub(r"[^0-9A-Za-z]+", "_", str(label or "")).strip("_")
+    return slug or f"ch{index}"
+
+
 # --- hover viewer (self-contained HTML over the montage + region-jump sidecar) ----------------
 
 # The montage sits under a top bar; row (A..) + column (1..) labels frame it; black grid lines
@@ -161,6 +193,11 @@ def _hex_to_rgb01(hex_color: str) -> np.ndarray:
 # that cell and shows the region id in LARGE text in the bar ABOVE the montage (never over the
 # wells). A cursor is mapped to a well purely from the sidecar geometry, so it needs no server.
 # Full-res-on-click (detail) remains the Plate View navigator ticket.
+# The legend doubles as the CHANNEL TOGGLE (IMA-206) when per-channel PNGs were exported: the
+# composite PNG shows while every channel is on, and any subset stacks the per-channel PNGs with
+# mix-blend-mode:screen (the browser's additive composite). No contrast slider here on purpose —
+# a PNG is already-windowed 8-bit, so re-windowing it in the browser cannot recover what the
+# window crushed; the honest thing is to SHOW the window each channel was exported at instead.
 _VIEWER_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -180,7 +217,9 @@ _VIEWER_HTML = """<!doctype html>
   #readout small{font-size:.42em;font-weight:600;color:var(--faint);margin-left:10px;text-transform:uppercase;letter-spacing:.08em}
   .right{display:flex;align-items:center;gap:20px;margin-left:auto}
   .legend{display:flex;gap:13px;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
-  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .legend label{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
+  .legend label.off{opacity:.4}
+  .legend small{color:var(--faint);font-size:10.5px}
   .sw{width:10px;height:10px;border-radius:50%}
   .zoom{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:11.5px}.zoom input{width:130px}
   #plate{position:absolute;top:57px;left:0;right:0;bottom:0;overflow:auto;background:var(--bg)}
@@ -190,8 +229,11 @@ _VIEWER_HTML = """<!doctype html>
   #rowruler{position:sticky;left:0;z-index:5;background:var(--bg);border-right:1px solid var(--border)}
   .lab{position:absolute;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:600;color:var(--muted);overflow:hidden}
   .lab.on{color:var(--accent);font-weight:800}
-  #stage{position:relative;line-height:0}
+  #stage{position:relative;line-height:0;background:#000;isolation:isolate}  /* isolate: blend the
+                                          per-channel layers with each other, not with the page */
   #montage{display:block}
+  #layers{position:absolute;inset:0;z-index:0}   /* above the composite img, under the grid lines */
+  #layers img{position:absolute;inset:0;width:100%;height:100%;display:none;mix-blend-mode:screen}
   #lines{position:absolute;inset:0;pointer-events:none;z-index:1}   /* black grid lines between wells */
   #box{position:absolute;display:none;border:2px solid #ff2d2d;pointer-events:none;z-index:3}
 </style></head>
@@ -211,6 +253,7 @@ _VIEWER_HTML = """<!doctype html>
     <div id="rowruler"></div>
     <div id="stage">
       <img id="montage" src="__PNG__" alt="plate montage"/>
+      <div id="layers"></div>
       <div id="lines"></div>
       <div id="box"></div>
     </div>
@@ -223,13 +266,32 @@ for (const w of D.wells) byRC[w.row_index + "," + w.col_index] = w;
 const stage = document.getElementById("stage"), img = document.getElementById("montage"),
       colr = document.getElementById("colruler"), rowr = document.getElementById("rowruler"),
       lines = document.getElementById("lines"), box = document.getElementById("box"),
+      layers = document.getElementById("layers"), legend = document.getElementById("legend"),
       readout = document.getElementById("readout"), zoom = document.getElementById("zoom");
 
-// compact channel legend: color dot + wavelength (parsed from the channel label when present)
-document.getElementById("legend").innerHTML = (D.channels || []).map(c => {
+// compact channel legend: color dot + wavelength (parsed from the channel label when present) +
+// the WINDOW this channel was exported at. It becomes a checkbox per channel when build_montage
+// wrote per-channel PNGs (per_channel=True) — that is the channel toggle.
+const CH = D.channels || [], TOGGLE = CH.length > 0 && CH.every(c => c.png);
+legend.innerHTML = CH.map((c, i) => {
   const m = (c.label || "").match(/(\\d{3,4})/); const t = m ? m[1] : (c.label || "");
-  return '<span><i class="sw" style="background:#' + c.color + '"></i>' + t + "</span>";
+  const w = c.window ? ' <small>' + Math.round(c.window.low) + '-' + Math.round(c.window.high) + '</small>' : '';
+  return '<label>' + (TOGGLE ? '<input type="checkbox" data-ch="' + i + '" checked/>' : '')
+       + '<i class="sw" style="background:#' + c.color + '"></i>' + t + w + '</label>';
 }).join("");
+if (TOGGLE){
+  CH.forEach(c => { const im = document.createElement("img"); im.src = c.png; im.alt = c.label || ""; layers.appendChild(im); });
+  legend.addEventListener("change", applyChannels);
+}
+// All channels on -> the composite PNG (exactly what build_montage rendered). Any subset -> stack
+// the per-channel PNGs with screen blending, which is the same additive composite in the browser.
+function applyChannels(){
+  const boxes = Array.prototype.slice.call(legend.querySelectorAll("input"));
+  const on = boxes.map(b => b.checked), all = on.every(Boolean);
+  img.style.display = all ? "block" : "none";
+  boxes.forEach((b, i) => { b.parentNode.classList.toggle("off", !on[i]);
+    layers.children[i].style.display = (!all && on[i]) ? "block" : "none"; });
+}
 
 const colLabs = [], rowLabs = [];
 for (let c = 0; c < NC; c++){ const el = document.createElement("div"); el.className = "lab"; el.textContent = D.grid.columns[c];
@@ -294,6 +356,7 @@ def build_montage(
     cell_px: int = _DEFAULT_CELL_PX,
     percentiles: tuple[float, float] = _DEFAULT_PERCENTILES,
     t: int = 0,
+    per_channel: bool = False,
 ) -> dict:
     """Render a static whole-plate montage (thumbnail mosaic) from an OME-zarr HCS plate.
 
@@ -311,11 +374,16 @@ def build_montage(
         ``(low, high)`` percentile clip for the GLOBAL-per-channel contrast window.
     t:
         Timepoint to render (default 0). A montage is a single-timepoint overview.
+    per_channel:
+        Also write ``plate_montage_<channel>.png`` per channel (IMA-206) — same canvas, same
+        GLOBAL window, one channel at a time in its own LUT color — and turn the HTML viewer's
+        legend into channel toggles. Off by default: it costs one extra PNG encode per channel.
 
     Returns
     -------
     dict
-        Manifest: ``{"montage", "sidecar", "n_wells", "grid": (n_rows, n_cols), "cell_px"}``.
+        Manifest: ``{"montage", "per_channel", "sidecar", "viewer", "n_wells",
+        "grid": (n_rows, n_cols), "cell_px"}``.
 
     Raises
     ------
@@ -368,7 +436,6 @@ def build_montage(
         del well  # release the full-res well before the next read (bounded memory)
 
     # --- global per-channel contrast, then composite to RGB -------------------------------
-    rgb = np.zeros((n_rows * cell_px, n_cols * cell_px, 3), dtype=np.float32)
     windows = []
     for ch in range(n_ch):
         vals = canvas[ch][filled]  # only real well pixels drive the window (blanks would skew it)
@@ -377,13 +444,23 @@ def build_montage(
         else:
             lo, hi = 0.0, 1.0
         windows.append((float(lo), float(hi)))
-        scaled = _window(canvas[ch], lo, hi)  # (H, W) in [0, 1]
-        rgb += scaled[:, :, None] * colors[ch][None, None, :]  # additive composite
-    rgb = (np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+    rgb = composite(canvas, colors, windows)   # additive composite, one global window per channel
     # Blank (never-filled) cells stay pure black — a viewer reads them as "no well here".
 
     montage_path = out_dir / "plate_montage.png"
     Image.fromarray(rgb, mode="RGB").save(montage_path)
+
+    # P1: ONE PNG PER CHANNEL. Same retained canvas, same global windows, one channel unmasked at
+    # a time — so a 638 signal sitting under a bright 405 is inspectable on its own, in its own
+    # color, at exactly the window the composite used (recorded in the sidecar next to it).
+    ch_pngs: list[Optional[str]] = [None] * n_ch
+    if per_channel:
+        for ch in range(n_ch):
+            mask = np.zeros(n_ch, dtype=bool)
+            mask[ch] = True
+            name = f"plate_montage_{_channel_slug(layout.channels[ch].get('label'), ch)}.png"
+            Image.fromarray(composite(canvas, colors, windows, mask), mode="RGB").save(out_dir / name)
+            ch_pngs[ch] = name
 
     sidecar_path = out_dir / "plate_montage.json"
     sidecar = {
@@ -393,7 +470,7 @@ def build_montage(
         "grid": {"n_rows": n_rows, "n_cols": n_cols, "rows": layout.rows, "columns": layout.cols},
         "channels": [
             {"label": c.get("label"), "color": str(c["color"]).lstrip("#"),
-             "window": {"low": windows[i][0], "high": windows[i][1]}}
+             "window": {"low": windows[i][0], "high": windows[i][1]}, "png": ch_pngs[i]}
             for i, c in enumerate(layout.channels)
         ],
         "wells": placements,  # region-jump: map a montage pixel/click back to a well id
@@ -405,6 +482,7 @@ def build_montage(
 
     return {
         "montage": str(montage_path),
+        "per_channel": [str(out_dir / n) for n in ch_pngs if n],   # [] unless per_channel=True
         "sidecar": str(sidecar_path),
         "viewer": str(viewer_path),
         "n_wells": len(layout.wells),

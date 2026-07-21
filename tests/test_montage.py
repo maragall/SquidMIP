@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from squidmip import build_montage
-from squidmip._montage import _area_downsample, _hex_to_rgb01, _window
+from squidmip._montage import _area_downsample, _channel_slug, _hex_to_rgb01, _window, composite
 from squidmip._output import write_from_stream
 
 # Two channels: red (638) and blue (405), so composite color is unambiguous per channel.
@@ -84,6 +84,40 @@ def test_hex_to_rgb01_parses_and_fails_loud():
     np.testing.assert_allclose(_hex_to_rgb01("20ADF8"), [0x20 / 255, 0xAD / 255, 0xF8 / 255])
     with pytest.raises(ValueError):
         _hex_to_rgb01("#FFF")  # not 6 digits
+
+
+def test_composite_masks_out_a_channel():
+    # IMA-206: masking a channel off removes exactly that channel's contribution — nothing else
+    # moves. Red channel 0, blue-ish channel 1; a mask of [True, False] must leave pure red.
+    store = np.stack([np.full((4, 4), 100.0), np.full((4, 4), 100.0)])
+    colors = np.stack([_hex_to_rgb01("#FF0000"), _hex_to_rgb01("#0000FF")])
+    windows = [(0.0, 100.0), (0.0, 100.0)]
+    both = composite(store, colors, windows)
+    only_red = composite(store, colors, windows, mask=np.array([True, False]))
+    assert (both[:, :, 2] > 0).all() and (only_red[:, :, 2] == 0).all()   # blue gone
+    np.testing.assert_array_equal(both[:, :, 0], only_red[:, :, 0])       # red untouched
+
+
+def test_composite_empty_mask_is_black_not_nan():
+    store = np.stack([np.full((4, 4), 100.0), np.full((4, 4), 0.0)])
+    colors = np.stack([_hex_to_rgb01("#FF0000"), _hex_to_rgb01("#0000FF")])
+    out = composite(store, colors, [(0.0, 100.0), (0.0, 0.0)], mask=np.zeros(2, bool))
+    assert out.shape == (4, 4, 3) and out.dtype == np.uint8
+    assert out.sum() == 0 and not np.isnan(out.astype(float)).any()
+
+
+def test_composite_applies_a_distinct_window_per_channel():
+    # same pixels in both channels, different windows -> different brightness per channel
+    store = np.stack([np.full((4, 4), 50.0), np.full((4, 4), 50.0)])
+    colors = np.stack([_hex_to_rgb01("#FF0000"), _hex_to_rgb01("#0000FF")])
+    out = composite(store, colors, [(0.0, 50.0), (0.0, 500.0)])
+    assert out[0, 0, 0] == 255                 # channel 0 saturates at its window
+    assert 0 < out[0, 0, 2] < 255              # channel 1 sits low in its much wider window
+
+
+def test_channel_slug_is_filename_safe():
+    assert _channel_slug("Fluorescence 638 nm - Penta", 0) == "Fluorescence_638_nm_Penta"
+    assert _channel_slug(None, 3) == "ch3"     # blank label falls back to the index
 
 
 def test_window_guards_flat_channel():
@@ -201,6 +235,79 @@ def test_montage_sidecar_records_per_channel_window(tmp_path):
     assert [c["color"] for c in side["channels"]] == ["FF0000", "20ADF8"]
     for c in side["channels"]:
         assert c["window"]["high"] >= c["window"]["low"]  # a real, ordered window per channel
+
+
+def test_montage_per_channel_writes_one_png_per_channel(tmp_path):
+    # P1 verbatim: one PNG per channel, alongside the composite. Names come from the omero label.
+    images = {"B2": _ramp([300, 0]), "B3": _ramp([0, 300])}
+    out = _make_plate(tmp_path, images)
+    manifest = build_montage(out, cell_px=4, per_channel=True)
+
+    assert Path(manifest["montage"]).name == "plate_montage.png"          # composite still written
+    names = [Path(p).name for p in manifest["per_channel"]]
+    assert names == ["plate_montage_638.png", "plate_montage_405.png"]
+    assert all((Path(out) / n).exists() for n in names)
+    side = json.loads(Path(manifest["sidecar"]).read_text())
+    assert [c["png"] for c in side["channels"]] == names                  # sidecar names them
+
+
+def test_montage_per_channel_png_carries_only_its_own_channel(tmp_path):
+    # Each per-channel PNG must be that channel ALONE, in its own display_color: B2 is lit only in
+    # 638 (red) and B3 only in 405 (blue), so the 638 PNG holds B2 and nothing at B3, and vice versa.
+    images = {"B2": _ramp([300, 0]), "B3": _ramp([0, 300])}
+    out = _make_plate(tmp_path, images)
+    manifest = build_montage(out, cell_px=4, per_channel=True)
+
+    from PIL import Image
+
+    side = json.loads(Path(manifest["sidecar"]).read_text())
+    cells = {w["well_id"]: w for w in side["wells"]}
+
+    def cell(png, w):
+        arr = np.asarray(Image.open(Path(out) / png)).astype(int)
+        return arr[w["y0"] : w["y1"], w["x0"] : w["x1"]].reshape(-1, 3).mean(axis=0)
+
+    red_png, blue_png = side["channels"][0]["png"], side["channels"][1]["png"]
+    assert cell(red_png, cells["B2"])[0] > 0 and cell(red_png, cells["B2"])[2] == 0   # red only
+    assert cell(red_png, cells["B3"]).sum() == 0            # B3 has no 638 signal -> black
+    assert cell(blue_png, cells["B3"])[2] > 0               # 405's LUT is blue-dominant
+    assert cell(blue_png, cells["B2"]).sum() == 0
+
+
+def test_montage_per_channel_uses_the_window_in_the_sidecar(tmp_path):
+    # D9's honesty requirement: the window a channel was exported at is recorded, and it is the
+    # SAME global window the composite used (per-channel PNGs are not re-windowed on their own).
+    images = {"B2": _ramp([1000, 100]), "B3": _ramp([100, 1000])}
+    out = _make_plate(tmp_path, images)
+    manifest = build_montage(out, cell_px=4, per_channel=True)
+    side = json.loads(Path(manifest["sidecar"]).read_text())
+    from PIL import Image
+
+    for c in side["channels"]:
+        assert c["window"]["high"] > c["window"]["low"]
+        arr = np.asarray(Image.open(Path(out) / c["png"]))
+        assert arr.max() > 0                                # windowed, not crushed to black
+
+
+def test_montage_html_channel_toggles_reference_the_per_channel_pngs(tmp_path):
+    images = {"B2": _ramp([300, 0]), "B3": _ramp([0, 300])}
+    out = _make_plate(tmp_path, images)
+    build_montage(out, cell_px=4, per_channel=True)
+    html = (Path(out) / "plate_montage.html").read_text()
+    assert '"png": "plate_montage_638.png"' in html and '"png": "plate_montage_405.png"' in html
+    assert 'type="checkbox"' in html and "applyChannels" in html      # toggles wired
+    assert 'c.window.low' in html and 'c.window.high' in html         # exported window shown (D9)
+    assert "http://" not in html and "https://" not in html          # still self-contained
+
+
+def test_montage_html_without_per_channel_has_no_dead_toggles(tmp_path):
+    # Default (composite only): the legend stays a plain legend — no checkbox that toggles nothing.
+    images = {"B2": _ramp([300, 0])}
+    out = _make_plate(tmp_path, images)
+    build_montage(out, cell_px=4)
+    html = (Path(out) / "plate_montage.html").read_text()
+    assert '"png": null' in html                            # sidecar says: no per-channel PNGs
+    assert 'type="checkbox"' not in html.split("<script>")[0]   # none rendered into the markup
 
 
 def test_montage_memory_is_bounded_not_whole_plate(tmp_path):

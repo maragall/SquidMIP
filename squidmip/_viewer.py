@@ -29,12 +29,15 @@ Design notes:
 - ndviewer_light is the embedded detail viewer (its LightweightViewer QWidget + push API); PyQt5 to
   match its stack. PyQt5 is imported here, never in squidmip/__init__, so the pipeline stays Qt-free.
 - Nothing is written to the user's disk: the detail view reads the acquisition's own read-only
-  TIFFs. Memory is NOT one-well-at-a-time on the plate side: the MIP run retains one downsampled
-  88x88xC float32 tile PER WELL (_OperatorWorker._raw) for the final global-contrast montage, so
-  the plate-side footprint is O(n_wells x C) (~190 MB for a 1536wp, C=4), plus a grid-sized RGB
-  canvas (~36 MB) and a transient float32 montage buffer at run end. Bounded by the plate format
-  (<=1536 wells), not by z/frame size. What IS one-well-at-a-time is project_plate's producer
-  (workers x one ~139 MB well) and the detail viewer's LRU-bounded decoded planes.
+  TIFFs. Memory is NOT one-well-at-a-time on the plate side: PlateOverview retains the whole plate
+  with its CHANNEL AXIS intact — one (C, nr*88, nc*88) NATIVE-DTYPE store per displayed layer — so
+  a channel toggle or a contrast drag recomposites from pixels already in RAM instead of re-reading
+  or re-projecting anything. That is ~95 MB for a 1536wp at C=4 uint16 (native dtype, so half what
+  float32 would cost), and it MULTIPLIES per layer: raw + one operator layer is ~190 MB. Allocated
+  lazily, only for a layer that actually receives tiles. On top sits a grid-sized RGB canvas (~36 MB)
+  per layer and one transient float32 buffer during a full-resolution recomposite. Bounded by the
+  plate format (<=1536 wells), not by z/frame size. What IS one-well-at-a-time is project_plate's
+  producer (workers x one ~139 MB well) and the detail viewer's LRU-bounded decoded planes.
 - Hit-testing / cell fitting are pure functions (unit-testable); widgets run headless under
   QT_QPA_PLATFORM=offscreen.
 """
@@ -54,13 +57,13 @@ from PyQt5.QtCore import Qt, QProcess, QProcessEnvironment, QSocketNotifier, QTh
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPalette, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QAction, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QLineEdit, QMainWindow, QPlainTextEdit, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter,
     QStyleFactory, QTabBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from squidmip._engine import _default_workers
 from squidmip._layers import OperationStack
-from squidmip._montage import _area_downsample, _hex_to_rgb01, _window
+from squidmip._montage import _area_downsample, _hex_to_rgb01, composite
 from squidmip._output import parse_well_id
 from squidmip._plate_shape import PlateShapeError, resolve_plate_format
 
@@ -636,17 +639,41 @@ def resolve_plate_root(path) -> tuple[Path, bool]:
 
 
 class _RunningContrast:
-    """Per-channel global contrast that updates as wells stream in (histogram over tiles so far)."""
+    """Per-channel global contrast that updates as wells stream in (histogram over tiles so far).
+
+    Each channel also carries an auto/manual LATCH (IMA-206). The histogram keeps growing while a
+    run streams, so an untouched channel keeps auto-scaling; the first time the user drags that
+    channel's contrast it latches MANUAL and the next well to land can no longer stomp the window
+    they just set. ``set_auto`` unlatches it back onto the running histogram.
+    """
 
     def __init__(self, n_ch: int, dmax: float, pct=(1.0, 99.8), bins=512):
         self._bins, self._dmax, self._pct = bins, max(1.0, float(dmax)), pct
         self._hist = [np.zeros(bins, dtype=np.int64) for _ in range(n_ch)]
+        self._manual: dict[int, tuple[float, float]] = {}   # ch -> the window the user latched
+
+    @property
+    def dmax(self) -> float:
+        return self._dmax
 
     def add(self, ch: int, tile: np.ndarray):
         idx = np.clip((tile.ravel() / self._dmax * self._bins).astype(int), 0, self._bins - 1)
         self._hist[ch] += np.bincount(idx, minlength=self._bins)
 
+    def set_manual(self, ch: int, lo: float, hi: float):
+        """Latch *ch* to a user-set window (hi is kept above lo so _window never divides by zero)."""
+        self._manual[ch] = (float(lo), float(max(hi, lo + 1)))
+
+    def set_auto(self, ch: int):
+        """Unlatch *ch* — it goes back to following the running histogram."""
+        self._manual.pop(ch, None)
+
+    def is_manual(self, ch: int) -> bool:
+        return ch in self._manual
+
     def window(self, ch: int) -> tuple[float, float]:
+        if ch in self._manual:      # latched: the user owns this channel's window (D4)
+            return self._manual[ch]
         h = self._hist[ch]
         tot = h.sum()
         if tot == 0:
@@ -656,11 +683,21 @@ class _RunningContrast:
         hi = np.searchsorted(cdf, self._pct[1] / 100.0) / self._bins * self._dmax
         return float(lo), float(max(hi, lo + 1))
 
+    def windows(self) -> list[tuple[float, float]]:
+        return [self.window(ch) for ch in range(len(self._hist))]
+
 
 # --- plate overview widget (one cell per well; hue-coded status; fit-to-view) ---------------
 
 class PlateOverview(QWidget):
-    """The low-res plate: an RGB canvas of MIP tiles, plus a per-well status hue and a red box."""
+    """The low-res plate: an RGB canvas of MIP tiles, plus a per-well status hue and a red box.
+
+    The RGB canvas is only what is CURRENTLY shown. What the widget actually owns (IMA-206) is a
+    per-layer ``(C, nr*_CELL, nc*_CELL)`` native-dtype store — the plate with its channel axis
+    still intact — plus a channel mask and a per-channel contrast window. Producers hand over
+    per-channel tiles and this widget does all compositing, so toggling a channel or dragging its
+    contrast re-composites from the retained pixels: no reader I/O, no re-projection, ever.
+    """
 
     hovered = pyqtSignal(str)              # region id (or "" off-plate), for the window's readout
     wellActivated = pyqtSignal(str, int)   # (well_id, fov_index) double-clicked -> load in ndviewer
@@ -678,13 +715,25 @@ class PlateOverview(QWidget):
         self._tiles_by_layer: dict[str, set] = {}              # layer -> cells with an image there
         self._canvas = QImage(self._nc * _CELL, self._nr * _CELL, QImage.Format_RGB888)
         self._canvas.fill(QColor(_BG))
-        self._final = None            # crisp global-contrast montage of the ACTIVE layer (or None)
+        self._final = None            # global-contrast recomposite of the ACTIVE layer (or None)
         # Layer stack render: the base ("raw") is self._canvas; each operator draws into its own
         # per-layer canvas/final. self._active is the layer the plate currently shows (LayersTab picks
         # it via set_active_layer). Keeps memory to one small montage-canvas per layer used.
         self._op_canvas: dict[str, QImage] = {}
         self._op_final: dict[str, QImage] = {}
+        self._final_arr: dict[str, np.ndarray] = {}   # keeps each recomposited RGB alive: QImage
+        #                                               WRAPS the numpy buffer, it does not copy it
         self._active = "raw"
+        # --- the channel axis (IMA-206) — set_channels declares it; empty until then -----------
+        self._labels: list[str] = []      # channel display names, for the channel bar
+        self._colors = None               # (C, 3) float RGB, the RESOLVED display_color per channel
+        self._dtype = np.uint16           # store dtype: the acquisition's native dtype (half the RAM)
+        self._store: dict[str, np.ndarray] = {}   # layer -> (C, nr*_CELL, nc*_CELL), allocated lazily
+        self._mask = None                 # (C,) bool: which channels composite into the plate
+        self._contrast = None             # _RunningContrast: global per-channel window + auto/manual
+        self._full = QTimer(self)         # coalesces the full-res recomposite behind a gesture
+        self._full.setSingleShot(True)    # (a drag repaints at DISPLAY res; full-res lands once)
+        self._full.timeout.connect(self._on_full_timeout)
         self._scaled = None           # cached pixmap of (final|canvas) scaled to the current zoom;
         self._scaled_cd = None        # rebuilt only when zoom (cd) or the source image changes — so
         #                               a hover/pan repaint blits 1:1 instead of re-resampling 12 MP.
@@ -733,15 +782,158 @@ class PlateOverview(QWidget):
     def _active_source(self) -> QImage:
         return self._final or self._canvas_for(self._active)
 
+    # -- the channel axis: store, mask, per-channel contrast (IMA-206) --
+    def set_channels(self, labels, colors: np.ndarray, dtype=np.uint16, pct=(1.0, 99.8)):
+        """Declare the acquisition's channels — the per-channel store/mask/contrast start here.
+
+        *colors* is the (C, 3) float RGB of the RESOLVED ``display_color`` (the acquisition's YAML
+        first, the wavelength fallback map second — resolve_channels already settled that), so the
+        plate is tinted exactly the way every other compositing site tints it.
+        """
+        self._labels = [str(x) for x in labels]
+        self._colors = np.asarray(colors, dtype=np.float32)
+        self._dtype = np.dtype(dtype)
+        self._mask = np.ones(len(self._labels), dtype=bool)     # every channel on by default (OV8)
+        dmax = float(np.iinfo(self._dtype).max) if self._dtype.kind in "ui" else 1.0
+        self._contrast = _RunningContrast(len(self._labels), dmax, pct=pct)
+        self._store.clear()
+
+    def _store_for(self, layer: str) -> Optional[np.ndarray]:
+        """The layer's (C, H, W) plate store, allocated on first tile (one per layer, lazily —
+        each layer that supports toggling costs its own ~95 MB at 1536wp x 4ch uint16)."""
+        if self._colors is None:
+            return None
+        st = self._store.get(layer)
+        if st is None:
+            st = np.zeros((len(self._colors), self._nr * _CELL, self._nc * _CELL), self._dtype)
+            self._store[layer] = st
+        return st
+
+    def channel_windows(self) -> list:
+        """The effective (lo, hi) per channel — the latched manual window, else the running one."""
+        return self._contrast.windows() if self._contrast is not None else []
+
+    def set_channel_visible(self, ch: int, on: bool):
+        """Toggle a channel in/out of the plate composite. Recomposites from the RETAINED store —
+        no reader I/O, no re-projection (that is the whole point of keeping the channel axis)."""
+        if self._mask is None or not (0 <= ch < len(self._mask)):
+            return
+        self._mask[ch] = bool(on)
+        self._refresh()
+
+    def set_channel_window(self, ch: int, lo: float, hi: float):
+        """Re-window one channel and repaint. LATCHES that channel manual (D4) so the wells still
+        streaming in can't stomp the window the user just set."""
+        if self._contrast is None or not (0 <= ch < len(self._mask)):
+            return
+        self._contrast.set_manual(ch, lo, hi)
+        self._refresh()
+
+    def set_channel_auto(self, ch: int):
+        """Unlatch a channel: it goes back to auto-scaling off the running histogram."""
+        if self._contrast is None or not (0 <= ch < len(self._mask)):
+            return
+        self._contrast.set_auto(ch)
+        self._refresh()
+
+    def _refresh(self):
+        """A user gesture: repaint NOW at display resolution, then land full-res once it settles.
+
+        The invariant is that no gesture ever touches the full (C, 2816, 4224) canvas — a slider
+        drag composites the sub-sampled view the screen can actually show (a few thousand px),
+        and the single full-res pass is coalesced behind the last event.
+        """
+        self.recomposite(quick=True)
+        self._full.start(150)
+
+    def _on_full_timeout(self):
+        """The coalescing timer fired. Guarded: a pending recomposite must not outlive the widget
+        (the plate is torn down and rebuilt on every open, and the timer is queued, not immediate)."""
+        try:
+            self.recomposite(quick=False)
+        except RuntimeError:
+            pass   # the C++ widget went away while the full-res pass was still pending
+
+    def recomposite(self, layer: Optional[str] = None, *, quick: bool = False):
+        """Rebuild a layer's plate image from its store, at the current mask + windows.
+
+        ``quick=True`` composites a strided view at roughly the on-screen resolution (cheap enough
+        to run on every slider tick); the default walks the whole store — the end-of-stream pass.
+        """
+        layer = layer or self._active
+        store = self._store.get(layer)
+        if store is None or self._colors is None:
+            return
+        step = max(1, int(round(_CELL / max(1.0, self._cd)))) if quick else 1
+        rgb = composite(store[:, ::step, ::step], self._colors, self.channel_windows(), self._mask)
+        self._final_arr[layer] = rgb          # hold the buffer: the QImage below only wraps it
+        h, w, _ = rgb.shape
+        self.set_final(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888), layer)
+
+    def hideEvent(self, e):
+        self._full.stop()   # a plate on its way out must not repaint from a queued timer
+        super().hideEvent(e)
+
+    def reset_layer(self, layer: str):
+        """Forget a layer's retained pixels — its store, its recomposite and its painted canvas.
+
+        Called before a run streams into a layer that already has one. Without it a mosaic re-run
+        that lands FEWER fields (a smaller selection, a failed well) would leave the previous run's
+        FOVs standing inside the same cell, blended into the new ones with no way to tell which is
+        which — and the ~95 MB store would never be freed either.
+        """
+        self._store.pop(layer, None)
+        self._final_arr.pop(layer, None)
+        self._op_final.pop(layer, None)
+        self._tiles_by_layer.pop(layer, None)
+        if layer == "raw":
+            self._canvas.fill(QColor(_BG))
+        else:
+            self._op_canvas.pop(layer, None)
+        if layer == self._active:
+            self._final = None
+            self._scaled = None
+            self.update()
+
     # -- data in --
-    def add_tile(self, ri: int, ci: int, well_id: str, rgb: np.ndarray, layer: str = "raw"):
+    def add_tile(self, ri: int, ci: int, well_id: str, tile: np.ndarray, layer: str = "raw",
+                 box=None):
+        """Take one PER-CHANNEL tile ``(C, h, w)`` (native dtype), retain it in the layer's store,
+        feed the running contrast, and re-composite that whole cell.
+
+        ``box`` is ``(top, left, h, w)`` in cell px for a multi-FOV mosaic (IMA-187): the tile is
+        one FIELD inside the cell, so it is written at that offset and the cell is re-composited
+        around it, which is what makes the seams between neighbouring FOVs update as they land.
+        ``box=None`` is the historical single-tile path — one field fills the cell at (0, 0).
+
+        CONTRAST IS FED THE TILE, NEVER THE STORE SLICE. A mosaic cell is zero-padded wherever no
+        FOV lands (margins, gaps between fields); feeding those zeros to the running histogram
+        would pin the 1st percentile at 0 for the whole plate and silently wash every well out.
+        Only real acquired pixels get a vote.
+        """
         if (ri, ci) not in self._by_rc:    # ignore a stale tile from a retired run / foreign cell
             return
-        rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
-        img = QImage(rgb.data, _CELL, _CELL, 3 * _CELL, QImage.Format_RGB888)
+        store = self._store_for(layer)
+        if store is None:                  # no channel axis declared yet -> nothing to composite
+            return
+        tile = np.asarray(tile)
+        y0, x0 = ri * _CELL, ci * _CELL
+        top, left = (int(box[0]), int(box[1])) if box is not None else (0, 0)
+        th, tw = tile.shape[1], tile.shape[2]      # place by ACTUAL shape: a field smaller than
+        store[:, y0 + top:y0 + top + th,           # the cell must not broadcast-crash
+              x0 + left:x0 + left + tw] = tile
+        for c_i in range(tile.shape[0]):
+            self._contrast.add(c_i, tile[c_i])     # real FOV pixels only — see the docstring
+        cell = composite(store[:, y0:y0 + _CELL, x0:x0 + _CELL], self._colors,
+                         self.channel_windows(), self._mask)
+        img = QImage(cell.data, _CELL, _CELL, 3 * _CELL, QImage.Format_RGB888)
         p = QPainter(self._canvas_for(layer))
-        p.drawImage(ci * _CELL, ri * _CELL, img)
+        p.drawImage(x0, y0, img)           # drawImage COPIES, so `cell` may die after p.end()
         p.end()
+        if self._op_final.pop(layer, None) is not None:   # a new tile supersedes the old recomposite
+            self._final_arr.pop(layer, None)              # -> back to the streamed canvas
+            if layer == self._active:
+                self._final = None
         self._tiles.add((ri, ci))
         self._tiles_by_layer.setdefault(layer, set()).add((ri, ci))   # per-layer: drives the grey dots
         if layer == self._active:         # only the shown layer needs a repaint / cache rebuild
@@ -772,6 +964,8 @@ class PlateOverview(QWidget):
         self._final = self._op_final.get(layer)   # None for "raw" -> falls back to the base canvas
         self._scaled = None
         self.update()
+        if layer in self._store:     # bring it up to the CURRENT mask/windows: its canvas was blitted
+            self.recomposite(layer)  # cell-by-cell, with whatever mask was set when each tile landed
 
     def select(self, ri: int, ci: int):
         """Move the red box to a well (driven by the ndviewer FOV slider)."""
@@ -1055,34 +1249,114 @@ def _mosaic_boxes(meta: dict) -> dict:
     return out
 
 
+# --- channel bar: one row per channel, under the plate overview -----------------------------
+
+class _ChannelBar(QWidget):
+    """Per-channel visibility + contrast for the plate, one compact row per channel.
+
+    A row is <color dot> [x] <name>  [low]-[high]  (auto). The checkbox masks that channel out of
+    the plate composite; the two sliders re-window it (which latches it manual, so a still-running
+    acquisition can't stomp it); "auto" hands it back to the running global window. Every control
+    drives PlateOverview, which recomposites from its retained per-channel store — nothing is
+    re-read and nothing is re-projected.
+    """
+
+    _STEPS = 1000                 # slider resolution; mapped onto [0, dmax] of the store dtype
+
+    def __init__(self, labels, colors: np.ndarray, overview: PlateOverview):
+        super().__init__()
+        self._overview = overview
+        self._dmax = overview._contrast.dmax if overview._contrast is not None else 65535.0
+        self._rows = []           # per channel: (checkbox, low slider, high slider)
+        self.setStyleSheet(f"background:{_BG};")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 5, 12, 6)
+        lay.setSpacing(3)
+        wins = overview.channel_windows()
+        for c_i, label in enumerate(labels):
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            dot = QLabel("\u25cf")   # the channel's own LUT color, so the strip reads as a legend too
+            dot.setStyleSheet("color:rgb({});".format(",".join(str(int(v * 255)) for v in colors[c_i])))
+            box = QCheckBox(str(label))
+            box.setChecked(True)
+            box.setStyleSheet(_CHECK_QSS)
+            box.toggled.connect(lambda on, i=c_i: self._overview.set_channel_visible(i, on))
+            lo, hi = wins[c_i] if wins else (0.0, self._dmax)
+            s_lo, s_hi = self._slider(lo), self._slider(hi)
+            s_lo.valueChanged.connect(lambda _v, i=c_i: self._push(i))
+            s_hi.valueChanged.connect(lambda _v, i=c_i: self._push(i))
+            auto = QPushButton("auto")
+            auto.setStyleSheet(_BTN_QSS)
+            auto.setToolTip("drop this channel's manual window and follow the running global one")
+            auto.clicked.connect(lambda _=False, i=c_i: self._auto(i))
+            row.addWidget(dot)
+            row.addWidget(box)
+            row.addStretch(1)
+            row.addWidget(s_lo)
+            row.addWidget(s_hi)
+            row.addWidget(auto)
+            lay.addLayout(row)
+            self._rows.append((box, s_lo, s_hi))
+
+    def _slider(self, value: float) -> QSlider:
+        s = QSlider(Qt.Horizontal)
+        s.setRange(0, self._STEPS)
+        s.setFixedWidth(90)
+        s.setValue(int(np.clip(value / self._dmax * self._STEPS, 0, self._STEPS)))
+        return s
+
+    def _push(self, ch: int):
+        """A slider moved -> re-window that channel (and latch it manual)."""
+        _, s_lo, s_hi = self._rows[ch]
+        lo, hi = sorted((s_lo.value(), s_hi.value()))   # either handle may be dragged past the other
+        self._overview.set_channel_window(ch, lo / self._STEPS * self._dmax,
+                                          hi / self._STEPS * self._dmax)
+
+    def _auto(self, ch: int):
+        """Unlatch the channel and snap its sliders back onto the running window."""
+        self._overview.set_channel_auto(ch)
+        lo, hi = self._overview.channel_windows()[ch]
+        _, s_lo, s_hi = self._rows[ch]
+        for s, v in ((s_lo, lo), (s_hi, hi)):
+            s.blockSignals(True)                        # a snap-back must not re-latch it manual
+            s.setValue(int(np.clip(v / self._dmax * self._STEPS, 0, self._STEPS)))
+            s.blockSignals(False)
+
+
 # --- operator worker: stream a projection over the plate, fill row-major -------------------
 
 class _OperatorWorker(QThread):
     """Runs an operator (MIP) over the plate AND persists it as a navigable multiscale OME-Zarr plate
     (``write_plate``), filling one thumbnail per well as each is written. Projection + pyramid write
     run in write_plate's bounded producer/writer pools; our ``_on_well`` renders the plate tile and
-    is called FROM THOSE WRITER THREADS, several at once — so the shared running-contrast, the ``_raw``
-    tile store, and the done-counter are guarded by ``_lock`` (the expensive per-channel downsample
-    happens OUTSIDE the lock, so downsampling still parallelises). Memory stays O(engine + write
-    workers) wells in flight plus one 88x88xC native-dtype tile per well retained in ``_raw`` for the
-    final montage. The written ``plate.ome.zarr`` is the durable, re-openable artifact.
+    is called FROM THOSE WRITER THREADS, several at once — so only the done-counter needs ``_lock``
+    (the expensive per-channel downsample happens OUTSIDE it, so downsampling still parallelises).
+    The worker is deliberately THIN: it emits one native-dtype tile per FIELD — the whole 88x88 cell
+    for a single-FOV well, or just that FOV's sub-cell box for a mosaic (IMA-187) — and keeps no
+    pixels of its own. PlateOverview owns the per-channel store, the contrast and the compositing,
+    so the channel toggle works on every entry path, not only after a run. Memory stays O(engine +
+    write workers) wells in flight. The written ``plate.ome.zarr`` is the durable, re-openable artifact.
     """
 
-    tileReady = pyqtSignal(int, int, str, object)   # (row_index, col_index, well_id, rgb tile)
+    tileReady = pyqtSignal(int, int, str, object, object)   # (ri, ci, well_id, (C,h,w) native tile,
+    #                                                          box=(top,left,h,w) in cell px | None)
     progress = pyqtSignal(int, int)                 # (done, total)
-    finalReady = pyqtSignal(object)                 # final global-contrast montage (H, W, 3) uint8
+    streamEnded = pyqtSignal()                      # every well landed -> recomposite the whole plate
     writtenReady = pyqtSignal(str)                  # path of the written plate.ome.zarr
     wellFailed = pyqtSignal(int, int)               # (ri, ci) of a well SKIPPED on a read error
     pushReady = pyqtSignal(int, object)             # (fov_idx, [per-channel ~512px plane]) for the slider
     failed = pyqtSignal(str)                        # whole-run failure (not a per-well skip)
     finished_ok = pyqtSignal()
 
-    def __init__(self, operator: str, reader, meta, fov_index: dict, nr: int, nc: int, out_dir: str,
+    def __init__(self, operator: str, reader, meta, fov_index: dict, out_dir: str,
                  regions=None, save: bool = True, n_fovs=1):
+        # No nr/nc: the worker no longer builds a plate-sized montage of its own (IMA-206 moved the
+        # canvas into PlateOverview), so it has no use for the plate's shape.
         super().__init__()
         self._operator = operator
         self._reader, self._meta = reader, meta
-        self._fov_index, self._nr, self._nc = fov_index, nr, nc
+        self._fov_index = fov_index
         self._out_dir = out_dir
         self._regions = regions          # None = whole plate; a list = subset preview (those wells only)
         self._save = save                # False = PREVIEW: compute + push to the viewer, write NOTHING
@@ -1093,11 +1367,8 @@ class _OperatorWorker(QThread):
         self._boxes = _mosaic_boxes(meta) if n_fovs != 1 else {}
         self._total = len(regions) if regions is not None else len(meta["regions"])
         self._channels = [c["name"] for c in meta["channels"]]
-        self._colors = np.stack([_hex_to_rgb01(c["display_color"]) for c in meta["channels"]])
         self._dtype = np.dtype(meta["dtype"])
-        self._contrast = _RunningContrast(len(self._channels), float(np.iinfo(self._dtype).max))
-        self._raw: dict[tuple, np.ndarray] = {}   # (ri,ci) -> (C, _CELL, _CELL) tiles, for the final montage
-        self._lock = threading.Lock()             # guards _contrast/_raw/_done (on_well runs on writer threads)
+        self._lock = threading.Lock()             # guards _done (on_well runs on writer threads)
         self._done = 0
         self._seen_fovs: dict[tuple, set] = {}    # (ri,ci) -> FOVs composited so far, for progress
         self._stop = threading.Event()            # set by the window to end the run cleanly
@@ -1131,39 +1402,27 @@ class _OperatorWorker(QThread):
         box = self._boxes.get((region, fov))
         n_c = len(self._channels)
 
-        # Downsample OUTSIDE the lock (the expensive part stays parallel).
+        # Downsample OUTSIDE the lock (the expensive part stays parallel). Single-FOV fills the
+        # whole cell; a mosaic FOV is fitted to its own sub-cell box and carries that box along,
+        # so the widget can slot it in at the right offset without knowing the geometry.
         if box is None:
             tiles = [_fit_cell(well[c_i]) for c_i in range(n_c)]
+            bh = bw = _CELL
         else:
             top, left, bh, bw = box
             tiles = [_fit_box(well[c_i], bh, bw) for c_i in range(n_c)]
-
-        rgb = np.zeros((_CELL, _CELL, 3), np.float32)
-        with self._lock:                          # shared contrast/raw/counter -> serialize (cheap part)
-            raw = self._raw.get((ri, ci))
-            if raw is None:
-                # Zero-filled: un-covered cell area (mosaic margins, gaps between FOVs) stays
-                # background rather than showing whatever the previous well left behind.
-                raw = np.zeros((n_c, _CELL, _CELL), self._dtype)
-                self._raw[(ri, ci)] = raw
-            for c_i, ds in enumerate(tiles):
-                if box is None:
-                    raw[c_i] = ds
-                else:
-                    # Later FOVs win in the ~9% overlap seam. Deterministic because
-                    # write order is per-(region, fov) and each box is fixed up front.
-                    raw[c_i][top:top + bh, left:left + bw] = ds
-                self._contrast.add(c_i, ds)
-            for c_i in range(n_c):
-                lo, hi = self._contrast.window(c_i)
-                rgb += _window(raw[c_i], lo, hi)[:, :, None] * self._colors[c_i][None, None, :]
+        raw = np.empty((n_c, bh, bw), self._dtype)   # native dtype (half the RAM)
+        for c_i, ds in enumerate(tiles):
+            raw[c_i] = ds
+        with self._lock:                          # shared counter -> serialize (the cheap part)
             seen = self._seen_fovs.setdefault((ri, ci), set())
             was_empty = not seen
             seen.add(fov)
             if was_empty:                          # count WELLS, not fields, so the bar still
                 self._done += 1                    # reads "n of n wells" on a 36-FOV plate
             done = self._done
-        self.tileReady.emit(ri, ci, well_id, (np.clip(rgb, 0, 1) * 255).astype(np.uint8))
+        # per-channel + its box; the widget windows, places and composites (IMA-206 + IMA-187)
+        self.tileReady.emit(ri, ci, well_id, raw, box)
         self.progress.emit(done, self._total)
         # feed the ndviewer growing slider: one ~512px plane per channel, in memory (register_array),
         # so scrubbing the processed wells is instant and z-collapsed (nz=1). Downsampled -> bounded.
@@ -1189,7 +1448,7 @@ class _OperatorWorker(QThread):
                             stop=self._stop.is_set, on_error=self._on_error, regions=self._regions)
                 if self._stop.is_set():
                     return  # window closing / re-opening; drop out cleanly (no final/written emit)
-                self.finalReady.emit(self._final_montage())
+                self.streamEnded.emit()
                 self.writtenReady.emit(str(Path(self._out_dir) / "plate.ome.zarr"))
             else:
                 # PREVIEW: run the engine over the subset and push each result to the plate + slider,
@@ -1211,42 +1470,31 @@ class _OperatorWorker(QThread):
                         close()
                 if self._stop.is_set():
                     return
-                self.finalReady.emit(self._final_montage())
+                self.streamEnded.emit()
             self.finished_ok.emit()
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
-
-    def _final_montage(self) -> np.ndarray:
-        wins = [self._contrast.window(ch) for ch in range(len(self._channels))]
-        canvas = np.zeros((self._nr * _CELL, self._nc * _CELL, 3), np.float32)
-        for (ri, ci), raw in self._raw.items():
-            y0, x0 = ri * _CELL, ci * _CELL
-            for ch in range(raw.shape[0]):
-                lo, hi = wins[ch]
-                canvas[y0:y0 + _CELL, x0:x0 + _CELL] += _window(raw[ch], lo, hi)[:, :, None] * self._colors[ch][None, None, :]
-        # clip/scale IN PLACE — avoids 3 grid-sized float32 copies (a ~430 MB transient on a 1536wp)
-        np.clip(canvas, 0, 1, out=canvas)
-        canvas *= 255
-        return canvas.astype(np.uint8)
 
 
 class _PreviewWorker(QThread):
     """Fast RAW preview so the plate shows imagery the moment it opens — before any operator runs
     (the "downsample the plate before opening" step). Reads ONE representative z-plane per channel
-    per well (not the whole stack), area-downsamples, and composites by display colour. Cheap
-    relative to a full projection; parallel reads; one well's planes at a time. Status stays 'empty'
-    (grey frame) — this is a preview, not a processed result. A later operator overwrites each tile.
+    per well (not the whole stack), area-downsamples, and hands the per-channel tile to the plate.
+    Cheap relative to a full projection; parallel reads; one well's planes at a time. Status stays
+    'empty' (grey frame) — this is a preview, not a processed result. A later operator overwrites
+    each tile. Like the other producers it keeps the CHANNEL AXIS intact all the way to the widget,
+    so the channel toggle works on a freshly-opened acquisition, before any operator has run.
     """
 
-    tileReady = pyqtSignal(int, int, str, object)   # (row_index, col_index, well_id, rgb tile)
+    tileReady = pyqtSignal(int, int, str, object)   # (ri, ci, well_id, (C, cell, cell) native tile)
+    streamEnded = pyqtSignal()                      # preview complete -> recomposite the whole plate
 
     def __init__(self, reader, meta, fov_index: dict, order: list):
         super().__init__()
         self._reader, self._meta = reader, meta
         self._fov_index, self._order = fov_index, order
         self._channels = [c["name"] for c in meta["channels"]]
-        self._colors = np.stack([_hex_to_rgb01(c["display_color"]) for c in meta["channels"]])
-        self._contrast = _RunningContrast(len(self._channels), float(np.iinfo(np.dtype(meta["dtype"])).max))
+        self._dtype = np.dtype(meta["dtype"])
         self._stop = threading.Event()
 
     def stop(self):
@@ -1267,13 +1515,10 @@ class _PreviewWorker(QThread):
                 for region, tiles in ex.map(load, self._order):   # row-major order preserved
                     if self._stop.is_set():
                         return
-                    rgb = np.zeros((_CELL, _CELL, 3), np.float32)
-                    for c_i, ds in enumerate(tiles):
-                        self._contrast.add(c_i, ds)
-                        lo, hi = self._contrast.window(c_i)
-                        rgb += _window(ds, lo, hi)[:, :, None] * self._colors[c_i][None, None, :]
                     ri, ci = self._fov_index[region]["rc"]
-                    self.tileReady.emit(ri, ci, region, (np.clip(rgb, 0, 1) * 255).astype(np.uint8))
+                    self.tileReady.emit(ri, ci, region, np.stack(tiles).astype(self._dtype))
+            if not self._stop.is_set():
+                self.streamEnded.emit()   # the running window is mature now -> one clean recomposite
         except Exception:
             pass   # preview is best-effort; the operator run is the authoritative result
 
@@ -1283,19 +1528,22 @@ class _ComputedPlateWorker(QThread):
 
     Streams each well from disk: a coarse pyramid level -> the plate thumbnail, and a ~512px level ->
     the ndviewer slider (register_array). Bounded (one well in flight); reads via tensorstore off the
-    GUI thread so opening a big computed plate never freezes the window."""
+    GUI thread so opening a big computed plate never freezes the window. Emits per-channel tiles, so
+    a reopened plate is windowed GLOBALLY by the widget's running contrast exactly like a live run —
+    it used to take percentiles per well, which made a dim well and a bright well look identical and
+    silently broke the one thing a plate overview is for (comparing wells at a glance)."""
 
-    tileReady = pyqtSignal(int, int, str, object)   # (ri, ci, well_id, rgb tile)
+    tileReady = pyqtSignal(int, int, str, object)   # (ri, ci, well_id, (C, cell, cell) native tile)
     pushReady = pyqtSignal(int, object)             # (fov_idx, [per-channel ~512px plane])
     progress = pyqtSignal(int, int)
+    streamEnded = pyqtSignal()                      # plate fully loaded -> recomposite globally
     finished_ok = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def __init__(self, base, wells, colors, coarse_lvl, push_lvl, dtype):
+    def __init__(self, base, wells, coarse_lvl, push_lvl, dtype):
         super().__init__()
         self._base = base                 # plate.ome.zarr path
         self._wells = wells               # [(well_id, wellpath, fov, ri, ci, flat_idx)]
-        self._colors = colors             # (C, 3) float RGB
         self._coarse, self._push = coarse_lvl, push_lvl
         self._dtype = dtype
         self._stop = threading.Event()
@@ -1316,18 +1564,15 @@ class _ComputedPlateWorker(QThread):
                 if self._stop.is_set():
                     return
                 coarse = self._read(wpath, fov, self._coarse)             # thumbnail source (C,y,x)
-                rgb = np.zeros((_CELL, _CELL, 3), np.float32)
-                for c_i, plane in enumerate(coarse):
-                    ds = _fit_cell(plane.astype(np.float32))
-                    lo, hi = float(np.percentile(ds, 1.0)), float(np.percentile(ds, 99.8))
-                    rgb += _window(ds, lo, hi if hi > lo else lo + 1)[:, :, None] * self._colors[c_i][None, None, :]
-                self.tileReady.emit(ri, ci, wid, (np.clip(rgb, 0, 1) * 255).astype(np.uint8))
+                tile = np.stack([_fit_cell(plane.astype(np.float32)) for plane in coarse])
+                self.tileReady.emit(ri, ci, wid, tile.astype(self._dtype))
                 push_src = self._read(wpath, fov, self._push)             # detail-slider source (C,Y,X)
                 push = [_area_downsample(push_src[c], _PUSH_PX, _PUSH_PX).astype(self._dtype)
                         for c in range(push_src.shape[0])]
                 self.pushReady.emit(idx, push)
                 self.progress.emit(i, n)
             if not self._stop.is_set():
+                self.streamEnded.emit()   # every well in the store -> one global-window recomposite
                 self.finished_ok.emit()
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -1349,7 +1594,7 @@ class PlateWindow(QMainWindow):
         self._fov_index = {}
         self._selected_regions = []   # wells picked on the plate (IMA-221); scopes an operator run
         self._pushed = set()          # wells whose raw z-stack is already registered in the detail viewer
-        self._final_arr = None        # keep the final montage array alive for its QImage
+        self._channel_bar = None      # per-channel toggle + contrast strip under the plate (IMA-206)
 
         # File menu: a reliable "Open acquisition folder" (drag-drop can be blocked on Windows by the
         # GL child pane or an elevation mismatch, so this is the always-works path).
@@ -1901,12 +2146,15 @@ class PlateWindow(QMainWindow):
         self._selected_regions = []   # wells picked on the plate (IMA-221); scopes an operator run
         self._pushed = set()
         self._current_well = None
-        self._final_arr = None
         self._enable_operators(False)
         if self._overview is not None:
             self._overview.setParent(None)
             self._overview.deleteLater()
             self._overview = None
+        if self._channel_bar is not None:     # its channels belong to the plate we just dropped
+            self._channel_bar.setParent(None)
+            self._channel_bar.deleteLater()
+            self._channel_bar = None
         self._readout.setText("scanning acquisition …")
         QApplication.processEvents()
         try:
@@ -1985,6 +2233,7 @@ class PlateWindow(QMainWindow):
         self._refresh_layers_tab()
         self._drop.hide()
         self._left_l.addWidget(self._overview, 1)   # fills the pane and self-fits — no scrollbars
+        self._install_channel_bar(meta["channels"], meta["dtype"])
 
         self._setup_raw_detail()
 
@@ -1994,6 +2243,7 @@ class PlateWindow(QMainWindow):
         # in the SAME row-major order the operator will later process them in.
         self._preview = _PreviewWorker(reader, meta, self._fov_index, order)
         self._preview.tileReady.connect(self._on_preview_tile)
+        self._preview.streamEnded.connect(lambda: self._recomposite("raw"))
         self._preview.start()   # (the detail already landed on order[0] via _setup_raw_detail)
         # top-left = LIVE STATUS (what's happening / what's shown); the plate name is the pane title
         # Multi-FOV policy (IMA-187): an operator run processes EVERY FOV and composites them into
@@ -2053,6 +2303,7 @@ class PlateWindow(QMainWindow):
         self._stop_preview()
         self._preview = _PreviewWorker(self._reader, self._meta, self._fov_index, self._order)
         self._preview.tileReady.connect(self._on_preview_tile)
+        self._preview.streamEnded.connect(lambda: self._recomposite("raw"))
         self._preview.start()
         self._readout.setText("raw view")
 
@@ -2122,18 +2373,18 @@ class PlateWindow(QMainWindow):
         self._refresh_layers_tab()
         self._drop.hide()
         self._left_l.addWidget(self._overview, 1)
+        self._install_channel_bar(channels, np.uint16)
         self._enable_operators(False)             # no raw data -> operators stay disabled
 
         if self._detail is not None:
             self._detail.start_acquisition([c["name"] for c in channels], 1, _PUSH_PX, _PUSH_PX,
                                            [f"{w}:0" for w in self._order])
-        colors = np.stack([_hex_to_rgb01(c["display_color"]) for c in channels])
         coarse_lvl = levels[-1]                                   # coarsest -> tiny thumbnail
         push_lvl = levels[min(3, len(levels) - 1)]                # ~512px level for the detail slider
-        self._worker = _ComputedPlateWorker(str(zroot), worker_wells, colors, coarse_lvl, push_lvl,
-                                            np.uint16)
+        self._worker = _ComputedPlateWorker(str(zroot), worker_wells, coarse_lvl, push_lvl, np.uint16)
         self._worker.tileReady.connect(self._on_tile)
         self._worker.pushReady.connect(self._on_push)
+        self._worker.streamEnded.connect(lambda: self._recomposite("computed"))
         self._worker.progress.connect(
             lambda i, n: self._readout.setText(f"loading computed plate — {i}/{n} wells"))
         self._worker.failed.connect(self._on_failed)
@@ -2206,16 +2457,19 @@ class PlateWindow(QMainWindow):
         # the whole feature not rendering. The overview then adopts the worker's boxes so a
         # double-click on a mosaic cell resolves the FOV under the cursor instead of always 0.
         self._worker = _OperatorWorker(key, self._reader, self._meta, self._fov_index,
-                                       self._overview._nr, self._overview._nc,
                                        str(out_dir) if out_dir else "", regions=regions, save=save,
                                        n_fovs=None)
         self._overview.set_mosaic_boxes(self._worker.mosaic_boxes)
+        # A re-run must not composite on top of the LAST run's pixels: with a mosaic, a run that
+        # lands fewer FOVs would otherwise leave the previous run's fields standing in the same
+        # cell, blended into the new ones. Drop this layer's store before the first tile arrives.
+        self._overview.reset_layer(key)
         dest = f" → {out_dir.name}" if save else " (preview — not saved)"
         self._worker.tileReady.connect(self._on_tile)
         self._worker.pushReady.connect(self._on_push)
         self._worker.progress.connect(
             lambda d, t: self._readout.setText(f"● {label} · {d}/{t} wells{dest}"))
-        self._worker.finalReady.connect(self._set_final)
+        self._worker.streamEnded.connect(lambda k=key: self._recomposite(k))
         self._worker.writtenReady.connect(self._on_written)
         self._worker.wellFailed.connect(                     # a skipped well -> red x, run continues
             lambda ri, ci: self._overview.set_status(ri, ci, "failed") if self._overview else None)
@@ -2257,14 +2511,16 @@ class PlateWindow(QMainWindow):
         """The operator finished persisting: remember the written plate (re-openable artifact)."""
         self._processed_plate = plate_path
 
-    def _on_preview_tile(self, ri, ci, well_id, rgb):
+    def _on_preview_tile(self, ri, ci, well_id, tile):
         if self._overview is not None:                       # raw preview fills the base ("raw") layer
-            self._overview.add_tile(ri, ci, well_id, rgb, layer="raw")
+            self._overview.add_tile(ri, ci, well_id, tile, layer="raw")
 
-    def _on_tile(self, ri, ci, well_id, rgb):
+    def _on_tile(self, ri, ci, well_id, tile, box=None):
+        """A field landed. ``box`` is None for the single-tile producers (_ComputedPlateWorker emits
+        a 4-arg signal, which PyQt matches against this default) and a sub-cell box for a mosaic."""
         if self._overview is None:
             return
-        self._overview.add_tile(ri, ci, well_id, rgb, layer=self._active_op_key or "raw")
+        self._overview.add_tile(ri, ci, well_id, tile, layer=self._active_op_key or "raw", box=box)
         self._overview.set_status(ri, ci, "done")           # blue
 
     def _on_push(self, fov_idx, planes):
@@ -2286,13 +2542,29 @@ class PlateWindow(QMainWindow):
                     self._overview.set_status(*rc, "failed")  # red x on wells that didn't finish
         self._readout.setText(f"failed: {msg}")
 
-    def _set_final(self, rgb):
+    def _recomposite(self, layer: str):
+        """End of a producer's stream: rebuild that layer once at full resolution, now that the
+        running global window has seen every well (early wells were windowed by a young histogram)."""
+        if self._overview is not None:
+            self._overview.recomposite(layer)
+
+    def _install_channel_bar(self, channels, dtype):
+        """Declare the plate's channel axis and (re)build the per-channel toggle/contrast strip.
+
+        Colors are the RESOLVED ``display_color`` — resolve_channels already applied the precedence
+        (the acquisition's YAML first, the wavelength fallback map second), so the plate is tinted
+        exactly like every other compositing site.
+        """
         if self._overview is None:
             return
-        self._final_arr = np.ascontiguousarray(rgb)
-        h, w, _ = self._final_arr.shape
-        self._overview.set_final(QImage(self._final_arr.data, w, h, 3 * w, QImage.Format_RGB888),
-                                 layer=self._active_op_key or "raw")
+        colors = np.stack([_hex_to_rgb01(c["display_color"]) for c in channels])
+        self._overview.set_channels([c.get("display_name") or c["name"] for c in channels],
+                                    colors, dtype)
+        if self._channel_bar is not None:
+            self._channel_bar.setParent(None)
+            self._channel_bar.deleteLater()
+        self._channel_bar = _ChannelBar(self._overview._labels, colors, self._overview)
+        self._left_l.addWidget(self._channel_bar)   # sits UNDER the plate, in the same pane
 
     # -- navigation links --
     # -- selection (IMA-221): the widget picks wells, THIS window knows what a well contains ----
@@ -2401,7 +2673,7 @@ class PlateWindow(QMainWindow):
         alive until it actually finishes (stop() returns after the current item, which is bounded)."""
         if w is None:
             return
-        for name in ("tileReady", "progress", "finalReady", "writtenReady", "wellFailed", "pushReady", "failed", "finished_ok"):
+        for name in ("tileReady", "progress", "streamEnded", "writtenReady", "wellFailed", "pushReady", "failed", "finished_ok"):
             sig = getattr(w, name, None)
             if sig is not None:
                 try:
