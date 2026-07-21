@@ -1020,11 +1020,17 @@ class PlateOverview(QWidget):
         """Forget a layer entirely and FREE its canvas (IMA-205: an exploration tab's layers die
         with the tab). ``_canvas_for`` lazily allocates a full plate-sized RGB888 image per layer
         (nc*_CELL x nr*_CELL — tens of MB on a 1536wp), so without this a closed tab's montage
-        stays resident forever. Falls back to the base layer if the dropped one was showing."""
+        stays resident forever. Falls back to the base layer if the dropped one was showing.
+
+        The per-channel STORE (IMA-206) is the bigger half — ~95 MB of retained (C, H, W) pixels
+        per layer — so it goes too. Dropping the canvas while the store survived would look like a
+        fix and leak the majority of the memory."""
         if layer == "raw":
             return
         self._op_canvas.pop(layer, None)
         self._op_final.pop(layer, None)
+        self._store.pop(layer, None)
+        self._final_arr.pop(layer, None)
         self._tiles_by_layer.pop(layer, None)
         self._tiles = set().union(*self._tiles_by_layer.values()) if self._tiles_by_layer else set()
         if self._active == layer:
@@ -2918,13 +2924,16 @@ class PlateWindow(QMainWindow):
         # A re-run must not composite on top of the LAST run's pixels: with a mosaic, a run that
         # lands fewer FOVs would otherwise leave the previous run's fields standing in the same
         # cell, blended into the new ones. Drop this layer's store before the first tile arrives.
-        self._overview.reset_layer(key)
+        # ...keyed by the LAYER, not the bare operator key: an exploration tab files its results
+        # under "<op>@<tab_key>" (IMA-205), and resetting "mip" from a tab run would wipe the
+        # plate-wide layer instead of the tab's own.
+        self._overview.reset_layer(layer_key)
         dest = f" → {out_dir.name}" if save else " (preview — not saved)"
         self._worker.tileReady.connect(self._on_tile)
         self._worker.pushReady.connect(self._on_push)
         self._worker.progress.connect(
             lambda d, t: self._readout.setText(f"● {label} · {d}/{t} wells{dest}"))
-        self._worker.streamEnded.connect(lambda k=key: self._recomposite(k))
+        self._worker.streamEnded.connect(lambda k=layer_key: self._recomposite(k))
         self._worker.writtenReady.connect(self._on_written)
         self._worker.wellFailed.connect(                     # a skipped well -> red x, run continues
             lambda ri, ci: self._overview.set_status(ri, ci, "failed") if self._overview else None)

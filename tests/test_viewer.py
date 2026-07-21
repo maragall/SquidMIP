@@ -1150,6 +1150,8 @@ def test_closing_tab_mid_run_stops_worker_and_frees_canvas(qapp, stub_detail, sq
     assert layer not in {ly.key for ly in win._op_stack.layers()}   # layer dropped
     assert layer not in win._overview._op_canvas                    # ~plate-sized canvas freed
     assert layer not in win._overview._op_final
+    assert layer not in win._overview._store                        # ...and the ~95 MB per-channel
+    assert layer not in win._overview._final_arr                    #    store with it (IMA-206)
     assert win._active_op_key is None
     win.close()
 
@@ -1530,6 +1532,7 @@ class _BlockingWorker(V.QThread):
     wellFailed = V.pyqtSignal(int, int)
     failed = V.pyqtSignal(str)
     finished_ok = V.pyqtSignal()
+    streamEnded = V.pyqtSignal()
 
     def __init__(self, *a, **kw):
         super().__init__()
