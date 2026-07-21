@@ -58,8 +58,20 @@ def load_acquisition_metadata(root) -> dict:
     time_series = _section("time_series")
     sample = _section("sample")
     delta_z_mm = z_stack.get("delta_z_mm")
+    # Objective description (IMA-263). The loupe reports what you are looking THROUGH, so both of
+    # these are read straight from the yaml and are None when it does not carry them -- never
+    # recomputed, never defaulted. `na` is accepted under either of the two spellings Squid's
+    # objective tables use. Note that acquisition.yaml is the ONLY supported source: the legacy
+    # flat "acquisition parameters.json" does carry objective.NA on some older datasets (the 10x
+    # tissue set among them) but is deliberately not read (see the module docstring), so on those
+    # acquisitions NA is genuinely absent and every consumer must SAY SO rather than invent it.
+    na = objective.get("na")
+    if na is None:
+        na = objective.get("numerical_aperture")
     return {
         "pixel_size_um": objective.get("pixel_size_um"),  # authoritative, binning-aware
+        "objective_magnification": objective.get("magnification"),
+        "objective_na": na,
         "n_z_declared": z_stack.get("nz"),
         "dz_um": delta_z_mm * 1000 if delta_z_mm is not None else None,
         "n_t_declared": time_series.get("nt"),

@@ -995,6 +995,51 @@ def loupe_clamp_crop(y0: int, x0: int, h: int, w: int, ny: int, nx: int):
     return max(0, min(int(y0), ny - h)), max(0, min(int(x0), nx - w)), h, w
 
 
+# Overlay legibility (IMA-263). The project's floor is 16 arcmin, optimal 20 arcmin, which it
+# fixes at 17.3 px at 60 cm and 28.8 px at 1 m. 18 px is the next whole pixel above the 60 cm
+# floor. Not 22 px (20 arcmin at 60 cm) and not 29 px (20 arcmin at 1 m): the inset is 240 px
+# square, and the readout is four lines, so at 29 px it would cover half of the very pixels it is
+# describing. 18 px costs 72 px of a 240 px inset (30%) and clears the "information, not
+# decoration" bar at the distance a bench microscope is actually driven from.
+_LOUPE_FONT_PX = 18
+_LOUPE_ABSENT = "not recorded"      # ONE spelling of "nobody wrote this down", everywhere
+
+
+def loupe_readout(pixel_size_um, magnification, na, s_loupe: float) -> list:
+    """The scale facts the loupe prints, as ``[(label, value)]``. Pure, so it is testable.
+
+    Answers Julio's two questions -- "what's going to be the subject magnification size? What is
+    the pixel size when you look at this subject?" -- and keeps the two pixel sizes APART, which
+    is the whole difference between a good and a bad loupe:
+
+    ``subject``  micrometres per IMAGE pixel: how big a feature really is on the specimen. A
+                 property of the objective and the camera, and it does not move when you zoom.
+    ``screen``   micrometres per SCREEN pixel inside the inset at the CURRENT zoom. This one does
+                 move, and it is the number that says how much you are actually magnifying.
+
+    Every value that was never recorded comes back as "not recorded" rather than a plausible
+    default. The 10x tissue set is exactly this case for NA: acquisition.yaml carries
+    magnification but no NA (the 0.3 lives only in the legacy JSON that _acquisition.py
+    deliberately does not read), so the loupe SAYS it does not know instead of printing 0.30.
+    """
+    def _num(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if np.isfinite(f) and f > 0 else None
+
+    mag, na_v, px = _num(magnification), _num(na), _num(pixel_size_um)
+    obj = f"{mag:g}x" if mag is not None else _LOUPE_ABSENT
+    obj += f" / NA {na_v:.2f}" if na_v is not None else f" / NA {_LOUPE_ABSENT}"
+    um_screen = loupe_um_per_screen_px(px, s_loupe)
+    return [
+        ("objective", obj),
+        ("subject", f"{px:g} um/px" if px is not None else _LOUPE_ABSENT),
+        ("screen", f"{um_screen:.3g} um/px" if um_screen is not None else _LOUPE_ABSENT),
+    ]
+
+
 def loupe_um_per_screen_px(pixel_size_um, s_loupe: float):
     """µm per SCREEN pixel inside the inset, or None when the pixel size isn't trustworthy.
 
@@ -1063,6 +1108,12 @@ class _LoupeSource:
     n_levels = 1
     well_px = 1
     pixel_size_um = None
+    # The objective this acquisition was taken through (IMA-263). None means NOT RECORDED, and
+    # every consumer must render it as such -- the loupe says "not recorded", never a plausible
+    # default. Declared on the base so every source answers the question, including the ones
+    # whose format cannot carry it.
+    objective_magnification = None
+    objective_na = None
 
     def available(self, well_id) -> tuple[bool, str]:
         """(ok, reason-if-not). ``reason`` is shown to the user verbatim."""
@@ -1111,6 +1162,8 @@ class _RawLoupeSource(_LoupeSource):
         self.well_px = int(min(ny, nx))
         self.n_levels = 1                      # raw TIFFs have no pyramid ON DISK
         self.pixel_size_um = meta.get("pixel_size_um")
+        self.objective_magnification = meta.get("objective_magnification")
+        self.objective_na = meta.get("objective_na")
         self._channels = [c["name"] for c in meta["channels"]]
         zs = meta["z_levels"]
         self._z = zs[len(zs) // 2]             # mid plane, as the preview does
@@ -1157,6 +1210,19 @@ class _RawLoupeSource(_LoupeSource):
         if step == 1:
             return crop
         oh, ow = max(1, h // step), max(1, w // step)
+        # STRIDE FIRST, then area-average the remainder (IMA-262). Area-averaging the whole crop
+        # casts every full-size plane to float32 before reducing it -- 2084x2084 x 4 channels is
+        # 17 MB per channel and measured 100 ms, which is the 116 ms IMA-208 removed, back again.
+        # It was latent until IMA-262 drew the carrier at its true footprint: that shrinks a cell
+        # from 135 to 23 screen px, which drops s_loupe onto the fill_well floor and makes the
+        # requested crop the WHOLE field instead of a 463 px window.
+        #
+        # Striding to 2x the target and averaging that down keeps the anti-aliasing the inset
+        # wants at 1/16th the work (a 520 px intermediate, not 2084). Pure striding is what
+        # _ZarrLoupeSource does, because there the stride shrinks the I/O itself; here the plane
+        # is already decoded in RAM, so the extra 2x average is nearly free and strictly better.
+        pre = max(1, step // 2)
+        crop = crop[:, ::pre, ::pre]
         # float32, not _area_downsample's float64 default: the compositor casts to float32 anyway,
         # and this array crosses a thread boundary and sits in the worker's LRU.
         return np.stack([_area_downsample(crop[c], oh, ow).astype(np.float32, copy=False)
@@ -1182,13 +1248,16 @@ class _ZarrLoupeSource(_LoupeSource):
     the loupe works on completed wells DURING a long run, and a subset save / failed well is
     reported as "not written yet" instead of magnifying some other well's pixels."""
 
-    def __init__(self, base, path_of, fov_of, levels, well_px, pixel_size_um, written=None):
+    def __init__(self, base, path_of, fov_of, levels, well_px, pixel_size_um, written=None,
+                 objective_magnification=None, objective_na=None):
         self._base = str(base)
         self._path_of, self._fov_of = path_of, fov_of
         self._levels = list(levels) if levels is not None else None   # None -> discover on first use
         self.n_levels = max(1, len(self._levels)) if self._levels else 1
         self.well_px = int(well_px)
         self.pixel_size_um = pixel_size_um
+        self.objective_magnification = objective_magnification
+        self.objective_na = objective_na
         self._written = written                # None = every well (a plate opened from disk)
         self._handles: dict[tuple, object] = {}
         self._coarse: dict[str, np.ndarray] = {}
@@ -4936,7 +5005,9 @@ class PlateWindow(QMainWindow):
             _well_px = _PUSH_PX
         self._set_loupe_source("computed", _ZarrLoupeSource(
             str(zroot), path_of=well_paths.get, fov_of=well_fovs.get,
-            levels=levels, well_px=_well_px, pixel_size_um=px_um, written=None))
+            levels=levels, well_px=_well_px, pixel_size_um=px_um, written=None,
+            objective_magnification=self._meta.get("objective_magnification"),
+            objective_na=self._meta.get("objective_na")))
         coarse_lvl = levels[-1]                                   # coarsest -> tiny thumbnail
         push_lvl = levels[min(3, len(levels) - 1)]                # ~512px level for the detail slider
         self._worker = _ComputedPlateWorker(str(zroot), worker_wells, coarse_lvl, push_lvl, np.uint16)
@@ -5063,6 +5134,8 @@ class PlateWindow(QMainWindow):
                 fov_of=lambda w: _fov_of_well(w, fovs),
                 levels=None,                                 # discovered from the first written field
                 well_px=min(ny, nx), pixel_size_um=self._meta.get("pixel_size_um"),
+                objective_magnification=self._meta.get("objective_magnification"),
+                objective_na=self._meta.get("objective_na"),
                 written=set()))
         else:
             self._drop_loupe_source(layer_key)

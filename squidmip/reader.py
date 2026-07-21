@@ -658,6 +658,10 @@ class SquidReader:
             "z_levels": z_sorted,
             "dz_um": acq["dz_um"],
             "pixel_size_um": acq["pixel_size_um"],  # authoritative (acquisition.yaml), not recomputed
+            # What the acquisition was taken THROUGH (IMA-263). None when the yaml omits it; the
+            # loupe says so rather than showing a number no one recorded.
+            "objective_magnification": acq["objective_magnification"],
+            "objective_na": acq["objective_na"],
             "wellplate_format": acq["wellplate_format"],
             "frame_shape": tuple(sample.shape),
             "dtype": sample.dtype,
@@ -924,6 +928,9 @@ class SquidMultiPageTiffReader:
             "z_levels": z_sorted,
             "dz_um": acq["dz_um"],
             "pixel_size_um": acq["pixel_size_um"],
+            # The objective this was taken through (IMA-263); None when the yaml omits it.
+            "objective_magnification": acq["objective_magnification"],
+            "objective_na": acq["objective_na"],
             "wellplate_format": acq["wellplate_format"],
             "frame_shape": tuple(sample.shape),
             "dtype": sample.dtype,
@@ -1068,6 +1075,9 @@ class SquidOMEReader:
             "z_levels": list(range(n_z)),
             "dz_um": acq["dz_um"],
             "pixel_size_um": acq["pixel_size_um"],
+            # The objective this was taken through (IMA-263); None when the yaml omits it.
+            "objective_magnification": acq["objective_magnification"],
+            "objective_na": acq["objective_na"],
             "wellplate_format": acq["wellplate_format"],
             "frame_shape": (int(dims.get("Y", sample.shape[-2])), int(dims.get("X", sample.shape[-1]))),
             "dtype": np.dtype(sample.dtype),
@@ -1497,7 +1507,12 @@ class SquidZarrReader:
             "z_levels": list(range(n_z)),
             "dz_um": ms.dz_um,
             "pixel_size_um": ms.pixel_size_um,
-            "wellplate_format": self._wellplate_format(regions),
+            # Always present, always None here (IMA-263): NGFF carries a pixel size but no
+            # objective, and SquidMIP's own writer emits none either. Declaring the keys means
+            # every consumer reads the same contract off every reader and gets an explicit
+            # "not recorded" instead of a KeyError or a stale value from another acquisition.
+            "objective_magnification": None,
+            "objective_na": None,
             "frame_shape": (ms.size(shape, "y", shape[-2]), ms.size(shape, "x", shape[-1])),
             "dtype": dtype,
             "n_t": n_t,
