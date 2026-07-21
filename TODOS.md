@@ -50,3 +50,11 @@ so a future session doesn't rediscover it from zero.
 - **Cons:** Different repo, different owner; not on any SquidMIP critical path.
 - **Context:** SquidMIP does **not** carry this bug — IMA-189's `squidmip/_channels.py` already resolves `display_color` correctly (top-level v1.0+ *and* nested `camera_settings`, mapped by name, raises on unresolved), and IMA-184 consumes `metadata.channels[].display_color` rather than re-parsing the yaml. This TODO is purely a flag for whoever owns `~/CEPHLA/projects/explorer/squid2minerva`.
 - **Depends on / blocked by:** squid2minerva maintainer.
+
+## Raw-contrast preview mode so offset corrections are visible → follow-up after IMA-224
+- **What:** A way to inspect a subset preview without the running auto-contrast, so a uniform additive change (background subtraction) is actually visible on screen.
+- **Why:** The viewer auto-windows contrast (`_RunningContrast`, `_viewer.py:806`). A spatially-uniform offset subtraction is therefore almost invisible in the preview — the display rescales and the image looks the same. That defeats the stated purpose of the subset preview (`_viewer.py:1298`, "test the operator on the first N wells") for exactly the operator class that IMA-224 introduces.
+- **Pros:** Makes the percentile control on IMA-224 verifiable by eye instead of only via the provenance sidecar; also helps IMA-225 flatfield and IMA-223 decon, where the same masking applies to a lesser degree.
+- **Cons:** Needs a considered UI answer (a fixed-window toggle? a pinned display range? a before/after split?) and touches contrast handling used by every path, so it is not a one-liner.
+- **Context:** Surfaced by the IMA-224 /plan-eng-review (2026-07-20) as the one residual failure mode accepted rather than solved. The accepted mitigation is the provenance sidecar (IMA-224 D8): the percentile used is recoverable after the fact, but only after the run. Fixing this converts a post-hoc audit into a live check.
+- **Depends on / blocked by:** IMA-224 landing (so there is a correction whose effect needs seeing); benefits from IMA-225's provenance work.
