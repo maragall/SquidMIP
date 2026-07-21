@@ -43,6 +43,38 @@ so a future session doesn't rediscover it from zero.
 - **Context:** ndviewer_light discovers plates by directory walk and reads array `0` + `omero` only (`ndviewer_light/core.py:1149`, `:1070`). IMA-184's cross commit already proves the plate opens under strict `ome-zarr-py`, so the metadata is spec-valid regardless.
 - **Depends on / blocked by:** IMA-193 design.
 
+## Plane-op (nz=Nz) write + reopen path → IMA-223
+- **What:** Let `write_plate` persist non-z-collapsed output and let the viewer reopen it: relax `_validate_image` (`_output.py:223` raises on `Z>1`), extend `_multiscales` beyond YX-only levels, and fix the reopen path (`_ComputedPlateWorker._read` reads `arr[0,:,0]`; `_open_computed` hardcodes `n_z: 1` and `np.uint16` at `_viewer.py:975/1683/1717`).
+- **Why:** IMA-226 lands the `consumes` contract with a loud gate; the first plane-op (decon/bgsub/flatfield) cannot ship live+persisted until the writer and reopen layers accept `Nz>1`.
+- **Pros:** Unblocks IMA-223/224/225 end-to-end; the gate in 226 flips to a real branch.
+- **Cons:** Touches the IMA-184 writer contract, which ndviewer_light and ome-zarr-py conformance both depend on; needs its own review.
+- **Context:** Found by the IMA-226 eng-review outside voice (2026-07-20): the viewer's five z-collapse sites were mapped, but the save path dies one layer down in `_output.py`. Also undefined: which z becomes the 88px plate thumbnail for a plane-op, and square-forced push downsampling (`_area_downsample(plane, 512, 512)`).
+- **Depends on / blocked by:** IMA-226 (consumes contract); IMA-223 is the natural owner since decon is the first consumer.
+
+## Fov-reducer engine path + geometry seam → IMA-222/IMA-210
+- **What:** `select_fovs` "all FOVs" semantics for ragged counts (`projection.py:200` raises when `n_fovs > len(available)`), a group-by-region-then-reduce engine loop, a geometry-carrying operator seam (stage positions + overlap — a `project(planes)` list cannot express stitch), and a reworked memory contract (Nfov frames in flight per worker breaks the "~139 MB × workers" invariant and `test_engine.py:206`).
+- **Why:** IMA-226's `{fov}` kind is gated with a named raise; stitch cannot be wired until these exist.
+- **Pros:** The consumes taxonomy stops being frozen-on-faith; validated against the first real fov-reducer.
+- **Cons:** The largest remaining chunk of IMA-210; memory feasibility must be measured, not asserted.
+- **Context:** IMA-226 eng review (2026-07-20), outside voice #3/#6/#7. See also the `fov-axis-needs-geometry` learning: model FOVs as `list[{index,position,overlap}]`, not bare indices.
+- **Depends on / blocked by:** IMA-226 (consumes contract); belongs to IMA-210/IMA-222.
+
+## t-axis live streaming (t>0) → with first Nt>1 dataset
+- **What:** `_on_well`/`_on_push` stream only `image[0,...]` / `register_array(0, ...)` — a time-lapse acquisition streams t=0 only.
+- **Why:** Named limitation so "live for any operator" isn't read as "live for any axis"; no current dataset has Nt>1.
+- **Pros:** Honest scope marker; pairs with the existing multi-timepoint TODO below.
+- **Cons:** None now; ahead of demand.
+- **Context:** IMA-226 eng review outside voice #8 (2026-07-20).
+- **Depends on / blocked by:** A real Nt>1 acquisition (same trigger as the multi-timepoint projection TODO).
+
+## Preview-mode slider eviction (save=False) → follow-up after IMA-226
+- **What:** The IMA-226 slider-miss loader reads the written `plate.ome.zarr`; a preview run writes nothing, so evicted preview planes stay irrecoverable past ndviewer_light's 1024-plane LRU (`core.py:1666`).
+- **Why:** Whole-plate previews on large plates would scrub back to blanks; small subset previews (the default, 4 wells) are unaffected.
+- **Pros:** Closing it makes preview and saved runs behave identically at any scale.
+- **Cons:** Needs either a spill-to-temp store or a bounded re-compute path; both are real designs.
+- **Context:** IMA-226 eng review D9 + outside voice #5 (2026-07-20). Interim: limitation documented in the preview UI text.
+- **Depends on / blocked by:** IMA-226's miss-loader hook landing first.
+
 ## Fix upstream squid2minerva/colors.py display_color nesting → external repo
 - **What:** `squid2minerva/colors.py:load_yaml_colors` reads `channel["display_color"]`, but real `acquisition_channels.yaml` nests it under `channel.camera_settings.<cam>.display_color`. Its Minerva OME-TIFF exports only get right colors via the wavelength-fallback map — a custom yaml color is silently ignored.
 - **Why:** Confirmed against a real dataset yaml. It's correct-by-luck today because the fallback palette matches the standard 4 channels; any non-default color drops silently.
