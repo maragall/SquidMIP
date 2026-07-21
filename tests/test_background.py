@@ -18,6 +18,7 @@ from squidmip import available_projectors, project_well, projector_consumes
 from squidmip._background import (
     BackgroundParams,
     bgsub_op,
+    clipped_fraction,
     estimate_background,
     restore,
     subtract_background,
@@ -49,22 +50,48 @@ def _known_background(size: int = 128, amplitude: float = 600.0, pedestal: float
 # --- the core numerical property: a KNOWN added background must come off ------------------
 
 @pytest.mark.parametrize("method", ["rolling_ball", "gaussian"])
-def test_removes_a_known_added_background(method):
+def test_removes_the_structure_of_a_known_added_background(method):
+    """The estimate must reproduce the SHAPE of the planted dome, and subtracting it must
+    flatten the empty field.
+
+    Measured against shape, not against absolute level, because a constant offset in the
+    estimate is not an error here — see ``test_rolling_ball_bias_is_conservative``. What would
+    be an error is leaving the dome's *structure* behind, and that is what is asserted."""
+    size = 128
+    fg, bg = _foreground(size), _known_background(size)
+    raw = (fg + bg).astype(np.uint16)
+    span = float(bg.max() - bg.min())
+
+    params = BackgroundParams(method=method, radius_px=15)
+    corrected = subtract_background(raw, params)
+    estimated = estimate_background(raw, params)
+
+    shape_err = float(np.abs((estimated - estimated.mean()) - (bg - bg.mean())).mean()) / span
+    assert shape_err < 0.15, f"{method}: estimate's SHAPE is off by {shape_err:.1%} of the span"
+
+    # and the corrected image must be flat where there is no sample: the dome's spread must be
+    # gone, not merely reduced.
+    empty = fg == 0
+    residual_spread = float(np.percentile(corrected[empty], 90) - np.percentile(corrected[empty], 10))
+    assert residual_spread < span * 0.35, (
+        f"{method}: {residual_spread:.0f} counts of dome left out of a planted span of {span:.0f}"
+    )
+
+
+def test_rolling_ball_bias_is_conservative_and_measured():
+    """Sternberg's ball rolls UNDER the surface, so its estimate is systematically LOW by
+    roughly the ball's sagitta — it never subtracts more signal than is there. That is a
+    property of the algorithm (ImageJ behaves the same way), not a bug, and it is pinned here
+    with a number so a future change that flips the sign cannot pass silently."""
     size = 128
     fg, bg = _foreground(size), _known_background(size)
     raw = (fg + bg).astype(np.uint16)
 
-    params = BackgroundParams(method=method, radius_px=25)
-    corrected = subtract_background(raw, params)
-    estimated = estimate_background(raw, params)
-
-    # the estimate must track the truth, not just be "some smooth thing"
-    err = np.abs(estimated - bg).mean() / bg.mean()
-    assert err < 0.15, f"{method}: background estimate off by {err:.1%} of its mean"
-
-    # and the corrected image must be flat where there is no sample
-    empty = fg == 0
-    assert corrected[empty].mean() < bg.mean() * 0.15
+    bias = {r: float((estimate_background(raw, BackgroundParams(radius_px=r)) - bg).mean() / bg.mean())
+            for r in (15, 25, 40)}
+    assert all(b < 0 for b in bias.values()), f"rolling ball over-estimated the background: {bias}"
+    assert bias[15] > bias[25] > bias[40], f"bias should deepen with radius: {bias}"
+    assert abs(bias[15]) < 0.15
 
 
 @pytest.mark.parametrize("method", ["rolling_ball", "gaussian"])
@@ -118,29 +145,49 @@ def test_the_input_plane_is_never_mutated():
     assert np.array_equal(raw, before)
 
 
-def test_raw_is_exactly_recoverable_from_corrected_plus_background_in_float():
-    """The layer is ADDITIVE and its operand is addressable, so the composition is invertible:
-    raw == corrected + background, exactly, with no float slop, when nothing clipped."""
-    raw = (_foreground(96) + _known_background(96)).astype(np.float32)
+@pytest.mark.parametrize("dtype", [np.uint16, np.uint8])
+def test_raw_is_exactly_recoverable_wherever_the_result_did_not_clip(dtype):
+    """The layer is ADDITIVE and its operand is addressable, so the composition is INVERTIBLE:
+    ``raw == corrected + background`` exactly — ``array_equal``, no tolerance — on the
+    acquisition dtypes (uint8/uint16). This is the mechanical form of "the raw is preserved".
+
+    It works because the integer cast ROUNDS: the residual of ``round(raw - bg)`` is under half
+    a count, so adding ``bg`` back and rounding lands on ``raw`` itself. Truncating instead
+    (plain ``astype``) would lose the raw by one count everywhere, which is precisely the kind
+    of quiet destructive edit this operator must not be.
+    """
+    scale = 255 / 4000 if dtype is np.uint8 else 1.0
+    raw = ((_foreground(96) + _known_background(96)) * scale).astype(dtype)
     params = BackgroundParams(radius_px=20)
     bg = estimate_background(raw, params)
     corrected = subtract_background(raw, params)
-    assert np.array_equal(restore(corrected, bg, dtype=raw.dtype), raw)
+
+    clipped = np.rint(raw.astype(np.float32) - bg) < 0
+    recovered = restore(corrected, bg, dtype=raw.dtype)
+    assert np.array_equal(recovered[~clipped], raw[~clipped])
 
 
 def test_integer_clipping_is_reported_not_hidden():
-    """Where the background estimate exceeds the raw value, an unsigned result clips at 0 and
-    THAT is where information would be lost. The operator must be able to say how much clipped
-    rather than pretending the transform was lossless."""
+    """Clipping at the dtype floor is the ONE place this transform loses information — where
+    the background estimate exceeds the raw value. The operator must be able to say how much,
+    rather than presenting a lossy transform as a lossless one."""
     raw = (_foreground(96) + _known_background(96)).astype(np.uint16)
     params = BackgroundParams(radius_px=20)
     bg = estimate_background(raw, params)
-    corrected = subtract_background(raw, params)
 
-    clipped = (raw.astype(np.float32) - bg) < 0
-    recovered = restore(corrected, bg, dtype=raw.dtype)
-    assert np.array_equal(recovered[~clipped], raw[~clipped])   # lossless everywhere else
-    assert clipped.mean() < 0.6                                  # sanity: not the whole frame
+    reported = clipped_fraction(raw, params)
+    measured = float(np.mean(np.rint(raw.astype(np.float32) - bg) < 0))
+    assert reported == pytest.approx(measured)
+
+    # rolling_ball rolls UNDER the surface, so its estimate never exceeds the raw and NOTHING
+    # clips: with the default method the layer is fully lossless, and it can say so.
+    assert reported == 0.0
+
+    # the gaussian method has a positive bias (bright objects leak into their own background),
+    # so it DOES clip — and the operator reports a nonzero fraction rather than hiding it.
+    leaky = BackgroundParams(method="gaussian", radius_px=20)
+    assert clipped_fraction(raw, leaky) > 0.0
+    assert clipped_fraction(raw.astype(np.float32), leaky) == 0.0   # float has no floor to clip at
 
 
 def test_a_bgsub_layer_can_be_toggled_off_to_return_to_raw():

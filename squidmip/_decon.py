@@ -139,10 +139,13 @@ def richardson_lucy_gaussian(
 
 
 def _cast_like(values: np.ndarray, dtype: np.dtype) -> np.ndarray:
-    """Cast back to the acquisition dtype, clipping integers instead of wrapping them."""
+    """Cast back to the acquisition dtype, ROUNDING and clipping integers rather than
+    truncating and wrapping them. ``astype`` alone truncates toward zero (half a count of
+    systematic dimming on every pixel) and wraps on overflow (the brightest pixel in the frame
+    becomes the darkest)."""
     if np.issubdtype(dtype, np.integer):
         info = np.iinfo(dtype)
-        values = np.clip(values, info.min, info.max)
+        values = np.clip(np.rint(values), info.min, info.max)
     return values.astype(dtype, copy=False)
 
 
