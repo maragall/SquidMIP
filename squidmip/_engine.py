@@ -117,16 +117,8 @@ def available_projectors() -> list[str]:
     return sorted(_PROJECTORS)
 
 
-def _resolve_projector(name) -> Projector:
-    """Look up a projector by name, failing loud (named) on an unknown key.
-
-    Also accepts an already-built ``Projector`` callable and passes it straight through. That
-    is what lets a *decorated* reducer (IMA-224 background subtraction, via
-    ``_correction.with_correction``) reach this seam: a correction carries a per-run parameter,
-    and a name-keyed table has nowhere to put one. Names remain the public, CLI-visible API.
-    """
-    if callable(name):
-        return name
+def _resolve_projector(name: str) -> Projector:
+    """Look up a projector by name, failing loud (named) on an unknown key."""
     try:
         return _PROJECTORS[name]
     except KeyError:
@@ -141,7 +133,7 @@ def project_plate(
     *,
     n_fovs: int = 1,
     workers: int | None = None,
-    projector: "str | Projector" = "mip",
+    projector: str = "mip",
     on_error=None,
     regions=None,
 ) -> Iterator[tuple[str, int, np.ndarray]]:
@@ -166,10 +158,7 @@ def project_plate(
         process — affinity/cgroup aware, not a hardcoded constant). Peak RSS scales with this,
         so pin it on many-core machines.
     projector:
-        A projector name from the table (default ``"mip"``), or a ``Projector`` callable.
-        See :func:`add_projector`. A callable is how a per-run *correction* (IMA-224
-        background subtraction) reaches the reduce seam — it carries a parameter that a
-        name-keyed table cannot.
+        A projector name from the table (default ``"mip"``). See :func:`add_projector`.
 
     Yields
     ------

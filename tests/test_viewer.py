@@ -322,12 +322,12 @@ def _within(ri, ci, cd=20.0):
             QPointF(V._HDR + ci * cd + cd - 2, V._COLH + ri * cd + cd - 2))
 
 
-def _mouse(kind, pos, mods=Qt.NoModifier, buttons=Qt.LeftButton):
+def _mouse(kind, pos, mods=Qt.NoModifier, buttons=Qt.LeftButton, btn=Qt.LeftButton):
     from PyQt5.QtCore import QEvent
     from PyQt5.QtGui import QMouseEvent
     ev = {"press": QEvent.MouseButtonPress, "move": QEvent.MouseMove,
           "release": QEvent.MouseButtonRelease, "dblclick": QEvent.MouseButtonDblClick}[kind]
-    return QMouseEvent(ev, pos, Qt.LeftButton, buttons, mods)
+    return QMouseEvent(ev, pos, btn, buttons, mods)
 
 
 def _drag(ov, a, b, mods):
@@ -391,6 +391,41 @@ def test_wheel_ignored_during_marquee(qapp):
     ov.wheelEvent(QWheelEvent(QPoint(60, 60), QPoint(60, 60), QPoint(0, 0), QPoint(0, 120),
                               Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False))
     assert ov._cd == cd_before                                  # zoom did NOT happen
+
+
+def test_right_button_release_does_not_commit_a_selection(qapp):
+    """A RIGHT release must not commit the gesture. Qt delivers a release for whichever button
+    went up, so without an e.button() check a right-click during a Shift-drag silently toggled
+    a well (and dropped the in-flight marquee) with no left release ever having happened."""
+    ov = _sel_overview()
+    seen = []
+    ov.selectionChanged.connect(lambda wells: seen.append(list(wells)))
+    ov.mousePressEvent(_mouse("press", _pt(0, 1), Qt.ShiftModifier))          # Shift-press on A2
+    ov.mouseReleaseEvent(_mouse("release", _pt(0, 1), Qt.ShiftModifier,
+                                buttons=Qt.NoButton, btn=Qt.RightButton))
+    assert ov.selected_wells() == []                            # nothing selected
+    assert seen == []                                           # and nothing emitted
+    assert ov._marquee is not None                              # the gesture is still in flight
+    ov.mouseReleaseEvent(_mouse("release", _pt(0, 1), Qt.ShiftModifier,       # the LEFT release...
+                                buttons=Qt.NoButton))
+    assert ov.selected_wells() == ["A2"]                        # ...is what commits it
+
+
+def test_leave_clears_the_marquee_so_zoom_survives(qapp):
+    """Losing the grab mid-drag (modal dialog, alt-tab) delivers a leave and NO release. A
+    stranded _marquee would paint a dashed rect forever and trip wheelEvent's guard, disabling
+    zoom permanently."""
+    from PyQt5.QtCore import QEvent, QPoint
+    from PyQt5.QtGui import QWheelEvent
+    ov = _sel_overview()
+    ov.mousePressEvent(_mouse("press", _pt(0, 0), Qt.ShiftModifier))
+    assert ov._marquee is not None
+    ov.leaveEvent(QEvent(QEvent.Leave))                         # grab lost; no release ever arrives
+    assert ov._marquee is None
+    cd_before = ov._cd
+    ov.wheelEvent(QWheelEvent(QPoint(60, 60), QPoint(60, 60), QPoint(0, 0), QPoint(0, 120),
+                              Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False))
+    assert ov._cd != cd_before                                  # zoom works again
 
 
 # --- selection regressions: the landed navigator gestures must be untouched -----------------
