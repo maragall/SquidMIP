@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+BASE_KEY = "raw"      # the base layer's key — always present, always at the bottom of the stack
+
 
 @dataclass
 class Layer:
@@ -20,7 +22,7 @@ class Layer:
 
 class OperationStack:
     def __init__(self) -> None:
-        self._layers: list[Layer] = [Layer("raw", "raw", True)]   # base layer, always present
+        self._layers: list[Layer] = [Layer(BASE_KEY, BASE_KEY, True)]   # base layer, always present
 
     def add(self, key: str, label: str) -> None:
         """Add (or re-add) an operation layer on top, enabled. Re-adding moves it to the top."""
@@ -34,11 +36,15 @@ class OperationStack:
                 return
 
     def move(self, key: str, delta: int) -> None:
-        """Reorder a layer by +/- steps. The base ('raw') never moves off the bottom."""
+        """Reorder a layer by +/- steps; +1 moves it one step TOWARD THE TOP (the end of the list,
+        which the Layers tab renders first). The base ('raw') never moves off the bottom: it cannot
+        be moved itself, and no operation layer can be pushed under it."""
+        if key == BASE_KEY:
+            return
         idx = next((i for i, ly in enumerate(self._layers) if ly.key == key), None)
         if idx is None:
             return
-        new = max(0, min(len(self._layers) - 1, idx + delta))
+        new = max(1, min(len(self._layers) - 1, idx + delta))   # index 0 stays the base layer
         if new != idx:
             self._layers.insert(new, self._layers.pop(idx))
 
@@ -53,4 +59,4 @@ class OperationStack:
         return list(self._layers)
 
     def reset(self) -> None:
-        self._layers = [Layer("raw", "raw", True)]
+        self._layers = [Layer(BASE_KEY, BASE_KEY, True)]

@@ -37,6 +37,19 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         run: pytest -q --ignore=tests/test_performance.py
+      # The Qt viewer tests are the layer-stack regression net (IMA-227), and they skip WHOLESALE
+      # when PySide is present in the process (a green build that ran nothing). This is the only
+      # job that installs the [gui] extra, so it is the one that must prove they actually ran.
+      - name: Qt viewer tests must run, not skip
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest tests/test_viewer.py tests/test_layers.py -q -rs | tee qt.log
+          grep -qE "[0-9]+ passed" qt.log || { echo "::error::no Qt viewer tests ran"; exit 1; }
+          if grep -qi "skipped" qt.log; then echo "::error::Qt viewer tests SKIPPED"; exit 1; fi
 
   # ---- freeze the GUI per OS via PyInstaller ---------------------------------------------------
   freeze:

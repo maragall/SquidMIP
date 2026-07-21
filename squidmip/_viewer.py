@@ -45,7 +45,7 @@ import os
 import re
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -59,7 +59,7 @@ from PyQt5.QtWidgets import (
 )
 
 from squidmip._engine import _default_workers
-from squidmip._layers import OperationStack
+from squidmip._layers import BASE_KEY, OperationStack
 from squidmip._montage import _area_downsample, _hex_to_rgb01, _window
 from squidmip._output import parse_well_id
 
@@ -514,6 +514,33 @@ class _RunningContrast:
 
 # --- plate overview widget (one cell per well; hue-coded status; fit-to-view) ---------------
 
+_BLANK: Optional[QImage] = None    # the empty state, shared by every widget and every empty layer
+
+
+def _blank_image() -> QImage:
+    """One 1x1 background image the painter scales to the plate — the empty state costs no memory
+    (a full-size blank canvas per un-run layer would be ~36 MB each on a 1536-well plate)."""
+    global _BLANK
+    if _BLANK is None:
+        _BLANK = QImage(1, 1, QImage.Format_RGB888)
+        _BLANK.fill(QColor(_BG))
+    return _BLANK
+
+
+@dataclass
+class _LayerState:
+    """Everything one rendered layer owns: the canvas its tiles stream into, the crisp
+    global-contrast montage once the run finishes, and which cells actually have an image (drives
+    the grey dots). ONE object per layer — the three used to be three parallel dicts, and forgetting
+    one of them is exactly how a layer ends up showing another layer's pixels."""
+    canvas: QImage
+    final: Optional[QImage] = None
+    tiles: set = field(default_factory=set)
+
+    def source(self) -> QImage:
+        return self.final or self.canvas
+
+
 class PlateOverview(QWidget):
     """The low-res plate: an RGB canvas of MIP tiles, plus a per-well status hue and a red box."""
 
@@ -528,17 +555,12 @@ class PlateOverview(QWidget):
         self._nr, self._nc = len(self._rows), len(self._cols)
         self._by_rc: dict[tuple, str] = dict(wells)            # every acquired well (for status + hit-test)
         self._status: dict[tuple, str] = {rc: "empty" for rc in wells}
-        self._tiles: set[tuple] = set()                        # cells that have a tile painted (any layer)
-        self._tiles_by_layer: dict[str, set] = {}              # layer -> cells with an image there
-        self._canvas = QImage(self._nc * _CELL, self._nr * _CELL, QImage.Format_RGB888)
-        self._canvas.fill(QColor(_BG))
-        self._final = None            # crisp global-contrast montage of the ACTIVE layer (or None)
-        # Layer stack render: the base ("raw") is self._canvas; each operator draws into its own
-        # per-layer canvas/final. self._active is the layer the plate currently shows (LayersTab picks
-        # it via set_active_layer). Keeps memory to one small montage-canvas per layer used.
-        self._op_canvas: dict[str, QImage] = {}
-        self._op_final: dict[str, QImage] = {}
-        self._active = "raw"
+        # Layer stack render: one _LayerState per layer that has been written to (base "raw" plus one
+        # per operator that has run), created on first write and dropped by reset_layer. self._active
+        # is the key the plate currently shows — the Layers tab picks it via set_active_layer, and
+        # None (every layer unticked) shows the shared empty state. Memory: one montage per LIVE layer.
+        self._layers: dict[str, _LayerState] = {BASE_KEY: _LayerState(self._new_canvas())}
+        self._active: Optional[str] = BASE_KEY
         self._scaled = None           # cached pixmap of (final|canvas) scaled to the current zoom;
         self._scaled_cd = None        # rebuilt only when zoom (cd) or the source image changes — so
         #                               a hover/pan repaint blits 1:1 instead of re-resampling 12 MP.
@@ -565,30 +587,36 @@ class PlateOverview(QWidget):
         w, h = self.width(), self.height()
         return max(2.0, min((w - _HDR - 2 * _PAD) / self._nc, (h - _COLH - 2 * _PAD) / self._nr))
 
-    def _canvas_for(self, layer: str) -> QImage:
-        if layer == "raw":
-            return self._canvas
-        cv = self._op_canvas.get(layer)
-        if cv is None:
-            cv = QImage(self._nc * _CELL, self._nr * _CELL, QImage.Format_RGB888)
-            cv.fill(QColor(_BG))
-            self._op_canvas[layer] = cv
+    def _new_canvas(self) -> QImage:
+        cv = QImage(self._nc * _CELL, self._nr * _CELL, QImage.Format_RGB888)
+        cv.fill(QColor(_BG))
         return cv
 
+    def _layer_for(self, layer: str) -> _LayerState:
+        """The state a WRITE goes to, created on first use (a layer costs nothing until written)."""
+        st = self._layers.get(layer)
+        if st is None:
+            st = self._layers[layer] = _LayerState(self._new_canvas())
+        return st
+
     def _active_source(self) -> QImage:
-        return self._final or self._canvas_for(self._active)
+        """What the plate paints. A layer nobody has written to yet (or every layer unticked) is a
+        DEFINED empty state — one shared 1x1 background image the painter scales up — never a blank
+        full-size canvas per missing key, and never the previous layer's stale pixels."""
+        st = self._layers.get(self._active) if self._active else None
+        return st.source() if st is not None else _blank_image()
 
     # -- data in --
-    def add_tile(self, ri: int, ci: int, well_id: str, rgb: np.ndarray, layer: str = "raw"):
+    def add_tile(self, ri: int, ci: int, well_id: str, rgb: np.ndarray, layer: str = BASE_KEY):
         if (ri, ci) not in self._by_rc:    # ignore a stale tile from a retired run / foreign cell
             return
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
         img = QImage(rgb.data, _CELL, _CELL, 3 * _CELL, QImage.Format_RGB888)
-        p = QPainter(self._canvas_for(layer))
+        st = self._layer_for(layer)
+        p = QPainter(st.canvas)
         p.drawImage(ci * _CELL, ri * _CELL, img)
         p.end()
-        self._tiles.add((ri, ci))
-        self._tiles_by_layer.setdefault(layer, set()).add((ri, ci))   # per-layer: drives the grey dots
+        st.tiles.add((ri, ci))            # per-layer: drives the grey dots
         if layer == self._active:         # only the shown layer needs a repaint / cache rebuild
             self._scaled = None
             self.update()
@@ -604,19 +632,26 @@ class PlateOverview(QWidget):
             self._status[rc] = state
         self.update()
 
-    def set_final(self, img: QImage, layer: str = "raw"):
-        self._op_final[layer] = img
+    def set_final(self, img: QImage, layer: str = BASE_KEY):
+        self._layer_for(layer).final = img
         if layer == self._active:
-            self._final = img
             self._scaled = None       # source changed -> the scaled cache is stale
             self.update()
 
-    def set_active_layer(self, layer: str):
-        """Show a layer (LayersTab toggle/reorder). Swaps in its montage + streamed canvas."""
+    def set_active_layer(self, layer: Optional[str]):
+        """Show a layer (Layers tab toggle/reorder), or the empty state when *layer* is None (every
+        layer unticked). The layer need not exist yet — an un-run one paints as an empty plate."""
         self._active = layer
-        self._final = self._op_final.get(layer)   # None for "raw" -> falls back to the base canvas
         self._scaled = None
         self.update()
+
+    def reset_layer(self, layer: str):
+        """Drop a layer's pixels (and free them). Called before a layer is (re-)run, so a second,
+        smaller run can never leave the previous run's tiles standing in the untouched wells."""
+        self._layers.pop(layer, None)
+        if layer == self._active:
+            self._scaled = None
+            self.update()
 
     def select(self, ri: int, ci: int):
         """Move the red box to a well (driven by the ndviewer FOV slider)."""
@@ -705,7 +740,8 @@ class PlateOverview(QWidget):
         # amber = processing, red x = failed, GREY = no image on the active layer, no dot once a cell
         # HAS an image (the image speaks for itself). Dot size is a capped absolute size.
         d = min(max(3.0, cd * 0.36), 15.0)
-        active_tiles = self._tiles_by_layer.get(self._active, set())
+        st = self._layers.get(self._active) if self._active else None
+        active_tiles = st.tiles if st is not None else set()
         for ri in range(nr):
             for ci in range(nc):
                 state = self._status.get((ri, ci), "empty")
@@ -1013,7 +1049,6 @@ class PlateWindow(QMainWindow):
         self._meta = None
         self._fov_index = {}
         self._pushed = set()          # wells whose raw z-stack is already registered in the detail viewer
-        self._final_arr = None        # keep the final montage array alive for its QImage
 
         # File menu: a reliable "Open acquisition folder" (drag-drop can be blocked on Windows by the
         # GL child pane or an elevation mismatch, so this is the always-works path).
@@ -1041,7 +1076,11 @@ class PlateWindow(QMainWindow):
         self._processed_plate = None  # path of the written plate.ome.zarr once an operator persists it
         self._plate_mode = "raw"      # what the plate view is showing — shown in the plate-pane title
         self._op_stack = OperationStack()   # the toggleable layer stack (base + applied operators)
-        self._active_op_key = None    # operator whose tiles are streaming into its layer right now
+        # WHAT THE WORKER WRITES vs WHAT THE USER SEES are two different things, and conflating them
+        # is how a display toggle used to redirect a running run's tiles. _running_key names the layer
+        # the current/last run streams into (None = raw); the DISPLAYED layer is always derived from
+        # _op_stack by _apply_layers. Nothing else may call set_active_layer.
+        self._running_key = None
         self._layers_tab = None       # the Layers tab widget, once opened
         self._order = []              # well order = the detail's FOV-slider order
         self._op_tabs = {}            # key -> operator-UI widget currently open as a tab in _left_tabs
@@ -1372,12 +1411,23 @@ class PlateWindow(QMainWindow):
         self._refresh_layers_tab()
 
     def _apply_layers(self):
-        """Show the topmost enabled layer on the plate; keep the title in sync."""
+        """THE single write path from the layer stack to the view: plate pixmap, pane title and the
+        Return-to-raw button all follow the topmost enabled layer, for ANY operator. Every layer
+        unticked is a defined state (an empty plate), not a silent no-op."""
+        if self._overview is None:
+            return
         top = self._op_stack.top_enabled()
-        if top is not None and self._overview is not None:
-            self._overview.set_active_layer(top.key)
-            self._plate_mode = "raw" if top.key == "raw" else top.label
-            self._plate_title.setText(f"{self._acq_name}   ·   {self._plate_mode}")
+        self._overview.set_active_layer(top.key if top is not None else None)
+        if top is None:
+            self._plate_mode = "no layers"
+        else:
+            self._plate_mode = "raw" if top.key == BASE_KEY else top.label
+        # same form as _on_hover, so the title never regresses to "None   ·   raw" pre-ingest
+        self._plate_title.setText(f"{self._acq_name or 'well plate'}   ·   {self._plate_mode}")
+        if getattr(self, "_raw_btn", None) is not None:
+            # only meaningful when there IS raw to return to and something else is on top
+            self._raw_btn.setVisible(self._reader is not None and top is not None
+                                     and top.key != BASE_KEY)
 
     def _build_cli_tab(self) -> QWidget:
         """A LIVE, interactive shell in the pane: run the `squidmip` batch CLI (IMA-186) right here.
@@ -1497,7 +1547,6 @@ class PlateWindow(QMainWindow):
         self._fov_index = {}
         self._pushed = set()
         self._current_well = None
-        self._final_arr = None
         self._enable_operators(False)
         if self._overview is not None:
             self._overview.setParent(None)
@@ -1561,12 +1610,9 @@ class PlateWindow(QMainWindow):
         self._overview = PlateOverview(rows, cols, wells)
         self._overview.hovered.connect(self._on_hover)
         self._overview.wellActivated.connect(self.activate_well)
-        self._plate_mode = "raw"                     # a freshly-opened plate shows raw previews
-        self._plate_title.setText(f"{self._acq_name}   ·   raw")   # bottom-left plate-pane title
         self._op_stack.reset()                       # fresh layer stack (base only)
-        self._active_op_key = None
-        if getattr(self, "_raw_btn", None):
-            self._raw_btn.hide()                     # raw view on open -> nothing to return from
+        self._running_key = None
+        self._apply_layers()                         # -> raw plate, "<acq> · raw" title, no raw button
         self._refresh_layers_tab()
         self._drop.hide()
         self._left_l.addWidget(self._overview, 1)   # fills the pane and self-fits — no scrollbars
@@ -1622,12 +1668,11 @@ class PlateWindow(QMainWindow):
         if self._reader is None or self._overview is None:
             return
         self._stop_worker()
-        self._active_op_key = None
-        if getattr(self, "_raw_btn", None):
-            self._raw_btn.hide()                             # nothing to return from now
-        self._plate_mode = "raw"
-        self._plate_title.setText(f"{self._acq_name}   ·   raw")
-        self._overview.set_active_layer("raw")
+        self._running_key = None
+        for ly in self._op_stack.layers():                   # the button drives the SAME stack the
+            if ly.key != BASE_KEY:                           # Layers tab does — one path, never two
+                self._op_stack.toggle(ly.key, False)
+        self._apply_layers()                                 # plate, title and raw button follow
         for rc in list(self._overview._status):
             self._overview.set_status(*rc, "empty")
         self._refresh_layers_tab()
@@ -1696,13 +1741,9 @@ class PlateWindow(QMainWindow):
         self._overview = PlateOverview(rows, cols, wells_rc)
         self._overview.hovered.connect(self._on_hover)
         self._overview.wellActivated.connect(self.activate_well)
-        self._active_op_key = "computed"
-        if getattr(self, "_raw_btn", None):
-            self._raw_btn.hide()                      # a computed plate has no raw to return to
-        self._plate_mode = "computed MIP"
-        self._plate_title.setText(f"{self._acq_name}   ·   computed MIP")
+        self._running_key = "computed"
         self._op_stack.reset(); self._op_stack.add("computed", "computed MIP")
-        self._overview.set_active_layer("computed")
+        self._apply_layers()                          # shows "computed"; no raw here to return to
         self._refresh_layers_tab()
         self._drop.hide()
         self._left_l.addWidget(self._overview, 1)
@@ -1763,13 +1804,10 @@ class PlateWindow(QMainWindow):
                 self._overview.set_status(*self._fov_index[r]["rc"], "processing")
         else:
             self._overview.set_all_status("processing")      # amber across the plate
-        self._plate_mode = label                             # plate now shows this operator's result
-        self._plate_title.setText(f"{self._acq_name}   ·   {label}")
-        self._active_op_key = key                            # tiles stream into this layer
-        if getattr(self, "_raw_btn", None):
-            self._raw_btn.show()                             # now there's a processed view to return from
+        self._running_key = key                              # tiles stream into this layer
+        self._overview.reset_layer(key)                      # a re-run starts clean: no stale tiles
         self._op_stack.add(key, label)                       # push the operator layer onto the stack
-        self._overview.set_active_layer(key)                 # show it
+        self._apply_layers()                                 # -> shows it, retitles, raw button on
         self._refresh_layers_tab()
         # switch the detail to processed mode: z collapsed (nz=1 -> ndv drops the z-slider), frames at
         # the push size, same well order. Each computed well is pushed into the growing slider below.
@@ -1824,12 +1862,14 @@ class PlateWindow(QMainWindow):
 
     def _on_preview_tile(self, ri, ci, well_id, rgb):
         if self._overview is not None:                       # raw preview fills the base ("raw") layer
-            self._overview.add_tile(ri, ci, well_id, rgb, layer="raw")
+            self._overview.add_tile(ri, ci, well_id, rgb, layer=BASE_KEY)
 
     def _on_tile(self, ri, ci, well_id, rgb):
         if self._overview is None:
             return
-        self._overview.add_tile(ri, ci, well_id, rgb, layer=self._active_op_key or "raw")
+        # routed by the RUNNING layer, never by what the user is looking at: toggling a layer
+        # mid-run must not send this run's tiles into another layer's canvas.
+        self._overview.add_tile(ri, ci, well_id, rgb, layer=self._running_key or BASE_KEY)
         self._overview.set_status(ri, ci, "done")           # blue
 
     def _on_push(self, fov_idx, planes):
@@ -1854,10 +1894,12 @@ class PlateWindow(QMainWindow):
     def _set_final(self, rgb):
         if self._overview is None:
             return
-        self._final_arr = np.ascontiguousarray(rgb)
-        h, w, _ = self._final_arr.shape
-        self._overview.set_final(QImage(self._final_arr.data, w, h, 3 * w, QImage.Format_RGB888),
-                                 layer=self._active_op_key or "raw")
+        # QImage keeps a reference to the buffer it wraps, so the array lives exactly as long as the
+        # QImage that holds it (and dies with the layer) — no window-level copy to keep it alive.
+        arr = np.ascontiguousarray(rgb)
+        h, w, _ = arr.shape
+        self._overview.set_final(QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888),
+                                 layer=self._running_key or BASE_KEY)
 
     # -- navigation links --
     def _on_hover(self, text: str):
@@ -1876,7 +1918,9 @@ class PlateWindow(QMainWindow):
         if self._overview is not None:                 # current well at view = the red BOX
             self._overview.select(*self._fov_index[well_id]["rc"])
         idx = self._fov_index[well_id]["idx"]
-        if self._active_op_key is not None or self._reader is None:   # processed/computed: already pushed
+        # the DETAIL follows the run, not the Layers tab: once an operator has run, its results are
+        # what the slider holds, whether or not its layer is currently ticked on the plate.
+        if self._running_key is not None or self._reader is None:     # processed/computed: already pushed
             try:
                 row, col = parse_well_id(well_id)
                 self._detail.go_to_well_fov(f"{row}{col}", fov_index)

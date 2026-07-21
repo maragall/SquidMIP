@@ -76,6 +76,12 @@ def stub_detail(monkeypatch):
     monkeypatch.setattr(V.PlateWindow, "_make_detail_viewer", lambda self: _StubDetail())
 
 
+def _tiles(win, layer):
+    """Cells that have an image on *layer* (each layer owns its own canvas + tile set)."""
+    st = win._overview._layers.get(layer) if win._overview is not None else None
+    return st.tiles if st is not None else set()
+
+
 def _drain_until(app, pred, timeout=60):
     t0 = time.time()
     while not pred() and time.time() - t0 < timeout:
@@ -130,7 +136,7 @@ def test_ingest_loads_plate_and_previews_without_processing(qapp, stub_detail, s
     # leaves status grey ("empty"); NO operator worker runs until the Process menu is used.
     assert win._overview is not None
     assert set(win._overview._by_rc.values()) == {"B2", "B3"}
-    assert _drain_until(qapp, lambda: len(win._overview._tiles) == 2)   # preview filled thumbnails
+    assert _drain_until(qapp, lambda: len(_tiles(win, "raw")) == 2)     # preview filled thumbnails
     assert set(win._overview._status.values()) == {"empty"}            # ...but status stays grey
     assert win._worker is None
     assert all(a.isEnabled() for a in win._op_actions.values())        # operators enabled once loaded
@@ -196,11 +202,11 @@ def test_run_operator_fills_tiles_and_hue_status(qapp, stub_detail, squid_datase
     win.ingest(str(root))
     win.run_operator("mip", out_parent=str(tmp_path))
     assert _drain_until(
-        qapp, lambda: win._overview is not None and len(win._overview._tiles) == 2
-        and win._overview._final is not None
+        qapp, lambda: len(_tiles(win, "mip")) == 2
+        and win._overview._layers["mip"].final is not None
     )
-    # both wells processed -> tiled + hue-coded "done"
-    assert win._overview._tiles == set(win._fov_index[w]["rc"] for w in ("B2", "B3"))
+    # both wells processed -> tiled on the MIP layer + hue-coded "done"
+    assert _tiles(win, "mip") == set(win._fov_index[w]["rc"] for w in ("B2", "B3"))
     assert set(win._overview._status.values()) == {"done"}
     # bounded memory: the worker keeps one 88px tile per well, not the acquisition
     assert len(win._worker._raw) == 2
@@ -246,7 +252,7 @@ def test_second_ingest_resets_state(qapp, stub_detail, squid_dataset, tmp_path):
     win = V.PlateWindow(None)
     win.ingest(str(root))
     win.run_operator("mip", out_parent=str(tmp_path))
-    _drain_until(qapp, lambda: win._overview is not None and len(win._overview._tiles) == 2)
+    _drain_until(qapp, lambda: len(_tiles(win, "mip")) == 2)
     win.ingest(str(root))            # second open: must stop the old worker + reset state
     qapp.processEvents()
     time.sleep(0.1)
@@ -256,3 +262,183 @@ def test_second_ingest_resets_state(qapp, stub_detail, squid_dataset, tmp_path):
     assert set(win._overview._status.values()) == {"empty"}     # fresh grey plate
     win._stop_worker()
     win.close()
+
+
+# --- layer stack -> what the plate renders (IMA-227) ----------------------------------------
+
+def _solid(v: int) -> np.ndarray:
+    """A plate-cell tile of one grey value, so the rendered layer is identifiable by one pixel."""
+    return np.full((V._CELL, V._CELL, 3), v, np.uint8)
+
+
+def _shown(ov) -> int:
+    """The grey value of the image the plate actually paints."""
+    return ov._active_source().pixelColor(0, 0).red()
+
+
+def test_every_layer_keeps_its_own_canvas_and_empty_state(qapp):
+    # Nothing here is MIP-specific: three operator layers (one of them a stand-in for a future
+    # operator) each keep their own pixels, and the plate shows whichever one is active.
+    ov = V.PlateOverview(["A"], ["1", "2"], {(0, 0): "A1", (0, 1): "A2"})
+    for layer, val in (("raw", 10), ("mip", 120), ("stitched", 240)):
+        ov.add_tile(0, 0, "A1", _solid(val), layer=layer)
+    for layer, val in (("raw", 10), ("mip", 120), ("stitched", 240)):
+        ov.set_active_layer(layer)
+        assert _shown(ov) == val
+        assert ov._layers[layer].tiles == {(0, 0)}       # per-layer grey dots, not a shared set
+    ov.set_active_layer("never_run")     # a layer nothing has been written to: empty, NOT stale
+    assert ov._active_source() is V._blank_image()
+    assert "never_run" not in ov._layers                 # ...and showing it allocates no canvas
+    ov.set_active_layer(None)            # every layer unticked: the same defined empty state
+    assert ov._active_source() is V._blank_image()
+    ov.set_active_layer("mip")
+    assert _shown(ov) == 120                             # and the real layers survived it
+
+
+def test_reset_layer_drops_only_that_layer(qapp):
+    ov = V.PlateOverview(["A"], ["1"], {(0, 0): "A1"})
+    ov.add_tile(0, 0, "A1", _solid(10), layer="raw")
+    ov.add_tile(0, 0, "A1", _solid(200), layer="mip")
+    ov.reset_layer("mip")
+    ov.set_active_layer("mip")
+    assert ov._active_source() is V._blank_image()       # cleared, not carrying old pixels
+    ov.set_active_layer("raw")
+    assert _shown(ov) == 10                              # the base layer is untouched
+
+
+def test_run_operator_sets_up_the_layer_state(qapp, stub_detail, squid_dataset, tmp_path):
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    assert win._raw_btn.isHidden()                       # raw on open: nothing to return from
+    win.run_operator("mip", out_parent=str(tmp_path))
+    assert win._running_key == "mip"                     # the worker streams into the MIP layer
+    assert [ly.key for ly in win._op_stack.layers()] == ["raw", "mip"]
+    assert win._op_stack.top_enabled().key == "mip"
+    assert win._overview._active == "mip"                # ...which is what the plate shows
+    assert win._plate_title.text() == "acq   ·   Maximum Intensity Projection"
+    assert not win._raw_btn.isHidden()
+    win._stop_worker(); win.close()
+
+
+def test_toggle_and_reorder_pick_the_right_layer_for_any_operator(qapp, stub_detail, squid_dataset,
+                                                                  tmp_path):
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("mip", out_parent=str(tmp_path))
+    assert _drain_until(qapp, lambda: len(_tiles(win, "mip")) == 2)
+    win._stop_worker()
+    # A SECOND operator layer. No stitcher exists in the repo yet, so register one by hand — the
+    # point is that the stack, the plate and the title are operator-agnostic.
+    rc = win._fov_index["B2"]["rc"]
+    win._op_stack.add("stitched", "Stitched")
+    win._overview.add_tile(*rc, "B2", _solid(200), layer="stitched")
+    win._apply_layers()
+    assert win._overview._active == "stitched"
+    assert win._plate_title.text().endswith("Stitched")
+
+    win._on_layer_toggle("stitched", False)              # untick the top -> the one below shows
+    assert win._overview._active == "mip"
+    assert win._plate_title.text().endswith("Maximum Intensity Projection")
+    win._on_layer_toggle("stitched", True)
+    win._on_layer_move("mip", +1)                        # "↑": MIP now sits above stitched
+    assert win._op_stack.layers()[-1].key == "mip"
+    assert win._overview._active == "mip"
+    win._on_layer_toggle("mip", False)                   # ...and unticking it falls to stitched
+    assert win._overview._active == "stitched"
+    win._on_layer_toggle("stitched", False)              # both operators off -> back to raw
+    assert win._overview._active == "raw"
+    assert win._plate_mode == "raw" and win._raw_btn.isHidden()
+    win.close()
+
+
+def test_all_layers_off_gives_a_defined_empty_plate(qapp, stub_detail, squid_dataset):
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    assert _drain_until(qapp, lambda: len(_tiles(win, "raw")) == 2)
+    win._on_layer_toggle("raw", False)                   # the last enabled layer off
+    assert win._op_stack.top_enabled() is None
+    assert win._overview._active is None
+    assert win._overview._active_source() is V._blank_image()   # empty, not the stale raw montage
+    assert win._plate_mode == "no layers"
+    assert "no layers" in win._plate_title.text()
+    win._on_layer_toggle("raw", True)                    # ...and it comes straight back
+    assert win._overview._active == "raw"
+    win._stop_preview(); win.close()
+
+
+def test_return_to_raw_routes_through_the_stack(qapp, stub_detail, squid_dataset, tmp_path):
+    # The button and the Layers tab must be ONE path: after "Return to raw view" the tab cannot
+    # still show MIP ticked on top while the plate renders raw.
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("mip", out_parent=str(tmp_path))
+    assert _drain_until(qapp, lambda: len(_tiles(win, "mip")) == 2)
+    win._return_to_raw()
+    assert win._running_key is None
+    assert [ly.enabled for ly in win._op_stack.layers() if ly.key == "mip"] == [False]
+    assert win._op_stack.top_enabled().key == "raw"
+    assert win._overview._active == "raw"
+    assert win._plate_mode == "raw" and win._raw_btn.isHidden()
+    win._on_layer_toggle("mip", True)                    # re-ticking MIP brings the result back
+    assert win._overview._active == "mip"
+    assert not win._raw_btn.isHidden()
+    win._stop_preview(); win._stop_worker(); win.close()
+
+
+def test_toggle_mid_run_does_not_redirect_the_worker(qapp, stub_detail, squid_dataset, tmp_path):
+    # Display and worker routing are separate concerns: unticking the layer being computed changes
+    # what is SHOWN, never where the in-flight tiles land (nor which mode the detail view is in).
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("mip", out_parent=str(tmp_path))
+    win._on_layer_toggle("mip", False)                   # untick mid-run
+    assert win._overview._active == "raw"                # the plate follows the stack ...
+    assert win._running_key == "mip"                     # ... the worker keeps its own layer
+    assert _drain_until(qapp, lambda: len(_tiles(win, "mip")) == 2)
+    assert _tiles(win, "mip") == set(win._fov_index[w]["rc"] for w in ("B2", "B3"))
+    win._detail.registered.clear()
+    win.activate_well("B3", 0)                           # the detail stays in processed mode
+    assert win._detail.nav[-1] == ("B3", 0)
+    assert not win._detail.registered                    # no raw z-stack push behind the results
+    win._stop_worker(); win.close()
+
+
+def test_rerun_with_preview_limit_leaves_no_stale_tiles(qapp, stub_detail, squid_dataset, tmp_path):
+    # Bug repro: a full run followed by a 1-well re-run used to leave the first run's pixels in the
+    # untouched wells, with no grey dot — the plate looked fully computed when it wasn't.
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("mip", out_parent=str(tmp_path))
+    assert _drain_until(qapp, lambda: len(_tiles(win, "mip")) == 2)
+    assert _drain_until(qapp, lambda: not win._worker.isRunning())
+    win.run_operator("mip", preview_limit=1, save=False)
+    assert _drain_until(qapp, lambda: len(_tiles(win, "mip")) == 1)
+    assert _tiles(win, "mip") == {win._fov_index["B2"]["rc"]}   # only the re-run well has an image
+    win._stop_worker(); win.close()
+
+
+def test_open_computed_routes_through_the_stack(qapp, stub_detail, squid_dataset, tmp_path,
+                                                monkeypatch):
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("mip", out_parent=str(tmp_path))      # write a real .hcs to re-open
+    assert _drain_until(qapp, lambda: win._processed_plate is not None)
+    assert _drain_until(qapp, lambda: not win._worker.isRunning())
+    monkeypatch.setattr(V.QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(tmp_path / "acq.hcs")))
+    win._open_computed()
+    assert [ly.key for ly in win._op_stack.layers()] == ["raw", "computed"]
+    assert win._running_key == "computed"
+    assert win._overview._active == "computed"
+    assert "computed MIP" in win._plate_title.text()
+    assert win._raw_btn.isHidden()                         # no raw reader behind a computed plate
+    win._on_layer_toggle("computed", False)                # tab and plate never disagree
+    assert win._overview._active == "raw"
+    win._stop_worker(); win.close()
