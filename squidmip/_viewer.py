@@ -429,12 +429,17 @@ class _ProcTerminal(QWidget):
 class _DetachTabBar(QTabBar):
     """Tab bar that detaches a tab when it's dragged OUT of the bar (ImageJ-style float-out,
     IMA-209). Gesture only — all detach logic lives in PlateWindow._detach_tab (the seam the
-    offscreen tests drive directly). The home tab (index 0) never detaches; a drag that stays
-    inside the bar keeps Qt's normal tab behavior."""
+    offscreen tests drive directly). A drag that stays inside the bar keeps Qt's normal tab
+    behavior.
 
-    def __init__(self, on_detach, parent=None):
+    ``first_detachable`` is where the detachable range starts: 1 in the process console, whose
+    index 0 is the permanent 'Process wells' home tab, but 0 in IMA-237's exploration pane, where
+    every tab is a user-opened subset and the first one is no more special than the fifth."""
+
+    def __init__(self, on_detach, parent=None, first_detachable: int = 1):
         super().__init__(parent)
         self._on_detach = on_detach
+        self._first_detachable = first_detachable
         self._press_pos = None
         self._press_index = -1
 
@@ -445,7 +450,7 @@ class _DetachTabBar(QTabBar):
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
-        if (self._press_pos is not None and self._press_index > 0
+        if (self._press_pos is not None and self._press_index >= self._first_detachable
                 and (e.pos() - self._press_pos).manhattanLength() >= QApplication.startDragDistance()
                 and not self.rect().contains(e.pos())):
             idx = self._press_index
@@ -463,11 +468,17 @@ class _DetachTabBar(QTabBar):
 
 class _DetachTabs(QTabWidget):
     """QTabWidget with a detachable tab bar. Qt requires setTabBar BEFORE any tab is added,
-    so the custom bar is installed here in __init__ rather than at the call site."""
+    so the custom bar is installed here in __init__ rather than at the call site.
 
-    def __init__(self, on_detach):
+    IMA-237 put a SECOND bar in the window (the exploration pane). Rather than fork a copy of
+    IMA-209's detach machinery — this codebase already paid for that once, with three parallel
+    _plate.py files — the bar tells the handler WHICH tab widget fired, so one _detach_tab serves
+    both. ``on_detach(index, tabs)``."""
+
+    def __init__(self, on_detach, first_detachable: int = 1):
         super().__init__()
-        self.setTabBar(_DetachTabBar(on_detach, self))
+        self.setTabBar(_DetachTabBar(lambda i: on_detach(i, self), self,
+                                     first_detachable=first_detachable))
 
 
 class _FloatWindow(QWidget):
@@ -2551,20 +2562,27 @@ class PlateWindow(QMainWindow):
         self._pending_resync = False  # a tab switch was deferred because a run was live (IMA-205 bugs)
         self._loupe_sources = {}      # layer key -> _LoupeSource backing that layer's pixels (IMA-208)
 
-        # THREE-PANE layout. Tabs live ONLY inside the top-left pane (their bar sits at the pane's top,
-        # like the plate pane's title bar) — never a global strip across the window. Any closable tab
-        # can be DRAGGED OUT of the bar into a free-floating window (ImageJ-style; see _detach_tab):
-        #   top-left  = the PROCESS console, a QTabWidget: a "Process wells" home tab (operator list),
-        #               one tab per operator you open (MIP -> where-to-save UI; Record -> recorder
-        #               UI), and one EXPLORATION tab per selected FOV subset (IMA-205). Operator UIs
-        #               live here because the right pane holds a single viewer widget.
-        #   bottom-left = the HCS PLATE view (<= half the display wide); its title bar names the plate.
-        #   right     = the ndviewer_light array viewer, full height. ONE widget instance (never
-        #               tabbed), but NOT plate-fixed: its FOV slider FOLLOWS the active tab — an
-        #               exploration tab re-points it at that tab's subset, the home tab restores the
-        #               whole plate (_on_tab_changed). ndviewer's only retarget seam is
-        #               start_acquisition, which resets the viewer, so computed frames do not
-        #               survive a tab switch; raw plane paths are re-registered so it isn't black.
+        # THREE HORIZONTAL PANES on one monitor (IMA-237). Tabs live inside a pane (their bar sits at
+        # the pane's top, like the plate pane's title bar) — never a global strip across the window.
+        # Any detachable tab can be DRAGGED OUT of its bar into a free-floating window (ImageJ-style;
+        # see _detach_tab, which serves BOTH bars):
+        #   PANE 1 = plate view + the controls with the tabs. A vertical split: on top the PROCESS
+        #            console, a QTabWidget with a "Process wells" home tab (operator list) and one tab
+        #            per operator you open (MIP -> where-to-save UI; Record -> recorder UI); below it
+        #            the HCS PLATE view, whose title bar names the plate.
+        #   PANE 2 = the initial viewer: the ndviewer_light array viewer, full height. ONE widget
+        #            instance (never tabbed), but NOT plate-fixed: its FOV slider FOLLOWS the active
+        #            exploration tab, which re-points it at that tab's subset; no exploration tab
+        #            restores the whole plate (_on_tab_changed). ndviewer's only retarget seam is
+        #            start_acquisition, which resets the viewer, so computed frames do not survive a
+        #            switch; raw plane paths are re-registered so it isn't black.
+        #   PANE 3 = the EXPLORATION pane: one tab per Shift-dragged FOV subset (IMA-205/221).
+        #
+        # Pane 3 starts COLLAPSED and HIDDEN, and it is the first exploration tab that reveals it
+        # (_sync_explore_pane). A user who never Shift-drags sees the unchanged two-pane app — an
+        # empty third pane permanently eating a fifth of the monitor is a cost you would pay for a
+        # feature you are not using. Exploration tabs moved OUT of the process console to get here:
+        # the console is pane 1, and pane 1 is not where the user asked exploration to live.
 
         # top-left: the process console (build the home tab first — it owns self._readout, which
         # _make_detail_viewer writes to if ndviewer is unavailable).
@@ -2583,6 +2601,21 @@ class PlateWindow(QMainWindow):
         self._left_tabs.currentChanged.connect(self._on_tab_changed)
         self._left_tabs.addTab(self._build_process_pane(), "Process wells")
         self._left_tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)  # home tab isn't closable
+
+        # PANE 3: the exploration pane. Same _DetachTabs class as the console (one detach seam, not
+        # two), but every tab is detachable — it has no permanent home tab to protect.
+        self._explore_tabs = _DetachTabs(self._detach_tab, first_detachable=0)
+        if self._fusion_style is not None:
+            self._explore_tabs.setStyle(self._fusion_style)
+        self._explore_tabs.setPalette(_dark_palette())
+        self._explore_tabs.setAutoFillBackground(True)
+        self._explore_tabs.setStyleSheet(_TABS_DARK)
+        self._explore_tabs.setTabsClosable(True)
+        self._explore_tabs.setMinimumWidth(300)   # revealed at a readable width or not at all
+        self._explore_tabs.tabCloseRequested.connect(
+            lambda i: self._close_op_tab(i, self._explore_tabs))
+        self._explore_tabs.currentChanged.connect(self._on_tab_changed)
+        self._explore_tabs.hide()                 # collapsed until the first exploration tab opens
 
         # right: the ndviewer array viewer directly (a singleton — no tab)
         self._detail = self._make_detail_viewer()
@@ -2649,11 +2682,18 @@ class PlateWindow(QMainWindow):
         outer = QSplitter(Qt.Horizontal)
         outer.setStyleSheet("QSplitter::handle{background:#232b3a;width:1px;}")
         outer.setChildrenCollapsible(False)
-        outer.addWidget(left_col)
-        outer.addWidget(right_frame)
-        outer.setSizes([760, 760])                 # divider fixed at the middle of the window
+        outer.addWidget(left_col)                  # pane 1: plate + controls with the tabs
+        outer.addWidget(right_frame)               # pane 2: the initial viewer
+        outer.addWidget(self._explore_tabs)        # pane 3: exploration (hidden -> zero width)
+        self._explore_tabs.hide()                  # re-assert: addWidget reparents and can re-show
+        outer.setSizes([760, 760, 0])              # divider at the middle while pane 3 is collapsed
+        # Stretch: panes 1 and 2 share the window as before; pane 3 gets 0 so a window RESIZE grows
+        # the plate and the viewer, never the exploration strip. Requirement 5 — pane 3 must not
+        # squash the plate view — is enforced twice: here, and in _sync_explore_pane, which carves
+        # pane 3's width out of the VIEWER pane on reveal rather than out of the plate pane.
         outer.setStretchFactor(0, 1)
         outer.setStretchFactor(1, 1)
+        outer.setStretchFactor(2, 0)
         self._split = outer
         self.setCentralWidget(outer)
 
@@ -2733,11 +2773,49 @@ class PlateWindow(QMainWindow):
         v.addWidget(layers_btn)
         return pane
 
-    # -- operator UIs live as tabs INSIDE the top-left pane (home tab + one per opened operator) ----
-    def _open_op_tab(self, key: str, title: str, builder):
-        """Open (or focus) an operator's UI as a tab beside 'Process wells'. Built lazily, once.
+    # -- operator UIs live as tabs INSIDE pane 1 (home tab + one per opened operator); exploration
+    # -- tabs live in pane 3. Both bars share every path below — *tabs* says which one. -----------
+    def _sync_explore_pane(self):
+        """Reveal pane 3 on its first tab, collapse it again when its last tab goes.
+
+        The pane is a real QSplitter child from construction, but HIDDEN — a hidden splitter child
+        occupies zero width, so before the first Shift-drag the window is the unchanged two-pane
+        app rather than a two-pane app with an empty strip bolted on.
+
+        The width it takes on reveal comes out of the VIEWER pane, never the plate pane: the plate
+        is the thing the user is navigating, and a new tab appearing must not shrink it."""
+        # isHidden(), NOT isVisible(): isVisible() is False for every child of a window that has
+        # not been shown yet, so keying off it would re-run the reveal on each call (and would make
+        # "is pane 3 collapsed?" unanswerable before the first show()). isHidden() is the explicit
+        # hide flag, which is exactly the state this method owns.
+        want_visible = self._explore_tabs.count() > 0
+        if want_visible == (not self._explore_tabs.isHidden()):
+            return
+        if not want_visible:
+            self._explore_tabs.hide()
+            sizes = self._split.sizes()
+            if len(sizes) == 3 and sizes[2]:
+                sizes[1] += sizes[2]              # give the width back to the viewer it came from
+                sizes[2] = 0
+                self._split.setSizes(sizes)
+            return
+        sizes = self._split.sizes()
+        self._explore_tabs.show()
+        if len(sizes) == 3:
+            floor = 360                           # leave the viewer usable, or don't take from it
+            want = max(self._explore_tabs.minimumWidth(), int(sum(sizes) * 0.22))
+            take = max(0, min(want, sizes[1] - floor))
+            if take:
+                sizes[1] -= take
+                sizes[2] = take
+                self._split.setSizes(sizes)
+
+    def _open_op_tab(self, key: str, title: str, builder, tabs=None):
+        """Open (or focus) a UI as a tab. Built lazily, once. *tabs* is the bar it belongs in —
+        the process console by default, pane 3 for exploration tabs.
         If the UI is currently detached (see _detach_tab), focus its floating window instead —
         never rebuild: for the CLI that would mean a second live shell."""
+        tabs = self._left_tabs if tabs is None else tabs
         win = self._floating.get(key)
         if win is not None:
             win.raise_()
@@ -2747,15 +2825,18 @@ class PlateWindow(QMainWindow):
         if w is None:
             w = builder()
             self._op_tabs[key] = w
-            self._left_tabs.addTab(w, title)
-        self._left_tabs.setCurrentWidget(w)
+            tabs.addTab(w, title)
+            self._sync_explore_pane()
+        tabs.setCurrentWidget(w)
 
-    def _close_op_tab(self, index: int):
-        if index == 0:                                     # 'Process wells' home tab — never closable
+    def _close_op_tab(self, index: int, tabs=None):
+        tabs = self._left_tabs if tabs is None else tabs
+        if index == 0 and tabs is self._left_tabs:         # 'Process wells' home tab — never closable
             return
-        w = self._left_tabs.widget(index)
-        self._left_tabs.removeTab(index)
+        w = tabs.widget(index)
+        tabs.removeTab(index)
         self._dispose_tab_widget(w)
+        self._sync_explore_pane()
 
     def _dispose_tab_widget(self, w):
         """The ONE teardown path for an operator UI — tab close, float close, and app exit all
@@ -2777,26 +2858,40 @@ class PlateWindow(QMainWindow):
         w.deleteLater()
 
     # -- drag a tab out -> free-floating window (IMA-209); Re-dock returns it ---------------------
-    def _detach_tab(self, index: int):
-        """Detach the tab at `index` into a _FloatWindow. ALL detach logic lives here (the drag in
-        _DetachTabBar is a thin, deferred caller) so the offscreen tests drive it directly.
-        Returns the new window, or None when the tab can't detach (home tab / unregistered)."""
-        if index <= 0:
+    def _detach_tab(self, index: int, tabs=None):
+        """Detach the tab at `index` of `tabs` into a _FloatWindow. ALL detach logic lives here (the
+        drag in _DetachTabBar is a thin, deferred caller) so the offscreen tests drive it directly.
+        Returns the new window, or None when the tab can't detach (home tab / unregistered).
+
+        ONE implementation serves both bars (IMA-237): pane 3's tabs float out through this exact
+        path, and re-dock to the bar they came from. *tabs* defaults to the process console, so
+        IMA-209's callers and tests are unchanged."""
+        tabs = self._left_tabs if tabs is None else tabs
+        if index <= 0 and tabs is self._left_tabs:   # the process console's home tab never detaches
             return None
-        w = self._left_tabs.widget(index)
+        if index < 0:
+            return None
+        w = tabs.widget(index)
         key = next((k for k, v in self._op_tabs.items() if v is w), None)
         if key is None:
             return None
-        title = self._left_tabs.tabText(index)
-        self._left_tabs.removeTab(index)
+        title = tabs.tabText(index)
+        tabs.removeTab(index)
         del self._op_tabs[key]
         # _layers_tab is deliberately NOT cleared: the widget lives on in the float and
         # _refresh_layers_tab writes into it directly, so a floating Layers keeps updating.
+        # `*_` is load-bearing: on_redock is connected to QPushButton.clicked, which passes
+        # `checked=False` and would land on a bare `lambda k=key:` AS k — so the Re-dock button
+        # called _redock(False), found no such key in _floating, and returned silently. The button
+        # had been dead since IMA-209 because every test called _redock(key) directly instead of
+        # clicking it. Swallow the signal's argument and keep the key bound.
         win = _FloatWindow(title, w,
-                           on_close=lambda k=key: self._on_float_closed(k),
-                           on_redock=lambda k=key: self._redock(k))
+                           on_close=lambda *_, k=key: self._on_float_closed(k),
+                           on_redock=lambda *_, k=key: self._redock(k))
+        win._home_tabs = tabs        # re-dock returns it to the bar it was dragged out of
         self._floating[key] = win
         win.show()
+        self._sync_explore_pane()    # pane 3 collapses if that was its last tab
         return win
 
     def _on_float_closed(self, key: str):
@@ -2807,6 +2902,7 @@ class PlateWindow(QMainWindow):
         w = win.take_content()
         if w is not None:
             self._dispose_tab_widget(w)
+        self._sync_explore_pane()
 
     def _redock(self, key: str):
         """Re-dock button: return the floated widget to the tab bar — the SAME object, so a live
@@ -2815,14 +2911,20 @@ class PlateWindow(QMainWindow):
         if win is None:
             return
         title = win._tab_title
+        # `is None`, never `or`: an EMPTY QTabWidget is falsy in PyQt, so `_home_tabs or _left_tabs`
+        # sent every re-dock from a just-emptied pane 3 into the process console instead.
+        tabs = getattr(win, "_home_tabs", None)
+        if tabs is None:
+            tabs = self._left_tabs                           # back to the bar it came from
         w = win.take_content()                             # empties the window: its close is plain
         win.close()
         win.deleteLater()
         if w is None:
             return
         self._op_tabs[key] = w
-        self._left_tabs.addTab(w, title)
-        self._left_tabs.setCurrentWidget(w)
+        tabs.addTab(w, title)
+        self._sync_explore_pane()
+        tabs.setCurrentWidget(w)
 
     def _discard_exploration(self, tab: "_ExplorationTab"):
         """Tear down one exploration tab's work: stop its run if it owns the live one, then drop
@@ -2884,9 +2986,9 @@ class PlateWindow(QMainWindow):
         at the OUTGOING acquisition mid-teardown is pure waste (ingest rebuilds it all anyway)."""
         self._tabs_muted = True
         try:
-            for i in range(self._left_tabs.count() - 1, 0, -1):
-                if isinstance(self._left_tabs.widget(i), _ExplorationTab):
-                    self._close_op_tab(i)
+            for i in range(self._explore_tabs.count() - 1, -1, -1):
+                if isinstance(self._explore_tabs.widget(i), _ExplorationTab):
+                    self._close_op_tab(i, self._explore_tabs)
             # ...and the ones dragged out into floating windows (IMA-209). A float is off the tab
             # bar but NOT off the plate: it still owns layers and can still own the live run.
             for key, win in list(self._floating.items()):
@@ -2918,11 +3020,27 @@ class PlateWindow(QMainWindow):
             self._readout.setText(f"{len(unknown)} region(s) are not in this acquisition: {unknown[:3]}")
             return None
         key = exploration_tab_key(self._acq_name, regions)
+        # PANE 3 (IMA-237), not the process console: the Shift-drag that opens this tab is also what
+        # REVEALS the exploration pane, which is why it is the gesture and not a menu item.
         self._open_op_tab(key, exploration_tab_label(regions),
-                          lambda: self._build_exploration_tab(regions, key))
+                          lambda: self._build_exploration_tab(regions, key),
+                          tabs=self._explore_tabs)
         return key
 
-    def _on_tab_changed(self, index: int, force: bool = False):
+    def _current_exploration(self) -> Optional["_ExplorationTab"]:
+        """The exploration tab the plate and viewer follow: pane 3's FRONT tab, or None when pane 3
+        is empty (IMA-237).
+
+        Before pane 3 existed, "which tab is in front" was a single question with a single answer,
+        because exploration tabs shared the process console's bar. Now the console and pane 3 are
+        side by side and both are visible at once, so scope is owned by pane 3 alone — opening the
+        Layers tab in pane 1 must not silently un-scope the viewer beside it."""
+        if self._explore_tabs.count() == 0:
+            return None
+        w = self._explore_tabs.currentWidget()
+        return w if isinstance(w, _ExplorationTab) else None
+
+    def _on_tab_changed(self, index: int = -1, force: bool = False):
         """The plate + detail follow the ACTIVE tab (IMA-205).
 
         An exploration tab claims to be scoped to its subset, so the plate's status dots and the
@@ -2947,11 +3065,11 @@ class PlateWindow(QMainWindow):
         if self._busy():
             self._request_resync()   # never retarget the slider a live run is pushing into — LATER
             return
-        w = self._left_tabs.widget(index)
+        w = self._current_exploration()      # pane 3 owns scope now — not the index we were handed
         prev = self._active_exploration
         if prev is not None and self._overview is not None:
             prev.status = self._overview.status_snapshot()      # park the outgoing tab's dots
-        if isinstance(w, _ExplorationTab):
+        if w is not None:
             self._active_exploration = w
             self._setup_raw_detail(order=w.regions)
             self._overview.set_all_status("empty")
@@ -2978,8 +3096,8 @@ class PlateWindow(QMainWindow):
         is silently discarded, and no later event re-delivers it. The pending flag IS that later
         event; ``_on_run_drained`` fires it as soon as the last worker thread actually exits."""
         self._pending_resync = True
-        w = self._left_tabs.widget(self._left_tabs.currentIndex())
-        if isinstance(w, _ExplorationTab):
+        w = self._current_exploration()
+        if w is not None:
             # say so IN THE TAB rather than in _readout: the run's progress writes _readout on every
             # well, so a note there would be gone before the user could read it.
             w.set_sync_pending(True)
@@ -2996,7 +3114,7 @@ class PlateWindow(QMainWindow):
         if not self._pending_resync:
             return
         self._pending_resync = False
-        self._on_tab_changed(self._left_tabs.currentIndex(), force=True)
+        self._on_tab_changed(force=True)
 
     def _activate_operator(self, key: str):
         """Operator card / menu clicked: open the operator's UI tab. Fully generic — driven by the

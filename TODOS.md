@@ -301,3 +301,19 @@ so a future session doesn't rediscover it from zero.
 - **Cons:** `project_plate` picks FOVs through `select_fovs(metadata, n_fovs)`, which cannot express an arbitrary `(region, fov)` list — the semantics genuinely do not match a user selection today, so adopting it needs a new entry point, not a swap.
 - **Context:** IMA-228 deliberately chose the sequential loop: selections are 1 FOV today (`n_fovs=1`, `_viewer.py:853`), each FOV is a few hundred ms, and explicit beat clever. Revisit when IMA-205's exploration pane makes multi-FOV selections real and someone can measure an actual slow export. Do not pre-optimise this on speculation.
 - **Depends on / blocked by:** IMA-187 (multi-FOV), IMA-205 (exploration pane).
+
+## Pane 3 width is not remembered across a collapse → follow-up after IMA-237
+- **What:** Persist the exploration pane's width so closing its last tab and re-opening one restores the width the user dragged the splitter to, instead of recomputing 22% of the window.
+- **Why:** `_sync_explore_pane` hands pane 3's width back to the VIEWER pane on collapse and recomputes it on the next reveal. A user who deliberately widens pane 3, closes their last subset, then Shift-drags again silently loses that adjustment.
+- **Pros:** Small — one remembered int, set from `_split.sizes()` at collapse time.
+- **Cons:** Needs a rule for the case where the window was resized while pane 3 was collapsed, or the remembered width can exceed the window.
+- **Context:** IMA-237 (2026-07-21). The reveal deliberately takes its width from the VIEWER pane, never the plate pane (requirement 5), and that rule must survive whatever remembering is added. `_sync_explore_pane` is the single place both directions live.
+- **Depends on / blocked by:** nothing; IMA-237 landed.
+
+## Drag a tab BETWEEN panes 1 and 3 → follow-up after IMA-237
+- **What:** Let a tab dragged out of pane 1 be dropped into pane 3's bar and vice versa, rather than only floating out and re-docking to its origin.
+- **Why:** IMA-237 generalized `_detach_tab`/`_redock` to take a source tab-widget, so both bars already route through one implementation and a float remembers its home bar (`_home_tabs`). Cross-pane docking is now a gesture question, not an architecture one.
+- **Pros:** The architecture is already paid for; this is the drop-target half.
+- **Cons:** Same open question as the IMA-209 drag-back TODO — no user has asked for it yet.
+- **Context:** IMA-237 (2026-07-21). Pairs with "ImageJ-style drag-BACK re-attach for floating tabs"; if either is built, build both against the same drop-target code.
+- **Depends on / blocked by:** real user demand; do not pre-build.

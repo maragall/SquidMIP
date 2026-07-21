@@ -33,7 +33,7 @@ if "PySide6" in sys.modules or "PySide2" in sys.modules:
 from PyQt5.QtCore import QEvent, QPointF, Qt  # noqa: E402
 from PyQt5.QtGui import QMouseEvent  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
-    QApplication, QPushButton, QSlider, QSpinBox, QTabWidget, QWidget,
+    QApplication, QPushButton, QSlider, QSpinBox, QWidget,
 )
 
 from squidmip import _viewer as V  # noqa: E402
@@ -99,18 +99,14 @@ def _drain_until(app, pred, timeout=60):
     return pred()
 
 
-def _leave_exploration_tabs(win):
-    """Bring every tab bar in the window off its exploration tab, whichever pane owns them.
+def _close_exploration_pane(win):
+    """Empty pane 3 through the REAL tab-close path, restoring a whole-plate detail slider.
 
-    An exploration tab scopes the detail slider to its subset (IMA-205), so a test that wants a
-    whole-plate detail again has to leave it — via the REAL currentChanged path, not by poking
-    _push_index. Layout-independent on purpose: IMA-237 moved these tabs into their own pane."""
-    for bar in win.findChildren(QTabWidget):
-        for i in range(bar.count()):
-            if not isinstance(bar.widget(i), V._ExplorationTab):
-                if isinstance(bar.widget(bar.currentIndex()), V._ExplorationTab):
-                    bar.setCurrentIndex(i)
-                break
+    An exploration tab scopes the slider to its subset (IMA-205), and since IMA-237 that scope is
+    owned by pane 3 alone — so "give me the whole plate back" means closing its tabs, not switching
+    pane 1. Never pokes _push_index directly: the point is to drive what the user drives."""
+    for i in range(win._explore_tabs.count() - 1, -1, -1):
+        win._close_op_tab(i, win._explore_tabs)
 
 
 def _press(x, y, button=Qt.LeftButton):
@@ -1034,7 +1030,8 @@ def test_open_exploration_tab_lists_exactly_the_selection(qapp, stub_detail, squ
     assert isinstance(tab, V._ExplorationTab)
     assert tab.regions == ["B3"]
     assert tab.listing.text() == "B3"                 # the tab shows exactly what it is scoped to
-    assert win._left_tabs.currentWidget() is tab
+    assert win._explore_tabs.currentWidget() is tab   # ...in PANE 3, not the process console
+    assert win._left_tabs.indexOf(tab) == -1
     win.close()
 
 
@@ -1042,14 +1039,14 @@ def test_open_exploration_tab_same_selection_focuses_not_duplicates(qapp, stub_d
     root, _ = squid_dataset
     win = V.PlateWindow(None)
     win.ingest(str(root))
-    n0 = win._left_tabs.count()
+    n0 = win._explore_tabs.count()
     k1 = win.open_exploration_tab(["B2", "B3"])
     k2 = win.open_exploration_tab(["B3", "B2"])       # same SET, different order
     assert k1 == k2
-    assert win._left_tabs.count() == n0 + 1           # one tab, not two
+    assert win._explore_tabs.count() == n0 + 1        # one tab, not two
     k3 = win.open_exploration_tab(["B3"])             # a different set DOES open another
     assert k3 != k1
-    assert win._left_tabs.count() == n0 + 2
+    assert win._explore_tabs.count() == n0 + 2
     win.close()
 
 
@@ -1057,12 +1054,13 @@ def test_open_exploration_tab_rejects_empty_and_unknown(qapp, stub_detail, squid
     root, _ = squid_dataset
     win = V.PlateWindow(None)
     win.ingest(str(root))
-    n0 = win._left_tabs.count()
+    n0 = win._explore_tabs.count()
     assert win.open_exploration_tab([]) is None
     assert "empty selection" in win._readout.text().lower()
     assert win.open_exploration_tab(["ZZ99"]) is None          # named, not a raw KeyError
     assert "not in this acquisition" in win._readout.text().lower()
-    assert win._left_tabs.count() == n0
+    assert win._explore_tabs.count() == n0
+    assert win._explore_tabs.isHidden()          # a REFUSED drag must not reveal pane 3
     win.close()
 
 
@@ -1178,9 +1176,8 @@ def test_closing_tab_mid_run_stops_worker_and_frees_canvas(qapp, stub_detail, sq
     win.run_operator("mip", regions=["B2", "B3"], save=False, tab_key=key)
     layer = f"mip@{key}"
     assert win._active_op_key == layer
-    idx = next(i for i in range(win._left_tabs.count())
-               if win._left_tabs.widget(i) is win._op_tabs[key])
-    win._close_op_tab(idx)                                       # close it, possibly mid-run
+    idx = win._explore_tabs.indexOf(win._op_tabs[key])
+    win._close_op_tab(idx, win._explore_tabs)                    # close it, possibly mid-run
     assert _drain_until(qapp, lambda: not win._busy())
     assert layer not in {ly.key for ly in win._op_stack.layers()}   # layer dropped
     assert layer not in win._overview._op_canvas                    # ~plate-sized canvas freed
@@ -1196,12 +1193,12 @@ def test_closing_idle_exploration_tab_is_clean(qapp, stub_detail, squid_dataset)
     win = V.PlateWindow(None)
     win.ingest(str(root))
     key = win.open_exploration_tab(["B2"])
-    n = win._left_tabs.count()
-    idx = next(i for i in range(win._left_tabs.count())
-               if win._left_tabs.widget(i) is win._op_tabs[key])
-    win._close_op_tab(idx)
-    assert win._left_tabs.count() == n - 1
+    n = win._explore_tabs.count()
+    idx = win._explore_tabs.indexOf(win._op_tabs[key])
+    win._close_op_tab(idx, win._explore_tabs)
+    assert win._explore_tabs.count() == n - 1
     assert key not in win._op_tabs
+    assert win._explore_tabs.isHidden()          # last tab gone -> pane 3 collapses again
     win.close()
 
 
@@ -1232,7 +1229,11 @@ def test_busy_guard_covers_retired_workers(qapp, stub_detail, squid_dataset, tmp
     win.close()
 
 
-def test_tab_switch_repoints_detail_and_home_restores_plate(qapp, stub_detail, squid_dataset):
+def test_tab_switch_repoints_detail_and_closing_it_restores_plate(qapp, stub_detail, squid_dataset):
+    """IMA-237 moved exploration into PANE 3, so scope is owned by pane 3's front tab, not by
+    whatever is in front of the process console. Switching pane 1 back to 'Process wells' must
+    therefore NOT un-scope the viewer (pane 3 is still right there, still showing the subset);
+    closing the exploration tab is what restores the whole plate."""
     root, _ = squid_dataset
     win = V.PlateWindow(None)
     win.ingest(str(root))
@@ -1240,7 +1241,11 @@ def test_tab_switch_repoints_detail_and_home_restores_plate(qapp, stub_detail, s
     qapp.processEvents()
     assert win._detail._fov_labels == ["B3:0"]                  # follows the exploration tab
     assert win._active_exploration is win._op_tabs[key]
-    win._left_tabs.setCurrentIndex(0)                           # back to "Process wells"
+    win._left_tabs.setCurrentIndex(0)                           # pane 1 back to "Process wells"
+    qapp.processEvents()
+    assert win._detail._fov_labels == ["B3:0"]                  # pane 3 still owns the scope
+    assert win._active_exploration is win._op_tabs[key]
+    win._close_op_tab(win._explore_tabs.indexOf(win._op_tabs[key]), win._explore_tabs)
     qapp.processEvents()
     assert win._detail._fov_labels == ["B2:0", "B3:0"]          # whole plate restored
     assert win._active_exploration is None
@@ -1272,8 +1277,8 @@ def test_ingest_closes_exploration_tabs(qapp, stub_detail, squid_dataset):
     win.ingest(str(root))                              # re-open: tabs belong to the old _fov_index
     qapp.processEvents()
     assert key not in win._op_tabs
-    assert not [i for i in range(win._left_tabs.count())
-                if isinstance(win._left_tabs.widget(i), V._ExplorationTab)]
+    assert win._explore_tabs.count() == 0
+    assert win._explore_tabs.isHidden()           # ...and pane 3 collapses with them
     assert win._active_exploration is None
     win.close()
 
@@ -1345,9 +1350,8 @@ def test_completed_save_run_is_not_marked_incomplete(qapp, stub_detail, squid_da
     win.run_operator("mip", out_parent=str(tmp_path), regions=["B2", "B3"], save=True, tab_key=key)
     assert _drain_until(qapp, lambda: not win._busy(), timeout=90)
     out = tmp_path / f"{win._acq_name}.hcs"
-    idx = next(i for i in range(win._left_tabs.count())
-               if win._left_tabs.widget(i) is win._op_tabs[key])
-    win._close_op_tab(idx)                              # close AFTER it finished
+    idx = win._explore_tabs.indexOf(win._op_tabs[key])
+    win._close_op_tab(idx, win._explore_tabs)           # close AFTER it finished
     assert not (out / "INCOMPLETE").exists(), "a completed plate must not be flagged incomplete"
     win.close()
 
@@ -1473,13 +1477,14 @@ def test_shift_drag_opens_an_exploration_tab_scoped_to_the_selected_wells(
     _shift_drag_over(win, ["B3"])                      # marquee over ONE of the two wells
     qapp.processEvents()
 
-    tabs = [win._left_tabs.widget(i) for i in range(win._left_tabs.count())
-            if isinstance(win._left_tabs.widget(i), V._ExplorationTab)]
+    tabs = [win._explore_tabs.widget(i) for i in range(win._explore_tabs.count())
+            if isinstance(win._explore_tabs.widget(i), V._ExplorationTab)]
     assert len(tabs) == 1, "the shift-drag gesture did not open an exploration tab"
     tab = tabs[0]
     assert tab.regions == ["B3"]                       # scoped to EXACTLY the selected wells
     assert tab.listing.text() == "B3"
-    assert win._left_tabs.currentWidget() is tab       # ...and it is brought to the front
+    assert win._explore_tabs.currentWidget() is tab    # ...brought to the front of PANE 3
+    assert not win._explore_tabs.isHidden(), "the shift-drag did not reveal pane 3"
     assert win._active_exploration is tab
     assert win._detail._fov_labels == ["B3:0"]         # the viewer follows the subset
     assert win._selected_regions == ["B3"]             # IMA-221 scoping is untouched
@@ -1493,7 +1498,7 @@ def test_shift_drag_over_several_wells_scopes_the_tab_to_all_of_them(
     win.ingest(str(root))
     _shift_drag_over(win, ["B2", "B3"])
     qapp.processEvents()
-    tab = win._left_tabs.currentWidget()
+    tab = win._explore_tabs.currentWidget()
     assert isinstance(tab, V._ExplorationTab)
     assert tab.regions == ["B2", "B3"]
     assert win._detail._fov_labels == ["B2:0", "B3:0"]
@@ -1508,11 +1513,11 @@ def test_repeating_the_same_shift_drag_focuses_the_same_tab(qapp, stub_detail, s
     win.ingest(str(root))
     _shift_drag_over(win, ["B3"])
     qapp.processEvents()
-    first = win._left_tabs.currentWidget()
+    first = win._explore_tabs.currentWidget()
     _shift_drag_over(win, ["B3"])
     qapp.processEvents()
-    tabs = [win._left_tabs.widget(i) for i in range(win._left_tabs.count())
-            if isinstance(win._left_tabs.widget(i), V._ExplorationTab)]
+    tabs = [win._explore_tabs.widget(i) for i in range(win._explore_tabs.count())
+            if isinstance(win._explore_tabs.widget(i), V._ExplorationTab)]
     assert tabs == [first]
     win.close()
 
@@ -1529,8 +1534,7 @@ def test_shift_click_refines_the_selection_without_opening_a_tab(qapp, stub_deta
     ov.mouseReleaseEvent(_mouse("release", _pt(*rc), Qt.ShiftModifier, buttons=Qt.NoButton))
     qapp.processEvents()
     assert ov.selected_wells() == ["B3"]                       # selection still happens...
-    assert not [i for i in range(win._left_tabs.count())
-                if isinstance(win._left_tabs.widget(i), V._ExplorationTab)]   # ...no tab
+    assert win._explore_tabs.count() == 0 and win._explore_tabs.isHidden()   # ...no tab
     win.close()
 
 
@@ -1544,8 +1548,7 @@ def test_shift_drag_over_empty_plate_opens_nothing_and_says_nothing(
     ov = _freeze(win._overview)
     _drag(ov, _pt(0, 0), _pt(0, 0.5), Qt.ShiftModifier)        # row A: no acquired wells
     qapp.processEvents()
-    assert not [i for i in range(win._left_tabs.count())
-                if isinstance(win._left_tabs.widget(i), V._ExplorationTab)]
+    assert win._explore_tabs.count() == 0 and win._explore_tabs.isHidden()
     assert win._readout.text() == before
     win.close()
 
@@ -1609,9 +1612,8 @@ def test_closing_the_front_tab_mid_run_restores_a_coherent_plate_view(
     assert win._busy()                                        # the run is live and blocked
     assert win._push_index == {win._fov_index["B3"]["idx"]: 0}
 
-    idx = next(i for i in range(win._left_tabs.count())
-               if win._left_tabs.widget(i) is win._op_tabs[key])
-    win._close_op_tab(idx)                                    # close it MID-RUN
+    idx = win._explore_tabs.indexOf(win._op_tabs[key])
+    win._close_op_tab(idx, win._explore_tabs)                 # close it MID-RUN
     assert _drain_until(qapp, lambda: not win._busy())
     qapp.processEvents()
 
@@ -1662,7 +1664,7 @@ def test_a_second_tab_opened_mid_run_syncs_when_the_run_finishes(
     key_b = win.open_exploration_tab(["B3"])                   # ...open a SECOND tab mid-run
     qapp.processEvents()
     tab_b = win._op_tabs[key_b]
-    assert win._left_tabs.currentWidget() is tab_b             # it is in front...
+    assert win._explore_tabs.currentWidget() is tab_b          # it is in front of pane 3...
     assert win._detail._fov_labels == ["B2:0"]                 # ...but the view still shows tab A
     assert tab_b.sync_pending, "the front tab shows another tab's run and says nothing"
     assert tab_b.sync_note.isVisibleTo(tab_b)
@@ -1688,15 +1690,20 @@ def test_deferred_resync_survives_a_failed_run(qapp, stub_detail, squid_dataset,
     key_a = win.open_exploration_tab(["B2"])
     qapp.processEvents()
     win.run_operator("mip", regions=["B2"], save=False, tab_key=key_a)
-    win._left_tabs.setCurrentIndex(0)                          # switch home MID-RUN (deferred)
+    # Defer a switch WITHOUT stopping the run: open a second tab in pane 3 mid-run. (Closing tab A
+    # would also defer, but _discard_exploration stops the worker, so the run would no longer be
+    # the failing one this test is about.)
+    key_b = win.open_exploration_tab(["B3"])
     qapp.processEvents()
-    assert win._detail._fov_labels == ["B2:0"]
+    assert win._pending_resync
+    assert win._detail._fov_labels == ["B2:0"]                 # still tab A's live run
     blocking_worker[-1].failed.emit("boom")
     blocking_worker[-1].release()
     assert _drain_until(qapp, lambda: not win._busy())
     qapp.processEvents()
-    assert win._detail._fov_labels == ["B2:0", "B3:0"]         # whole plate restored
-    assert win._active_exploration is None
+    assert win._detail._fov_labels == ["B3:0"]                 # handed to the front tab anyway
+    assert win._active_exploration is win._op_tabs[key_b]
+    assert not win._pending_resync
 # --- loupe: press-and-hold magnifier (IMA-208) ----------------------------------------------
 #
 # The gesture and the geometry are tested separately from the I/O: the state machine needs no
@@ -2488,10 +2495,10 @@ def test_real_shift_drag_selection_is_what_minerva_exports(qapp, stub_detail, sq
     assert win.selected_region_fovs() == expected             # IMA-221's payload
     assert win.minerva_selection() == expected                # ...is what IMA-228 exports
 
-    # The same Shift-drag also opens IMA-205's exploration tab, which SCOPES the detail slider to
-    # the subset — so leave that tab before opening a well outside it, or activate_well correctly
-    # refuses and the precedence assertion below would pass vacuously.
-    _leave_exploration_tabs(win)
+    # The same Shift-drag also opens IMA-205's exploration tab in pane 3, which SCOPES the detail
+    # slider to the subset — so empty pane 3 before opening a well outside it, or activate_well
+    # correctly refuses and the precedence assertion below would pass vacuously.
+    _close_exploration_pane(win)
     qapp.processEvents()
     other = ov._by_rc[sorted(ov._by_rc)[-1]]
     win.activate_well(other, 0)                               # a DIFFERENT well open in detail
@@ -2633,3 +2640,161 @@ def test_closing_mid_export_disconnects_the_worker(qapp, stub_detail, squid_data
     worker.wait(5000)
     qapp.processEvents()
     assert win._minerva is None
+
+
+# --- IMA-237: three horizontal panes, the third revealed by the exploration gesture ------------
+#
+# Julio's requirement is a THREE-pane app on one monitor: pane 1 = plate + the tabbed controls,
+# pane 2 = the initial viewer, pane 3 = exploration. The constraint that shapes the code is that
+# pane 3 must not exist for a user who never Shift-drags, so these drive the REAL splitter and the
+# REAL gesture rather than asserting on a builder's return value.
+
+def test_outer_split_has_three_panes_and_pane3_starts_collapsed(qapp, stub_detail):
+    win = V.PlateWindow(None)
+    outer = win._split
+    assert outer.count() == 3, "the window is not a three-pane layout"
+    assert outer.widget(2) is win._explore_tabs, "pane 3 is not the exploration pane"
+    assert win._explore_tabs.isHidden()                 # collapsed: zero width, not an empty strip
+    assert outer.sizes()[2] == 0
+    win.close()
+
+
+def test_window_resize_never_grows_pane3_at_the_plate_pane_s_expense(qapp, stub_detail, squid_dataset):
+    """Requirement 5, measured rather than asserted on a stretch factor Qt won't read back:
+    widen the window with pane 3 open and the extra pixels go to panes 1 and 2."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.resize(1400, 900)
+    win.show()
+    qapp.processEvents()
+    win.ingest(str(root))
+    _shift_drag_over(win, ["B3"])
+    qapp.processEvents()
+    plate0, viewer0, explore0 = win._split.sizes()
+    assert explore0 > 0
+
+    win.resize(1900, 900)
+    qapp.processEvents()
+    plate1, viewer1, explore1 = win._split.sizes()
+    assert plate1 > plate0, "the plate pane did not get its share of the new width"
+    assert explore1 == explore0, "the exploration pane grew on resize instead of the plate"
+    win.close()
+
+
+def test_pane3_appears_only_after_a_real_shift_drag_and_takes_width_from_the_viewer(
+        qapp, stub_detail, squid_dataset):
+    """The headline: unchanged two-pane app until the gesture, three panes after it — and the
+    plate pane keeps every pixel it had."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.resize(1600, 900)
+    win.show()
+    qapp.processEvents()
+    win.ingest(str(root))
+    qapp.processEvents()
+
+    assert win._explore_tabs.isHidden()                 # BEFORE: pane 3 does not exist
+    assert win._explore_tabs.count() == 0
+    plate_before = win._split.sizes()[0]
+    viewer_before = win._split.sizes()[1]
+
+    _shift_drag_over(win, ["B3"])
+    qapp.processEvents()
+
+    assert not win._explore_tabs.isHidden(), "the shift-drag did not reveal pane 3"
+    assert win._explore_tabs.count() == 1               # ...and it is POPULATED, not just visible
+    assert isinstance(win._explore_tabs.currentWidget(), V._ExplorationTab)
+    plate_after, viewer_after, explore_after = win._split.sizes()
+    assert explore_after > 0
+    assert plate_after == plate_before, "pane 3 squashed the plate view"
+    assert viewer_after < viewer_before, "pane 3's width came from somewhere other than the viewer"
+    win.close()
+
+
+def test_exploration_tabs_are_not_in_the_process_console(qapp, stub_detail, squid_dataset):
+    """Requirement 3: exploration tabs moved OUT of pane 1's tab bar."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    key = win.open_exploration_tab(["B2", "B3"])
+    tab = win._op_tabs[key]
+    assert win._explore_tabs.indexOf(tab) >= 0
+    assert win._left_tabs.indexOf(tab) == -1
+    assert not [i for i in range(win._left_tabs.count())
+                if isinstance(win._left_tabs.widget(i), V._ExplorationTab)]
+    win.close()
+
+
+def test_a_tab_drags_out_of_pane3_through_the_same_detach_path_as_ima209(
+        qapp, stub_detail, squid_dataset):
+    """Requirement 4: ONE _detach_tab serves both bars — pane 3 floats out, and re-docks BACK to
+    pane 3 rather than landing in the process console."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    key = win.open_exploration_tab(["B3"])
+    tab = win._op_tabs[key]
+
+    fl = win._detach_tab(win._explore_tabs.indexOf(tab), win._explore_tabs)
+    assert isinstance(fl, V._FloatWindow)               # the IMA-209 float, not a second class
+    assert fl.content() is tab                          # the SAME widget, not a rebuild
+    assert win._explore_tabs.indexOf(tab) == -1
+    assert win._explore_tabs.isHidden()                 # its last tab left -> pane 3 collapses
+    assert win._floating[key] is fl
+
+    dock = next(b for b in fl.findChildren(QPushButton) if b.text() == "Re-dock")
+    dock.click()                                        # the float's own Re-dock button
+    qapp.processEvents()
+    assert win._explore_tabs.indexOf(tab) >= 0, "re-dock did not return it to pane 3"
+    assert win._left_tabs.indexOf(tab) == -1, "re-dock dumped it in the process console"
+    assert not win._explore_tabs.isHidden()
+    assert key not in win._floating
+    win.close()
+
+
+def test_pane3_index0_is_detachable_but_the_process_home_tab_is_not(qapp, stub_detail, squid_dataset):
+    """The home-tab guard belongs to the process console, not to _detach_tab in general: pane 3's
+    index 0 is an ordinary user-opened tab and must drag out like any other."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    assert win._detach_tab(0) is None                   # 'Process wells' — never detaches
+    assert win._left_tabs.count() >= 1
+    win.open_exploration_tab(["B3"])
+    assert isinstance(win._detach_tab(0, win._explore_tabs), V._FloatWindow)
+    assert win._explore_tabs.tabBar()._first_detachable == 0
+    assert win._left_tabs.tabBar()._first_detachable == 1
+    win.close()
+
+
+def test_opening_a_pane1_tab_does_not_unscope_the_viewer(qapp, stub_detail, squid_dataset):
+    """Both panes are visible at once now, so pane 1's front tab must not silently claim the
+    viewer's scope: opening Layers while an exploration tab is up used to look like a tab switch."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    key = win.open_exploration_tab(["B3"])
+    qapp.processEvents()
+    assert win._detail._fov_labels == ["B3:0"]
+    win._open_op_tab("layers", "Layers", win._build_layers_tab)   # a PANE 1 tab
+    qapp.processEvents()
+    assert win._detail._fov_labels == ["B3:0"], "a pane 1 tab stole the viewer's scope"
+    assert win._active_exploration is win._op_tabs[key]
+    win.close()
+
+
+def test_the_redock_BUTTON_works_not_just_the_method(qapp, stub_detail):
+    """REGRESSION (found by IMA-237 driving the real widget): QPushButton.clicked passes
+    `checked=False`, which bound to the `k=key` default of the on_redock lambda — so clicking
+    Re-dock called _redock(False), missed _floating entirely, and did nothing. Every existing test
+    called win._redock(key) directly, so the button was dead from IMA-209 until now."""
+    win = V.PlateWindow(None)
+    w = _open_stub_tab(win)
+    fl = win._detach_tab(win._left_tabs.indexOf(w))
+    dock = next(b for b in fl.findChildren(QPushButton) if b.text() == "Re-dock")
+    dock.click()                                             # the GESTURE, not the method
+    qapp.processEvents()
+    assert win._op_tabs.get("stub") is w, "the Re-dock button did nothing"
+    assert win._left_tabs.indexOf(w) >= 0
+    assert not win._floating
+    win.close()
