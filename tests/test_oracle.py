@@ -278,3 +278,22 @@ def test_grade_str_is_readable():
     fx = cut_fixture(src, grid=(2, 2), overlap_frac=0.20, max_offset_px=10, seed=16)
     assert str(grade_positions(fx.truth, fx)).startswith("PASS")
     assert str(grade_positions(fx.nominal, fx)).startswith("FAIL")
+
+
+def test_seam_ratio_does_not_discriminate_on_pure_noise():
+    """Documents the metric's known limit, so nobody trusts it where it cannot work.
+
+    Uncorrelated noise has no spatial structure, so a misplaced tile looks statistically
+    like a correct one and the seam gate passes regardless. That is why grade_positions
+    also checks placement, and why overlap_texture exists.
+    """
+    rng = np.random.default_rng(0)
+    noise = (rng.random((400, 400)) * 60000).astype(np.uint16)
+    fx = cut_fixture(noise, grid=(2, 2), overlap_frac=0.20, max_offset_px=10, seed=1)
+    th, tw = fx.tiles[0].shape
+    misplaced = seam_ratio(
+        paste(fx.tiles, fx.nominal), fx.nominal, (th, tw), mask=coverage(fx.tiles, fx.nominal)
+    )
+    assert misplaced <= 1.5, "on noise the seam gate cannot discriminate — documented limit"
+    # ...but the placement gate still catches it, which is the point.
+    assert not grade_positions(fx.nominal, fx).passed

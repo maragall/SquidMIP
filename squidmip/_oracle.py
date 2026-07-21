@@ -362,6 +362,13 @@ def seam_ratio(composite: np.ndarray, positions, tile_shape, mask=None) -> float
 
     Returns ``inf`` when the interior step is zero (a perfectly flat image carries no signal
     to normalise against) — reported honestly rather than papered over with a fudge factor.
+
+    **Know the limitation:** this metric needs *spatial structure*. On uncorrelated noise a
+    misplaced tile is statistically indistinguishable from a correct one, so the ratio stays
+    near 1.0 and the gate silently passes a bad mosaic. Real microscopy fields are structured,
+    so it discriminates in practice — but it is a companion to the placement check in
+    :func:`grade_positions`, never a replacement for it. Use :func:`overlap_texture` to
+    confirm there is signal to measure before trusting a seam result.
     """
     comp = np.asarray(composite).astype(np.float64)
     pos = np.asarray(positions, dtype=np.int64)
