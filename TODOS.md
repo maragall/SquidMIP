@@ -50,3 +50,43 @@ so a future session doesn't rediscover it from zero.
 - **Cons:** Different repo, different owner; not on any SquidMIP critical path.
 - **Context:** SquidMIP does **not** carry this bug — IMA-189's `squidmip/_channels.py` already resolves `display_color` correctly (top-level v1.0+ *and* nested `camera_settings`, mapped by name, raises on unresolved), and IMA-184 consumes `metadata.channels[].display_color` rather than re-parsing the yaml. This TODO is purely a flag for whoever owns `~/CEPHLA/projects/explorer/squid2minerva`.
 - **Depends on / blocked by:** squid2minerva maintainer.
+
+## Per-FOV zarr layout ingest → follow-up ticket
+- **What:** Read `{acq}/zarr/{region}/fov_{n}.ome.zarr` (Squid's non-HCS 5-D per-FOV zarr layout).
+- **Why:** IMA-229 deferred it, and the *original* rationale was wrong. The review assumed that
+  layout only appears for non-wellplate acquisitions whose region ids `_output.parse_well_id`
+  would refuse anyway. Verified false: `multi_point_worker.py:268` selects the layout from the
+  acquisition MODE (`is_hcs = is_select_wells or is_loaded_wells`), not from region naming. A
+  genuine wellplate run in flexible/manual-region mode produces this layout with region ids like
+  `B2` — which `parse_well_id` accepts and `write_plate` would handle fine.
+- **Pros:** Closes a gap real users on real plates will hit; the downstream pipeline already works.
+- **Cons:** A second discovery path (no plate/well group metadata — per-region directories of
+  independent stores), so `fovs_per_region` and plate ordering come from directory names.
+- **Context:** IMA-229 refuses it by name (that refusal message must NOT claim "non-wellplate").
+  Trigger to build it: the first user report of the refusal, or confirmation that anyone acquires
+  in flexible-region mode. The reader work is small once IMA-229's shared plate-layout module and
+  `SquidZarrReader` exist — mostly a different discovery front-end onto the same read path.
+- **Depends on / blocked by:** IMA-229 (shared layout module + zarr read path).
+
+## 6-D zarr (`acquisition.zarr`) ingest → probably never
+- **What:** Read Squid's `ZARR_USE_6D_FOV_DIMENSION` output: one `(FOV,T,C,Z,Y,X)` array per region.
+- **Why:** Captured so the refusal in `open_reader` reads as a decision, not an oversight.
+- **Pros:** Complete coverage of Squid's documented format matrix.
+- **Cons:** Squid's own docs (`software/docs/zarr-v3-format.md:61`) call it non-standard and warn
+  that most OME-NGFF viewers misread it; the array lives at the store root with
+  `datasets.path = "."`, so it needs its own metadata handling too.
+- **Context:** Off by default (`ZARR_USE_6D_FOV_DIMENSION=False`). Only build if a real dataset
+  turns up. `ndviewer_light` has `start_zarr_acquisition_6d()` if it ever does.
+- **Depends on / blocked by:** a real 6-D acquisition existing.
+
+## Streaming / live read of an in-progress zarr acquisition → future
+- **What:** Follow a running acquisition rather than opening a snapshot of it.
+- **Why:** IMA-229's `allow_incomplete=True` opens a partial plate once; it does not re-scan as
+  new wells land. Zarr's streaming-read property is one of the format's headline advantages
+  (`zarr-v3-format.md:11`) and is currently unused.
+- **Pros:** MIP a plate while it is still being acquired; the same read path already works.
+- **Cons:** Needs an invalidation/re-scan story for the discovery intersection and the plate view,
+  plus a definition of "done enough to project".
+- **Context:** IMA-229 already treats plate/well metadata as a plan and intersects it with disk,
+  which is exactly the primitive a re-scan would repeat on a timer.
+- **Depends on / blocked by:** IMA-229.
