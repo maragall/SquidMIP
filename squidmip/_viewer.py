@@ -2515,7 +2515,10 @@ class _OperatorWorker(QThread):
     def run(self):
         try:
             projector = self._operator
-            if self._save and not self._region_op:
+            if self._save:
+                # write_plate picks its own stream from the operator, so a region operator (stitch)
+                # persists through the same call: both twins yield (region, fov, (T,C,1,Y,X)), and
+                # the disk guard sizes a region write from real mosaic extents rather than frames.
                 from squidmip import write_plate  # persist + project in one bounded, streaming pass
 
                 write_plate(self._reader, self._out_dir, n_fovs=self._n_fovs, workers=_VIEWER_WORKERS,
@@ -2535,9 +2538,8 @@ class _OperatorWorker(QThread):
                     # (bounded in-flight window, regions=, on_error=, and the same
                     # (region, fov, (T, C, 1, Y, X)) yield), so the loop below is UNCHANGED.
                     # workers=1: peak memory is workers x one fused mosaic (~0.9 GB on a 27-FOV 10x
-                    # well), not the ~139 MB of one projected FOV. Persisting a stitched plate needs
-                    # write_plate to accept a region operator (squidmip/_output.py); until that
-                    # lands a stitch run is compute + view only -- hence `not self._region_op` above.
+                    # well), not the ~139 MB of one projected FOV. Saving takes the write_plate
+                    # branch above, which dispatches to stitch_plate itself.
                     from squidmip import stitch_plate
 
                     stream = stitch_plate(self._reader, workers=1, operator=projector,
