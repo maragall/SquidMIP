@@ -31,7 +31,12 @@ Flow::
     project_plate(reader, ...) ─► (region, fov, (T,C,1,Y,X))
                                        │  per well, as it arrives:
                                        ├─► field group: array 0 (full-res) + multiscales + omero
+                                       ├─► PyramidSource.ingest (optional live tile source —
+                                       │    the coarse pyramid tail, already computed, cached in RAM)
                                        └─► individual TIFFs (one per channel, per timepoint)
+
+The read side (IMA-217) is :class:`PyramidSource` below — the canonical tile-read API over
+the written plate (per-FOV ``read``/``levels``/``wells`` + IMA-216's ``read_tile`` seam).
 
 Colors come from ``metadata.channels[].display_color`` (IMA-189 already resolves them, mapped
 by name, raising on an unrecognised channel) — the writer never re-parses the acquisition YAML.
@@ -41,7 +46,10 @@ is exactly the array's C-axis order (IMA-183 builds the C axis from that list).
 
 from __future__ import annotations
 
+import json
 import re
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
@@ -232,11 +240,18 @@ def _validate_image(image: np.ndarray, channels: list[dict]) -> None:
         )
 
 
-def _write_field(field_dir: Path, image: np.ndarray, channels: list[dict], pixel_size_um, dz_um=None) -> int:
+def _write_field(field_dir: Path, image: np.ndarray, channels: list[dict], pixel_size_um, dz_um=None) -> list[np.ndarray]:
     """Write one field: pyramid levels ``0..L`` (0 = full-res, pixel-exact) + multiscales + omero.
 
-    Returns the number of levels written (1 for a small field with no pyramid)."""
+    Returns the pyramid level list (so the caller can hand it to a live
+    :class:`PyramidSource` without recomputing; ``[image]`` alone for a small field).
+
+    Ordering is the availability contract: the field group ``zarr.json`` is UNLINKED
+    first and written LAST, so its parseable presence proves a complete field to a
+    concurrent reader — including across an idempotent rerun, where the prior run's
+    group json must not make a mid-rewrite field look available."""
     _validate_image(image, channels)
+    (field_dir / "zarr.json").unlink(missing_ok=True)
     levels = _pyramid(image)
     for i, lvl in enumerate(levels):
         store = create_array(field_dir / str(i), lvl.shape, lvl.dtype)
@@ -250,7 +265,7 @@ def _write_field(field_dir: Path, image: np.ndarray, channels: list[dict], pixel
             "omero": _omero(channels, image.dtype),
         },
     )
-    return len(levels)
+    return levels
 
 
 def _write_tiffs(tiff_root: Path, region: str, fov: int, image: np.ndarray, channel_names: list[str]) -> None:
@@ -262,6 +277,249 @@ def _write_tiffs(tiff_root: Path, region: str, fov: int, image: np.ndarray, chan
         for c_i, channel in enumerate(channel_names):
             plane = image[t, c_i, 0]  # (Y, X), native dtype, z collapsed
             tifffile.imwrite(tdir / f"{region}_{fov}_0_{channel}.tiff", plane)
+
+
+# --- pyramid read side (IMA-217) -------------------------------------------------------------
+
+_CACHE_MAX_YX = 1024      # cache band: levels with index>0 AND max(Y,X) <= this (one chunk)
+_HANDLE_LRU_MAX = 128     # open tensorstore handles kept per source
+
+
+def _clamp_slice(s: slice, dim: int) -> slice:
+    """Clamp a level-local pixel slice into [0, dim]; a fully-out-of-range slice becomes
+    empty (never None). Negative/stepped slices are unsupported (contract: undefined)."""
+    start = 0 if s.start is None else min(max(int(s.start), 0), dim)
+    stop = dim if s.stop is None else min(max(int(s.stop), 0), dim)
+    return slice(start, max(start, stop))
+
+
+class PyramidSource:
+    """Tile-read API over a (possibly still-writing) ``plate.ome.zarr`` — IMA-217.
+
+    ONE class serves both the cold reopen (disk via tensorstore) and the live run
+    (a write-fed RAM cache of coarse pyramid levels), per the locked spec
+    (.spec/open/ima-217.md). ``read`` order and availability semantics::
+
+        read(region, fov, level, ys, xs, t)
+          │ 1. RAM hit ────────────► slice-copy INSIDE the lock ──► (C, h, w)
+          │ 2. gate fails ─────────► None   (pending — tiler keeps parent)
+          │    gate = field group zarr.json EXISTS AND PARSES (written LAST,
+          │           unlinked FIRST on rerun; in-process guarantee, no fsync)
+          │ 3. level >= count ─────► None   (small field / shrunken rerun — the
+          │                                  stale higher-level dirs are never opened)
+          │ 4. t out of range ─────► IndexError (normalized, both paths)
+          └ 5. tensorstore read ───► (C, h, w); post-gate failures RAISE
+                                     (absent chunk FILES read as fill-value zeros —
+                                      zarr semantics, undetectable here)
+
+    ``ingest`` (writer threads) is the SINGLE invalidation point: it drops every
+    cached level, memoized shape/count, and open handle for that FOV before
+    inserting the new coarse tail — which makes memoization, reruns, and shrunken
+    pyramids safe together. Keys are ``parse_well_id``-canonical, so "b2" and "B2"
+    hit the same entry. External/cross-process rewrite of an open plate is out of
+    contract.
+    """
+
+    def __init__(self, plate_dir, *, cache_bytes: int = 512 << 20):
+        self._plate_dir = Path(plate_dir)   # lazy: may not exist yet (live wiring)
+        self._cache_bytes = int(cache_bytes)
+        self._lock = threading.Lock()
+        self._cache: dict[tuple, np.ndarray] = {}      # (region, fov, level) -> 5-D array
+        self._lru: OrderedDict = OrderedDict()         # same keys, recency order (incl. pins)
+        self._pinned: set = set()                      # coarsest cached level per FOV
+        self._bytes = 0
+        self._meta: dict[tuple, dict] = {}             # (region, fov) -> {count, shapes5, labels}
+        self._handles: OrderedDict = OrderedDict()     # (region, fov, level) -> TensorStore
+
+    # -- key/path helpers ---------------------------------------------------------------
+
+    @staticmethod
+    def _canon(region) -> str:
+        row, col = parse_well_id(region)   # ValueError on malformed ids (documented outcome)
+        return row + col
+
+    def _field_dir(self, region: str, fov: int) -> Path:
+        row, col = parse_well_id(region)
+        return self._plate_dir / row / col / str(fov)
+
+    # -- availability gate + metadata ----------------------------------------------------
+
+    def _load_field_meta(self, region: str, fov: int) -> Optional[dict]:
+        """None = pending. The gate is the try around the GROUP json only: missing,
+        truncated, or shape-surprising group json all mean pending (write_group is a
+        plain write_text — a torn read is a normal race, never an error). Past the
+        gate, an unreadable LEVEL json is corruption and raises."""
+        fdir = self._field_dir(region, fov)
+        try:
+            doc = json.loads((fdir / "zarr.json").read_text())
+            ome = doc["attributes"]["ome"]
+            count = len(ome["multiscales"][0]["datasets"])
+            labels = [c["label"] for c in ome.get("omero", {}).get("channels", [])]
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            return None
+        shapes5 = []
+        for i in range(count):   # post-gate: arrays were written before the group json
+            adoc = json.loads((fdir / str(i) / "zarr.json").read_text())
+            shapes5.append(tuple(int(s) for s in adoc["shape"]))
+        return {"count": count, "shapes5": shapes5, "labels": labels}
+
+    def _meta_for(self, key: tuple) -> Optional[dict]:
+        with self._lock:
+            meta = self._meta.get(key)
+        if meta is not None:
+            return meta
+        meta = self._load_field_meta(*key)
+        if meta is not None:
+            with self._lock:
+                meta = self._meta.setdefault(key, meta)
+        return meta
+
+    # -- public API ---------------------------------------------------------------------
+
+    def wells(self) -> dict[str, list[int]]:
+        """PLANNED layout snapshot {region: [fov, ...]} — parse-tolerant: {} until the
+        plate group json parses; a well whose own group json is missing/unparseable
+        (plate json is written first) is omitted this call."""
+        try:
+            doc = json.loads((self._plate_dir / "zarr.json").read_text())
+            plate_wells = doc["attributes"]["ome"]["plate"]["wells"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+        out: dict[str, list[int]] = {}
+        for w in plate_wells:
+            try:
+                row, col = str(w["path"]).split("/")
+                wdoc = json.loads((self._plate_dir / row / col / "zarr.json").read_text())
+                images = wdoc["attributes"]["ome"]["well"]["images"]
+                out[row + col] = [int(im["path"]) for im in images]
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return out
+
+    def levels(self, region: str, fov: int) -> list[tuple[int, int]]:
+        """(Y, X) per written level, level 0 first; [] while the FOV is pending."""
+        meta = self._meta_for((self._canon(region), int(fov)))
+        if meta is None:
+            return []
+        return [(s[-2], s[-1]) for s in meta["shapes5"]]
+
+    def read(self, region: str, fov: int, level: int,
+             ys: slice, xs: slice, t: int = 0) -> Optional[np.ndarray]:
+        key = (self._canon(region), int(fov))
+        level = int(level)
+        ck = (*key, level)
+        with self._lock:
+            arr = self._cache.get(ck)
+            if arr is not None:
+                self._lru.move_to_end(ck)
+                if not 0 <= t < arr.shape[0]:
+                    raise IndexError(f"t={t} out of range for T={arr.shape[0]}")
+                ys_c = _clamp_slice(ys, arr.shape[-2])
+                xs_c = _clamp_slice(xs, arr.shape[-1])
+                return arr[t, :, 0, ys_c, xs_c].copy()   # copy inside the lock: no eviction race
+        meta = self._meta_for(key)
+        if meta is None:
+            return None                       # pending — t deliberately not validated
+        if not 0 <= level < meta["count"]:
+            return None                       # level the field doesn't have; levels() disambiguates
+        shape5 = meta["shapes5"][level]
+        if not 0 <= t < shape5[0]:
+            raise IndexError(f"t={t} out of range for T={shape5[0]}")
+        store = self._handle(key, level)      # post-gate: any failure below raises
+        ys_c = _clamp_slice(ys, shape5[-2])
+        xs_c = _clamp_slice(xs, shape5[-1])
+        return np.asarray(store[t, :, 0, ys_c, xs_c].read().result())
+
+    def read_tile(self, desc) -> np.ndarray:
+        """IMA-216 ``TileSource`` Protocol adapter for PER-FOV levels (216's `_tiling.py`
+        owns the interface). ``desc.key == (region, fov)``, ``desc.level`` = disk level
+        index, ``desc.channel`` = channel LABEL (omero order == C-axis order). Returns
+        the full 2-D level plane; raises LookupError on pending/absent/unknown-channel —
+        the 218 fetch executor maps that to ``TileCache.fetch_failed`` (keep-parent)."""
+        region, fov = desc.key
+        key = (self._canon(region), int(fov))
+        meta = self._meta_for(key)
+        if meta is None:
+            raise LookupError(f"tile pending: field {key} not written yet")
+        if not meta.get("labels"):            # ingested-only meta lacks labels; disk has them
+            disk = self._load_field_meta(*key)
+            if disk is not None:
+                with self._lock:
+                    meta["labels"] = disk["labels"]
+        labels = meta.get("labels") or []
+        if desc.channel not in labels:
+            raise LookupError(f"unknown channel label {desc.channel!r}; omero has {labels}")
+        arr = self.read(region, fov, desc.level, slice(None), slice(None), t=0)
+        if arr is None:
+            raise LookupError(f"tile absent: field {key} has no level {desc.level}")
+        return arr[labels.index(desc.channel)]
+
+    def ingest(self, region: str, fov: int, levels: list[np.ndarray]) -> None:
+        """Cache the coarse tail (index>0 AND max(Y,X) <= _CACHE_MAX_YX) of an
+        already-computed pyramid. Drop-then-insert: the single invalidation point."""
+        key = (self._canon(region), int(fov))
+        keep = {i: lvl for i, lvl in enumerate(levels)
+                if i > 0 and max(lvl.shape[-2:]) <= _CACHE_MAX_YX}
+        meta = {"count": len(levels), "shapes5": [tuple(l.shape) for l in levels], "labels": None}
+        with self._lock:
+            self._drop_fov_locked(key)
+            self._meta[key] = meta
+            for i, lvl in keep.items():
+                ck = (*key, i)
+                self._cache[ck] = lvl
+                self._lru[ck] = None
+                self._bytes += lvl.nbytes
+            if keep:
+                self._pinned.add((*key, max(keep)))   # coarsest cached level
+            self._evict_locked()
+
+    def close(self) -> None:
+        """Release RAM (cache + handles + memoized metadata). The source stays usable —
+        a later read lazily re-derives everything from disk."""
+        with self._lock:
+            self._cache.clear(); self._lru.clear(); self._pinned.clear()
+            self._meta.clear(); self._handles.clear(); self._bytes = 0
+
+    # -- internals ----------------------------------------------------------------------
+
+    def _handle(self, key: tuple, level: int):
+        hk = (*key, level)
+        with self._lock:
+            store = self._handles.get(hk)
+            if store is not None:
+                self._handles.move_to_end(hk)
+                return store
+        import tensorstore as ts   # open OUTSIDE the lock (slow); double-open race is benign
+        store = ts.open({"driver": "zarr3",
+                         "kvstore": {"driver": "file",
+                                     "path": str(self._field_dir(key[0], key[1]) / str(level))}},
+                        open=True).result()
+        with self._lock:
+            store = self._handles.setdefault(hk, store)
+            self._handles.move_to_end(hk)
+            while len(self._handles) > _HANDLE_LRU_MAX:
+                self._handles.popitem(last=False)
+        return store
+
+    def _drop_fov_locked(self, key: tuple) -> None:
+        for ck in [k for k in self._cache if k[:2] == key]:
+            self._bytes -= self._cache.pop(ck).nbytes
+            self._lru.pop(ck, None)
+            self._pinned.discard(ck)
+        for hk in [k for k in self._handles if k[:2] == key]:
+            self._handles.pop(hk, None)
+        self._meta.pop(key, None)
+
+    def _evict_locked(self) -> None:
+        # Oldest non-pinned first; if pins alone exceed the budget, demote pins in LRU
+        # order (least-recently-read first) — degrade to disk, never OOM.
+        while self._bytes > self._cache_bytes and self._lru:
+            victim = next((k for k in self._lru if k not in self._pinned), None)
+            if victim is None:
+                victim = next(iter(self._lru))
+            self._bytes -= self._cache.pop(victim).nbytes
+            self._lru.pop(victim, None)
+            self._pinned.discard(victim)
 
 
 # --- orchestration ---------------------------------------------------------------------------
@@ -277,6 +535,7 @@ def write_from_stream(
     write_workers: int = _WRITE_WORKERS,
     stop=None,
     regions=None,
+    source: Optional[PyramidSource] = None,
 ) -> dict:
     """Write the plate + (optionally) TIFFs from a ``(region, fov, image)`` stream and *metadata*.
 
@@ -327,11 +586,13 @@ def write_from_stream(
         row, col = parse_well_id(region)
         # field directory is the RAW fov id (Squid convention), digit-named for ndviewer.
         levels = _write_field(plate_dir / row / col / str(fov), image, channels, pixel_size_um, dz_um)
+        if source is not None:   # live tile source: hand over the already-computed pyramid
+            source.ingest(region, fov, levels)
         if tiff:
             _write_tiffs(tiff_root, region, fov, image, channel_names)
         if on_well is not None:  # live consumer (plate viewer): render tile + push to ndviewer
             on_well(region, fov, image)
-        return levels
+        return len(levels)
 
     n_written = 0
     n_levels = 1
@@ -380,6 +641,7 @@ def write_plate(
     stop=None,
     on_error=None,
     regions=None,
+    source: Optional[PyramidSource] = None,
 ) -> dict:
     """Project a plate (IMA-188) and write the canonical OME-zarr + individual TIFFs.
 
@@ -409,4 +671,4 @@ def write_plate(
     stream = project_plate(reader, n_fovs=n_fovs, workers=workers, projector=projector,
                            on_error=on_error, regions=regions)
     return write_from_stream(metadata, stream, out_dir, n_fovs=n_fovs, tiff=tiff, on_well=on_well,
-                             write_workers=write_workers, stop=stop, regions=regions)
+                             write_workers=write_workers, stop=stop, regions=regions, source=source)
