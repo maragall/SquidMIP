@@ -54,3 +54,63 @@ def test_run_defaults_output_next_to_acquisition(squid_dataset):
     assert params.output_folder is None
     manifest = run(params)
     assert Path(manifest["plate"]).parent.parent == Path(root).parent
+
+
+# ── IMA-225: --flatfield ─────────────────────────────────────────────────────────────────
+
+def _profile_for(root, path):
+    """Save a radial .npy profile matching the acquisition at *root* (the stitcher's format)."""
+    import numpy as np
+
+    from squidmip import open_reader
+    from squidmip.correction import save_flatfield
+
+    meta = open_reader(str(root)).metadata
+    ny, nx = meta["frame_shape"]
+    yy, xx = np.mgrid[0:ny, 0:nx].astype(np.float32)
+    cy, cx = max((ny - 1) / 2.0, 1e-6), max((nx - 1) / 2.0, 1e-6)
+    prof = 0.4 + 0.6 * np.exp(-(((yy - cy) / cy) ** 2 + ((xx - cx) / cx) ** 2))
+    return save_flatfield(path, np.stack([prof.astype(np.float32)] * len(meta["channels"])))
+
+
+def test_flatfield_validator_rejects_a_missing_file(tmp_path, squid_dataset):
+    # Up-front, like --projector: a bad profile must fail BEFORE any plate skeleton is written.
+    root, _ = squid_dataset
+    with pytest.raises(ValueError, match="not an existing file"):
+        ProcessParameters(input_folder=str(root), flatfield=str(tmp_path / "nope.npy"))
+
+
+def test_flatfield_estimate_sentinel_is_accepted(squid_dataset):
+    root, _ = squid_dataset
+    assert ProcessParameters(input_folder=str(root), flatfield="estimate").flatfield == "estimate"
+
+
+def test_flatfield_run_writes_its_own_folder_with_provenance(squid_dataset, tmp_path):
+    import json
+
+    root, _ = squid_dataset
+    profile = _profile_for(root, tmp_path / "ff.npy")
+    raw = run(ProcessParameters(input_folder=str(root), output_folder=str(tmp_path)))
+    corrected = run(ProcessParameters(input_folder=str(root), output_folder=str(tmp_path),
+                                      flatfield=str(profile)))
+    # A corrected run and a raw run of the same acquisition COEXIST — no silent overwrite.
+    assert Path(raw["plate"]).parent != Path(corrected["plate"]).parent
+    assert Path(corrected["plate"]).parent.name.endswith(".flatfield.hcs")
+    sidecar = json.loads(Path(corrected["flatfield"]).read_text())
+    assert sidecar["correction"] == "flatfield" and sidecar["projector"] == "mip"
+    assert sidecar["source"] == str(profile)
+
+
+def test_flatfield_estimate_runs_end_to_end(squid_dataset, tmp_path):
+    root, _ = squid_dataset
+    manifest = run(ProcessParameters(input_folder=str(root), output_folder=str(tmp_path),
+                                     flatfield="estimate"))
+    assert manifest["n_fields_written"] == 2
+    assert Path(manifest["flatfield"]).exists()
+
+
+def test_no_flatfield_writes_no_sidecar(squid_dataset, tmp_path):
+    root, _ = squid_dataset
+    manifest = run(ProcessParameters(input_folder=str(root), output_folder=str(tmp_path)))
+    assert "flatfield" not in manifest
+    assert not (Path(manifest["plate"]).parent / "flatfield.json").exists()

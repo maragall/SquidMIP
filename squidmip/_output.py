@@ -380,6 +380,7 @@ def write_plate(
     stop=None,
     on_error=None,
     regions=None,
+    flatfield=None,
 ) -> dict:
     """Project a plate (IMA-188) and write the canonical OME-zarr + individual TIFFs.
 
@@ -399,6 +400,11 @@ def write_plate(
         UNCOMPRESSED copy of the output in Squid's ``{region}_{fov}_0_{channel}.tiff`` filename
         convention (You Yan's "individual tiff output"), for tools that read Squid TIFFs directly and
         can't open OME-Zarr. It roughly DOUBLES on-disk size, so it's off unless a caller asks for it.
+    flatfield:
+        Optional prepared ``squidmip.correction.Field`` (IMA-225) — illumination correction applied
+        around the reduction. Passed straight to :func:`squidmip.project_plate`; when given, a
+        ``flatfield.json`` provenance sidecar is written beside the plate so the corrected artifact
+        can be audited. ``None`` (default) writes exactly what it always did.
 
     Returns
     -------
@@ -407,6 +413,12 @@ def write_plate(
     """
     metadata = reader.metadata
     stream = project_plate(reader, n_fovs=n_fovs, workers=workers, projector=projector,
-                           on_error=on_error, regions=regions)
-    return write_from_stream(metadata, stream, out_dir, n_fovs=n_fovs, tiff=tiff, on_well=on_well,
-                             write_workers=write_workers, stop=stop, regions=regions)
+                           on_error=on_error, regions=regions, flatfield=flatfield)
+    manifest = write_from_stream(metadata, stream, out_dir, n_fovs=n_fovs, tiff=tiff,
+                                 on_well=on_well, write_workers=write_workers, stop=stop,
+                                 regions=regions)
+    if flatfield is not None:
+        from squidmip.correction import write_provenance
+
+        manifest["flatfield"] = str(write_provenance(out_dir, flatfield, {"projector": projector}))
+    return manifest

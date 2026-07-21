@@ -174,8 +174,9 @@ def test_run_operator_persists_via_write_plate(qapp, stub_detail, squid_dataset,
 
     def fake_write_plate(reader, out_dir, *, n_fovs=1, workers=None, projector="mip",
                          tiff=True, on_well=None, write_workers=4, stop=None, on_error=None,
-                         regions=None):
-        captured.update(projector=projector, tiff=tiff, out_dir=str(out_dir), regions=regions)
+                         regions=None, flatfield=None):
+        captured.update(projector=projector, tiff=tiff, out_dir=str(out_dir), regions=regions,
+                        flatfield=flatfield)
         return {"plate": str(out_dir), "levels": 1}      # no wells — we only assert the dispatch
     monkeypatch.setattr(squidmip, "write_plate", fake_write_plate)
 
@@ -256,3 +257,80 @@ def test_second_ingest_resets_state(qapp, stub_detail, squid_dataset, tmp_path):
     assert set(win._overview._status.values()) == {"empty"}     # fresh grey plate
     win._stop_worker()
     win.close()
+
+
+# ── IMA-225: the Flatfield + MIP operator card ──────────────────────────────────────────
+
+def _write_profile(reader, path):
+    """Save a radial .npy profile matching the open acquisition (the stitcher's format)."""
+    import numpy as np
+
+    from squidmip.correction import save_flatfield
+
+    meta = reader.metadata
+    ny, nx = meta["frame_shape"]
+    yy, xx = np.mgrid[0:ny, 0:nx].astype(np.float32)
+    cy, cx = max((ny - 1) / 2.0, 1e-6), max((nx - 1) / 2.0, 1e-6)
+    prof = 0.4 + 0.6 * np.exp(-(((yy - cy) / cy) ** 2 + ((xx - cx) / cx) ** 2))
+    return save_flatfield(path, np.stack([prof.astype(np.float32)] * len(meta["channels"])))
+
+
+def test_flatfield_card_exists_and_does_not_displace_mip():
+    # The card is a real operator card, but NOT a projector: it runs MIP with a correction attached.
+    keys = [op.key for op in V._OPERATIONS]
+    assert "mip" in keys and "flatfield" in keys
+    op = V._OPERATIONS_BY_KEY["flatfield"]
+    assert op.projector_name == "mip" and op.correction is True
+    assert V._OPERATIONS_BY_KEY["mip"].projector_name == "mip"       # MIP is untouched
+    assert V._OPERATIONS_BY_KEY["mip"].correction is False
+
+
+def test_flatfield_tab_builds(qapp, stub_detail, squid_dataset):
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win._activate_operator("flatfield")
+    assert "flatfield" in win._op_tabs
+    win.close()
+
+
+def test_flatfield_run_without_a_profile_is_refused(qapp, stub_detail, squid_dataset, tmp_path):
+    # A 'Flatfield + MIP' run must never quietly degrade into a plain MIP.
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("flatfield", out_parent=str(tmp_path))
+    assert win._worker is None or not win._worker.isRunning()
+    assert "profile" in win._readout.text().lower()
+    win.close()
+
+
+def test_flatfield_run_corrects_and_writes_its_own_folder(qapp, stub_detail, squid_dataset, tmp_path):
+    # The corrected plate lands in <acq>.flatfield.hcs, beside (never on top of) a raw run, and
+    # carries a provenance sidecar.
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    profile = _write_profile(win._reader, tmp_path / "ff.npy")
+    win.run_operator("mip", out_parent=str(tmp_path))                    # raw run first
+    assert _drain_until(qapp, lambda: win._worker is not None and not win._worker.isRunning())
+    win.run_operator("flatfield", out_parent=str(tmp_path), flatfield=str(profile))
+    assert _drain_until(qapp, lambda: win._worker is not None and not win._worker.isRunning())
+    from pathlib import Path
+    names = {p.name for p in Path(tmp_path).iterdir()}
+    raw = [n for n in names if n.endswith(".hcs") and ".flatfield" not in n]
+    corrected = [n for n in names if n.endswith(".flatfield.hcs")]
+    assert raw and corrected                                             # both plates coexist
+    assert (Path(tmp_path) / corrected[0] / "flatfield.json").exists()   # auditable
+    win._stop_worker(); win.close()
+
+
+def test_flatfield_estimate_path_runs_as_a_preview(qapp, stub_detail, squid_dataset):
+    # The computed fallback: no .npy, nothing written, still a corrected result.
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("flatfield", preview_limit=2, save=False, flatfield="estimate")
+    assert _drain_until(qapp, lambda: win._overview is not None and len(win._overview._tiles) == 2)
+    assert win._plate_mode == V._OPERATIONS_BY_KEY["flatfield"].label   # the layer is LABELLED
+    win._stop_worker(); win.close()

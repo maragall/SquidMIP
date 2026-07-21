@@ -99,11 +99,14 @@ class FakeReader:
 def _restore_projector_table():
     """Snapshot/restore the module-global projector table so tests that add don't leak."""
     saved = dict(engine._PROJECTORS)
+    saved_flags = dict(engine._PROJECTOR_COMMUTES)
     try:
         yield
     finally:
         engine._PROJECTORS.clear()
         engine._PROJECTORS.update(saved)
+        engine._PROJECTOR_COMMUTES.clear()
+        engine._PROJECTOR_COMMUTES.update(saved_flags)
 
 
 def _collect(reader, **kw) -> dict[tuple[str, int], np.ndarray]:
@@ -236,3 +239,81 @@ def test_invalid_workers_raises():
     reader = FakeReader(n_wells=2)
     with pytest.raises(ValueError, match="workers must be >= 1"):
         next(project_plate(reader, workers=0))
+
+
+# ── IMA-225: illumination correction threaded through the engine ─────────────────────────
+
+def _field_for(reader, floor: float = 0.4):
+    """A prepared radial correction Field matching *reader*'s frame shape/dtype/channel count."""
+    from squidmip.correction import prepare_field
+
+    meta = reader.metadata
+    ny, nx = meta["frame_shape"]
+    yy, xx = np.mgrid[0:ny, 0:nx].astype(np.float32)
+    cy, cx = max((ny - 1) / 2.0, 1e-6), max((nx - 1) / 2.0, 1e-6)
+    prof = floor + (1.0 - floor) * np.exp(-(((yy - cy) / cy) ** 2 + ((xx - cx) / cx) ** 2))
+    flat = np.stack([prof.astype(np.float32)] * len(meta["channels"]))
+    return prepare_field(flat, None, dtype=meta["dtype"], frame_shape=meta["frame_shape"],
+                         n_channels=len(meta["channels"]), source="test")
+
+
+def test_mip_declares_it_commutes_and_reference_does_not():
+    # This flag is what licenses correcting AFTER the reduction. `reference` picks a plane by focus
+    # score, which monotonicity does not license, so it must stay False.
+    assert engine.projector_commutes("mip") is True
+    assert engine.projector_commutes("reference") is False
+
+
+def test_add_projector_defaults_to_not_commuting():
+    # Safe default on a public extension seam: an author who never read the engine gets the
+    # always-correct path, not the merely-fast one.
+    add_projector("plain_custom", lambda planes: next(iter(planes)))
+    assert engine.projector_commutes("plain_custom") is False
+    add_projector("fast_custom", lambda planes: next(iter(planes)), commutes_with_scaling=True)
+    assert engine.projector_commutes("fast_custom") is True
+
+
+def test_projector_commutes_is_false_for_an_unknown_name():
+    assert engine.projector_commutes("never_registered") is False
+
+
+def test_no_flatfield_is_byte_identical_to_today():
+    # REGRESSION GUARD: the correction seam must be invisible when nobody asks for it.
+    reader = FakeReader(n_wells=3)
+    plain = _collect(FakeReader(n_wells=3), workers=2)
+    explicit_none = _collect(reader, workers=2, flatfield=None)
+    assert plain.keys() == explicit_none.keys()
+    for key, img in plain.items():
+        np.testing.assert_array_equal(img, explicit_none[key])
+
+
+def test_flatfield_changes_the_pixels_but_not_the_output_contract():
+    reader = FakeReader(n_wells=2, shape=(16, 16))
+    field = _field_for(reader)
+    plain = _collect(FakeReader(n_wells=2, shape=(16, 16)), workers=2)
+    corrected = _collect(reader, workers=2, flatfield=field)
+    for key, img in corrected.items():
+        assert img.shape == plain[key].shape and img.dtype == plain[key].dtype
+        assert img.shape[2] == 1                    # Z stays size-1 — the writer's contract
+        assert not np.array_equal(img, plain[key])
+
+
+def test_flatfield_result_is_independent_of_worker_count():
+    # The prepared field is immutable and shared read-only, so concurrency must change no pixel.
+    field = _field_for(FakeReader(n_wells=6, shape=(16, 16)))
+    one = _collect(FakeReader(n_wells=6, shape=(16, 16)), workers=1, flatfield=field)
+    many = _collect(FakeReader(n_wells=6, shape=(16, 16)), workers=4, flatfield=field)
+    assert one.keys() == many.keys()
+    for key, img in one.items():
+        np.testing.assert_array_equal(img, many[key])
+
+
+def test_a_non_commuting_projector_corrects_every_plane():
+    # `reference` does not commute, so the engine must take the BEFORE path: the returned plane is
+    # a CORRECTED plane, i.e. it differs from the uncorrected reference pick.
+    reader = FakeReader(n_wells=1, shape=(16, 16))
+    field = _field_for(reader)
+    plain = _collect(FakeReader(n_wells=1, shape=(16, 16)), workers=1, projector="reference")
+    corrected = _collect(reader, workers=1, projector="reference", flatfield=field)
+    for key, img in corrected.items():
+        assert not np.array_equal(img, plain[key])

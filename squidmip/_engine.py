@@ -58,6 +58,14 @@ Projector = Callable[[Iterable[np.ndarray]], np.ndarray]
 # name -> z-reduction callable. Selected by name in project_plate; extended via add_projector.
 _PROJECTORS: dict[str, Projector] = {"mip": project, "reference": project_reference}
 
+# name -> does this reduction commute with a monotone per-pixel rescale? (IMA-225)
+# Only meaningful when an illumination correction is attached: a reducer that commutes may be
+# corrected ONCE after the reduction instead of on every plane (bit-identical, 1/Nz the work).
+# MIP is a per-pixel max, so it commutes with any non-decreasing f: max(f(a), f(b)) = f(max(a, b)).
+# `reference` picks the sharpest plane by focus score — a pick monotonicity does not license — so
+# it does not. Absent = False: the safe answer for anything registered from outside the engine.
+_PROJECTOR_COMMUTES: dict[str, bool] = {"mip": True, "reference": False}
+
 
 def _default_workers() -> int:
     """Thread count when the caller doesn't specify — adapt to the machine, never hardcode.
@@ -77,7 +85,7 @@ def _default_workers() -> int:
     return n or 1
 
 
-def add_projector(name: str, projector: Projector) -> None:
+def add_projector(name: str, projector: Projector, *, commutes_with_scaling: bool = False) -> None:
     """Add a named z-reduction so it can be selected by name in :func:`project_plate`.
 
     This is how a future projector (EDF/EMF/mean) plugs in **without touching the engine**:
@@ -93,6 +101,15 @@ def add_projector(name: str, projector: Projector) -> None:
         equal-shape planes and returns one plane. It SHOULD stream (bounded memory) to keep
         the plate engine's per-worker footprint flat; a projector that materialises the whole
         z-stack (e.g. EDF) is allowed but owns its own, documented, memory profile.
+    commutes_with_scaling:
+        Declare that this reduction commutes with a monotone per-pixel rescale, i.e.
+        ``reduce(f(p) for p in planes) == f(reduce(planes))`` for every non-decreasing ``f``
+        (IMA-225). Set it and an attached illumination correction is applied ONCE after the
+        reduction instead of once per plane — bit-identical, ``1/Nz`` the work. Default **False**,
+        the always-correct answer: this is public API whose selling point is that authors need not
+        read engine code, so the default must never be the merely-fast one. True holds for
+        per-pixel selections (max, min) and fails for anything that picks a plane by a whole-plane
+        score (focus/EDF) or averages through an integer round-trip.
 
     Raises
     ------
@@ -110,11 +127,17 @@ def add_projector(name: str, projector: Projector) -> None:
             f"(defined: {available_projectors()})."
         )
     _PROJECTORS[name] = projector
+    _PROJECTOR_COMMUTES[name] = bool(commutes_with_scaling)
 
 
 def available_projectors() -> list[str]:
     """Return the available projector names, sorted (``["mip", ...]``)."""
     return sorted(_PROJECTORS)
+
+
+def projector_commutes(name: str) -> bool:
+    """Whether *name* declared :func:`add_projector`'s ``commutes_with_scaling`` (default False)."""
+    return _PROJECTOR_COMMUTES.get(name, False)
 
 
 def _resolve_projector(name: str) -> Projector:
@@ -136,6 +159,7 @@ def project_plate(
     projector: str = "mip",
     on_error=None,
     regions=None,
+    flatfield=None,
 ) -> Iterator[tuple[str, int, np.ndarray]]:
     """Project every selected well of a plate in parallel, streaming results well-by-well.
 
@@ -183,6 +207,13 @@ def project_plate(
         callable ``on_error(region, fov, exc)``, a well whose projection raises is passed to it and
         then SKIPPED — the stream keeps going instead of aborting the whole plate on one corrupt
         file. ``None`` (default) keeps the fail-fast contract exactly. Peak-memory bound is unchanged.
+    flatfield:
+        Opt-in illumination correction (IMA-225): a prepared, immutable
+        ``squidmip.correction.Field`` (build it once with ``correction.prepare_field``). It
+        decorates the ``reduce`` seam rather than replacing the projector — the projector still
+        does the z-reduction, so the ``(T, C, 1, Y, X)`` output contract is untouched. The field is
+        read-only and shared across every worker, so results do not depend on the worker count.
+        ``None`` (default) leaves the run byte-identical to an uncorrected one.
 
     Notes
     -----
@@ -197,6 +228,11 @@ def project_plate(
     n_workers = workers if workers is not None else _default_workers()
 
     reduce = _resolve_projector(projector)
+    # Correct AFTER the reduction only when the projector declared it commutes (1 correction and 1
+    # rounding per well instead of Nz, bit-identical); otherwise correct every plane.
+    from squidmip.correction import AFTER, BEFORE
+
+    side = AFTER if projector_commutes(projector) else BEFORE
 
     # Warm the reader's lazy index/time-folders/metadata single-threaded BEFORE fan-out.
     meta = reader.metadata
@@ -217,7 +253,8 @@ def project_plate(
                 region, fov = next(tasks)
             except StopIteration:
                 return False
-            future = pool.submit(project_well, reader, region, fov, reduce=reduce)
+            future = pool.submit(project_well, reader, region, fov, reduce=reduce,
+                                 field=flatfield, correction_side=side)
             in_flight[future] = (region, fov)
             return True
 

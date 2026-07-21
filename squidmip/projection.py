@@ -121,6 +121,8 @@ def project_well(
     region: str,
     fov: int,
     reduce: Callable[[Iterable[np.ndarray]], np.ndarray] = project,
+    field=None,
+    correction_side: str = "before",
 ) -> np.ndarray:
     """Project one FOV's z-stack for every channel and timepoint.
 
@@ -136,6 +138,15 @@ def project_well(
     reduce:
         The z-reduction primitive. Defaults to :func:`project` (MIP). IMA-188 passes its
         own projector here (EDF/EMF/…) — this is the pluggable seam; 183 ships MIP only.
+    field:
+        An optional prepared ``squidmip.correction.Field`` (IMA-225). ``None`` (default) leaves
+        *reduce* untouched, so an uncorrected run is byte-identical to before by construction.
+        Given one, *reduce* is decorated per channel — the correction needs the channel index,
+        which only this loop knows (a bare ``reduce`` callable does not).
+    correction_side:
+        ``"before"`` (correct each plane, then reduce — always valid) or ``"after"`` (reduce, then
+        correct once — only for reducers that declare ``commutes_with_scaling``). Ignored when
+        *field* is None.
 
     Returns
     -------
@@ -155,11 +166,22 @@ def project_well(
     n_t = meta["n_t"]
     y, x = meta["frame_shape"]
 
+    # One decorated reduce per channel, built ONCE per well (not per timepoint): the illumination
+    # profile is per channel, so the channel index has to be bound here. field=None -> `reduce`
+    # itself, unchanged.
+    if field is None:
+        reducers = [reduce] * len(channels)
+    else:
+        from squidmip.correction import with_correction
+
+        reducers = [with_correction(reduce, field, c_i, correction_side)
+                    for c_i in range(len(channels))]
+
     out = np.empty((n_t, len(channels), 1, y, x), dtype=meta["dtype"])
     for t in range(n_t):
         for c_i, channel in enumerate(channels):
             planes = (reader.read(region, fov, channel, z, t) for z in z_levels)
-            out[t, c_i, 0] = reduce(planes)  # streamed z; bounded memory
+            out[t, c_i, 0] = reducers[c_i](planes)  # streamed z; bounded memory
     return out
 
 

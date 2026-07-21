@@ -404,6 +404,14 @@ class Operation:
     label: str
     blurb: str
     build_tab: str        # name of the PlateWindow method that builds this operator's UI tab
+    projector: str = ""   # engine projector name; "" means "same as key" (the common case)
+    correction: bool = False   # show the illumination-correction block in the tab (IMA-225)
+
+    @property
+    def projector_name(self) -> str:
+        """The engine projector this card runs. Illumination correction is NOT a projector — it
+        reduces nothing — so its card runs an ordinary z-reduction with the correction attached."""
+        return self.projector or self.key
 
 # The operator registry. MIP is operator #1; append an Operation + write its `_build_*_tab` and both
 # the console cards and the Process-well-plates menu grow automatically.
@@ -411,6 +419,13 @@ _OPERATIONS = (
     Operation("mip", "Maximum Intensity Projection",
               "Collapse each well's z-stack to one max-intensity image; save a navigable OME-Zarr plate.",
               "_build_mip_tab"),
+    # IMA-225. A card, not a projector: flatfield corrects illumination shading *around* a
+    # reduction, so this runs MIP with a correction attached rather than replacing it. The label
+    # says so — a user must never read this as "flatfield instead of MIP".
+    Operation("flatfield", "Flatfield + MIP",
+              "Correct illumination shading (a stitcher .npy profile, or one estimated from the "
+              "data), then max-intensity project each well.",
+              "_build_flatfield_tab", projector="mip", correction=True),
 )
 _OPERATIONS_BY_KEY = {op.key: op for op in _OPERATIONS}
 
@@ -791,9 +806,10 @@ class _OperatorWorker(QThread):
     finished_ok = pyqtSignal()
 
     def __init__(self, operator: str, reader, meta, fov_index: dict, nr: int, nc: int, out_dir: str,
-                 regions=None, save: bool = True):
+                 regions=None, save: bool = True, flatfield=None):
         super().__init__()
         self._operator = operator
+        self._flatfield = flatfield      # IMA-225: a .npy path or "estimate"; resolved in run()
         self._reader, self._meta = reader, meta
         self._fov_index, self._nr, self._nc = fov_index, nr, nc
         self._out_dir = out_dir
@@ -845,14 +861,39 @@ class _OperatorWorker(QThread):
         if info is not None:
             self.wellFailed.emit(*info["rc"])
 
+    def _build_field(self):
+        """Resolve the requested illumination profile to a prepared, immutable correction Field.
+
+        Runs ONCE on this worker thread before any well: loading is quick, but estimating reads a
+        sample of wells, and neither belongs on the GUI thread. The Field is then shared read-only
+        by every engine worker, so the result never depends on the worker count.
+        """
+        from squidmip.correction import (estimate_flatfield, load_flatfield, prepare_field,
+                                         sample_planes)
+
+        if not self._flatfield:
+            return None
+        shape, n_ch = self._meta["frame_shape"], len(self._channels)
+        if self._flatfield == "estimate":
+            flat, dark = estimate_flatfield(sample_planes(self._reader), n_channels=n_ch,
+                                            frame_shape=shape), None
+            source = "estimated from this acquisition (smoothed per-channel average)"
+        else:
+            flat, dark = load_flatfield(self._flatfield)
+            source = str(self._flatfield)
+        return prepare_field(flat, dark, dtype=self._dtype, frame_shape=shape, n_channels=n_ch,
+                             source=source)
+
     def run(self):
         try:
+            field = self._build_field()          # fails LOUD (via `failed`) before any well runs
             if self._save:
                 from squidmip import write_plate  # persist + project in one bounded, streaming pass
 
                 write_plate(self._reader, self._out_dir, n_fovs=1, workers=_VIEWER_WORKERS,
                             projector=self._operator, tiff=False, on_well=self._on_well,
-                            stop=self._stop.is_set, on_error=self._on_error, regions=self._regions)
+                            stop=self._stop.is_set, on_error=self._on_error, regions=self._regions,
+                            flatfield=field)
                 if self._stop.is_set():
                     return  # window closing / re-opening; drop out cleanly (no final/written emit)
                 self.finalReady.emit(self._final_montage())
@@ -864,7 +905,8 @@ class _OperatorWorker(QThread):
                 from squidmip import project_plate
 
                 stream = project_plate(self._reader, workers=_VIEWER_WORKERS, projector=self._operator,
-                                       on_error=self._on_error, regions=self._regions)
+                                       on_error=self._on_error, regions=self._regions,
+                                       flatfield=field)
                 try:
                     for region, fov, image in stream:
                         if self._stop.is_set():
@@ -1271,12 +1313,60 @@ class PlateWindow(QMainWindow):
     def _build_mip_tab(self) -> QWidget:
         return self._build_run_tab(_OPERATIONS_BY_KEY["mip"])
 
+    def _build_flatfield_tab(self) -> QWidget:
+        return self._build_run_tab(_OPERATIONS_BY_KEY["flatfield"])
+
+    def _build_correction_block(self, v, state):
+        """The illumination-correction picker (IMA-225), added to the generic run tab when the
+        operator declares ``correction``. ONE block in the shared builder — correction applies to
+        any z-reducer, so there is no per-operator tab fork.
+
+        Two sources, and the difference is stated in the UI rather than buried: a measured ``.npy``
+        profile (what the Cephla stitcher writes — the correction of record), or a profile estimated
+        from this acquisition (a heavily smoothed per-channel average; a look, not a measurement).
+        Choosing neither REFUSES the run (see :meth:`run_operator`) rather than quietly degrading a
+        'Flatfield + MIP' into a plain MIP.
+        """
+        v.addWidget(_hline())
+        head = QLabel("Illumination profile")
+        head.setStyleSheet("color:#57606a;font-size:10px;font-weight:800;letter-spacing:1.5px;padding-top:6px;")
+        v.addWidget(head)
+        src_lbl = QLabel("(no profile chosen)")
+        src_lbl.setWordWrap(True)
+        src_lbl.setStyleSheet("color:#8b98ad;font-size:12px;")
+
+        def pick_npy():
+            f, _ = QFileDialog.getOpenFileName(self, "Choose a flatfield profile", "",
+                                               "Flatfield profile (*.npy)")
+            if not f:
+                return
+            state["flatfield"] = f
+            src_lbl.setText(f"{f}\nmeasured profile — applied per channel, in file order")
+
+        def use_estimate():
+            state["flatfield"] = "estimate"
+            src_lbl.setText("Estimated from this acquisition — a heavily smoothed per-channel "
+                            "average over the first wells. NOT BaSiC: it is biased by bright "
+                            "specimen content and estimates gain only (no darkfield). Use it to "
+                            "see whether a plate has shading worth correcting.")
+
+        npy_btn = QPushButton("Choose a .npy profile…"); npy_btn.setStyleSheet(_BTN_QSS)
+        npy_btn.clicked.connect(pick_npy)
+        est_btn = QPushButton("Estimate from the data"); est_btn.setStyleSheet(_BTN_QSS)
+        est_btn.clicked.connect(use_estimate)
+        row = QHBoxLayout(); row.setSpacing(6)
+        row.addWidget(npy_btn); row.addWidget(est_btn); row.addStretch(1)
+        v.addLayout(row)
+        v.addWidget(src_lbl)
+
     def _build_run_tab(self, op) -> QWidget:
         """Generic projector-operator tab (MIP, …): pick a destination, run over the whole plate → a
         navigable OME-Zarr plate. ONE builder for every z-reduction operator — a new one needs no new
         tab code. Per-tab state lives in a closure (no per-operator instance attrs)."""
         w, v = self._op_tab_shell(op.label, op.blurb + " Pick a destination with room — output can be large.")
-        state = {"dir": None}
+        state = {"dir": None, "flatfield": None}
+        if op.correction:
+            self._build_correction_block(v, state)
         dir_lbl = QLabel("(no folder chosen)"); dir_lbl.setWordWrap(True)
         dir_lbl.setStyleSheet("color:#8b98ad;font-size:12px;")
         run = QPushButton("Run on the whole plate"); run.setStyleSheet(_BTN_QSS); run.setEnabled(False)
@@ -1292,7 +1382,8 @@ class PlateWindow(QMainWindow):
 
         pick_btn = QPushButton("Choose output folder…"); pick_btn.setStyleSheet(_BTN_QSS)
         pick_btn.clicked.connect(pick)
-        run.clicked.connect(lambda: self.run_operator(op.key, out_parent=state["dir"]))
+        run.clicked.connect(
+            lambda: self.run_operator(op.key, out_parent=state["dir"], flatfield=state["flatfield"]))
         v.addWidget(pick_btn); v.addWidget(dir_lbl); v.addWidget(run)
 
         # PREVIEW on a subset — test the operator on the first N wells without committing the whole
@@ -1319,7 +1410,8 @@ class PlateWindow(QMainWindow):
                 dest = state["dir"] or QFileDialog.getExistingDirectory(self, f"Save {op.label} preview to folder")
                 if not dest:
                     return
-            self.run_operator(op.key, out_parent=dest, preview_limit=spin.value(), save=save)
+            self.run_operator(op.key, out_parent=dest, preview_limit=spin.value(), save=save,
+                              flatfield=state["flatfield"])
 
         prev.clicked.connect(do_preview)
         v.addWidget(prev)
@@ -1728,20 +1820,31 @@ class PlateWindow(QMainWindow):
 
     # -- run a post-processing operator over the whole plate (persists a navigable OME-Zarr plate) --
     def run_operator(self, key: str, out_parent: Optional[str] = None,
-                     preview_limit: Optional[int] = None, save: bool = True):
-        """Run a projector operator (MIP / reference) over the plate.
+                     preview_limit: Optional[int] = None, save: bool = True,
+                     flatfield: Optional[str] = None):
+        """Run a projector operator (MIP / reference / MIP with a flatfield) over the plate.
 
         preview_limit=N runs on only the first N wells (a subset) — a cheap way to test an operator.
         save=False is PREVIEW: compute + stream results into the plate + ndviewer slider, writing
         NOTHING to disk (no folder, no disk-space cost). save=True persists a navigable OME-Zarr;
         combined with preview_limit it saves just that subset. Tests pass out_parent to skip the dialog.
+
+        flatfield (IMA-225) is a ``.npy`` profile path or the string ``"estimate"``; the field is
+        BUILT IN THE WORKER (loading is quick, but estimating reads wells — neither belongs on the
+        GUI thread) and a failure surfaces through the worker's ``failed`` signal. A corrected run
+        writes to its own ``<name>.flatfield.hcs``, so it can never clobber a raw run.
         """
         if self._reader is None or self._overview is None:
             return
         if self._worker is not None and self._worker.isRunning():
             self._readout.setText("already processing — let the current run finish first")
             return
-        label = _OPERATIONS_BY_KEY[key].label
+        op = _OPERATIONS_BY_KEY[key]
+        if op.correction and not flatfield:
+            # Refuse rather than quietly running a plain MIP under a 'Flatfield + MIP' label.
+            self._readout.setText("choose an illumination profile (.npy) or estimate one first")
+            return
+        label = op.label
         regions = self._order[:preview_limit] if preview_limit is not None else None
         scope = f"first {len(regions)} wells" if regions is not None else "the whole plate"
         out_dir = est_gb = None
@@ -1752,7 +1855,12 @@ class PlateWindow(QMainWindow):
                 out_parent = QFileDialog.getExistingDirectory(self, f"Save {label} plate to folder")
                 if not out_parent:
                     return
-            out_dir = Path(out_parent) / f"{self._acq_name}.hcs"
+            stem = self._acq_name
+            if flatfield:                                # corrected output gets its own folder …
+                from squidmip.correction import corrected_dir_name
+
+                stem = corrected_dir_name(stem)          # … so it can NEVER overwrite a raw run
+            out_dir = Path(out_parent) / f"{stem}.hcs"
             ok, est_gb, msg = self._check_disk(out_dir)   # whole-plate estimate; a subset only uses less
             if not ok and regions is None:
                 self._readout.setText(msg)
@@ -1776,9 +1884,10 @@ class PlateWindow(QMainWindow):
         if self._detail is not None:
             self._detail.start_acquisition([c["name"] for c in self._meta["channels"]], 1,
                                            _PUSH_PX, _PUSH_PX, [f"{r}:0" for r in self._order])
-        self._worker = _OperatorWorker(key, self._reader, self._meta, self._fov_index,
+        self._worker = _OperatorWorker(op.projector_name, self._reader, self._meta, self._fov_index,
                                        self._overview._nr, self._overview._nc,
-                                       str(out_dir) if out_dir else "", regions=regions, save=save)
+                                       str(out_dir) if out_dir else "", regions=regions, save=save,
+                                       flatfield=flatfield)
         dest = f" → {out_dir.name}" if save else " (preview — not saved)"
         self._worker.tileReady.connect(self._on_tile)
         self._worker.pushReady.connect(self._on_push)

@@ -12,6 +12,10 @@ means a new operator is a new ``--projector`` value, not new CLI plumbing.
     squidmip <acquisition>                      # MIP every well -> <acquisition>.hcs/plate.ome.zarr
     squidmip <acquisition> --projector mip --workers 8 --output-folder /mnt/big
     squidmip <acquisition> --tiff               # also write the uncompressed per-plane TIFF export
+    squidmip <acquisition> --flatfield ff.npy   # MIP *with* illumination correction -> <name>.flatfield.hcs
+
+Illumination correction (IMA-225) is the one thing that is NOT a ``--projector`` value: it reduces
+nothing, so it decorates the reduction rather than replacing it. Hence its own flag.
 """
 
 from __future__ import annotations
@@ -26,6 +30,9 @@ from pydantic import BaseModel, field_validator
 from pydantic_settings import CliApp, CliPositionalArg
 
 logger = logging.getLogger("squidmip")
+
+# --flatfield sentinel: estimate the profile from the acquisition instead of loading a .npy.
+ESTIMATE = "estimate"
 
 
 class ProcessParameters(BaseModel, use_attribute_docstrings=True):
@@ -50,6 +57,14 @@ class ProcessParameters(BaseModel, use_attribute_docstrings=True):
     tiff: bool = False
     """Also write the individual per-plane TIFF export (Squid filename convention). This is a SECOND,
     uncompressed copy — roughly doubles on-disk size — so it's off by default."""
+
+    flatfield: Optional[str] = None
+    """Illumination-correction profile: a stitcher-produced ``.npy`` (a dict with 'flatfield' and
+    optional 'darkfield'). The operator still runs the z-reduction; the correction is applied around
+    it, the output lands in ``<name>.flatfield.hcs`` so it cannot clobber a raw run, and a
+    ``flatfield.json`` sidecar records what was applied. Pass 'estimate' to derive a crude profile
+    from the acquisition itself instead (a heavily smoothed per-channel average — see
+    squidmip.correction.estimate_flatfield for its documented limits; it is NOT BaSiC)."""
 
     limit: Optional[int] = None
     """Process only the first N wells — a quick SLICE of the plate (subset preview) so you can test
@@ -86,6 +101,39 @@ class ProcessParameters(BaseModel, use_attribute_docstrings=True):
             raise ValueError(f"unknown projector {v!r}; available: {sorted(avail)}")
         return v
 
+    @field_validator("flatfield")
+    @classmethod
+    def _flatfield_exists(cls, v):
+        # Same up-front discipline as _known_projector: a missing/unreadable profile must fail
+        # BEFORE write_plate lays down a plate skeleton, not hours into the run.
+        if v is None or v == ESTIMATE:
+            return v
+        p = Path(v).expanduser()
+        if not p.is_file():
+            raise ValueError(f"flatfield {v!r} is not an existing file (expected a .npy profile, "
+                             f"or {ESTIMATE!r} to estimate one from the data)")
+        return str(p.resolve())
+
+
+def _build_field(params: "ProcessParameters", reader):
+    """Resolve --flatfield to a prepared correction Field (or None). Runs single-threaded, once."""
+    from squidmip.correction import (estimate_flatfield, load_flatfield, prepare_field,
+                                     sample_planes)
+
+    meta = reader.metadata
+    shape, n_ch = meta["frame_shape"], len(meta["channels"])
+    if params.flatfield == ESTIMATE:
+        logger.info("estimating a flatfield from the acquisition (smoothed per-channel average — "
+                    "a fallback, not a measured profile)")
+        flat, dark = estimate_flatfield(sample_planes(reader), n_channels=n_ch,
+                                        frame_shape=shape), None
+        source = "estimated from this acquisition (smoothed per-channel average)"
+    else:
+        flat, dark = load_flatfield(params.flatfield)
+        source = str(params.flatfield)
+    return prepare_field(flat, dark, dtype=meta["dtype"], frame_shape=shape, n_channels=n_ch,
+                         source=source)
+
 
 def run(params: ProcessParameters) -> dict:
     """Open the acquisition and write the operator's OME-Zarr plate; return write_plate's manifest."""
@@ -102,7 +150,14 @@ def run(params: ProcessParameters) -> dict:
     if multi:
         logger.warning("%d well(s) have >1 FOV — sampling one FOV per well (high-throughput "
                        "stitching not yet implemented).", multi)
+    # Illumination correction (IMA-225): built ONCE, single-threaded, before any write — and the
+    # corrected plate gets its own folder name so it can never clobber a raw run of the same data.
+    field = _build_field(params, reader) if params.flatfield else None
     name = Path(params.input_folder).name
+    if field is not None:
+        from squidmip.correction import corrected_dir_name
+
+        name = corrected_dir_name(name)
     out_parent = (Path(params.output_folder).expanduser() if params.output_folder
                   else Path(params.input_folder).parent)
     out_dir = out_parent / f"{name}.hcs"
@@ -126,7 +181,7 @@ def run(params: ProcessParameters) -> dict:
 
     manifest = write_plate(
         reader, out_dir, projector=params.projector, workers=params.workers,
-        tiff=params.tiff, on_error=on_error, regions=regions,
+        tiff=params.tiff, on_error=on_error, regions=regions, flatfield=field,
     )
     logger.info(
         "done: %s (%d/%d wells written, %d pyramid level(s))%s",

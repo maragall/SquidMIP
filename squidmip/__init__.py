@@ -15,9 +15,29 @@ The public surface is intentionally tiny::
 
     write_plate(reader, "/path/out")          # canonical multiscale OME-zarr plate (tiff=True adds TIFFs)
     build_montage("/path/out")                # static plate montage PNG + region-jump sidecar + hover viewer
+
+    field = prepare_field(*load_flatfield("ff.npy"), dtype=meta["dtype"],       # illumination
+                          frame_shape=meta["frame_shape"],                      # correction
+                          n_channels=len(meta["channels"]))                     # (IMA-225)
+    write_plate(reader, "/path/out", flatfield=field)   # MIP *with* a flatfield, not instead of it
 """
 
-from squidmip._engine import add_projector, available_projectors, project_plate
+from squidmip._engine import (
+    add_projector,
+    available_projectors,
+    project_plate,
+    projector_commutes,
+)
+from squidmip.correction import (
+    Field,
+    apply_correction,
+    estimate_flatfield,
+    load_flatfield,
+    prepare_field,
+    sample_planes,
+    save_flatfield,
+    with_correction,
+)
 from squidmip._montage import build_montage
 from squidmip._output import write_plate
 from squidmip.projection import project, project_well, select_fovs
@@ -32,7 +52,17 @@ __all__ = [
     "project_plate",
     "add_projector",
     "available_projectors",
+    "projector_commutes",
     "write_plate",
     "build_montage",
+    # illumination correction (IMA-225) — decorates the reduce seam, never replaces the projector
+    "Field",
+    "load_flatfield",
+    "save_flatfield",
+    "prepare_field",
+    "apply_correction",
+    "with_correction",
+    "estimate_flatfield",
+    "sample_planes",
 ]
 __version__ = "0.1.0"
