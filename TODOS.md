@@ -3,6 +3,84 @@
 Deferred work captured during plan-eng-reviews. Each item records the reasoning
 so a future session doesn't rediscover it from zero.
 
+## Dead `sim_*` fixtures — regenerate or delete → blocks IMA-183/188 baselines
+- **What:** Every simulated dataset under `~/CEPHLA/Data/` is broken. `sim_1536wp`,
+  `sim_384wp_4fov` and `sim_4wp_hongquan` are symlink fan-outs pointing at
+  `~/Downloads/z_stack_2026-05-15_18-39-28.532906 hongquan/`, which no longer exists
+  (500/500 sampled links dead, verified 2026-07-20). `sim_384wp_4fov` and
+  `sim_4wp_hongquan` additionally have **no `coordinates.csv`**.
+- **Why:** The integration suite is red, not skipped. `tests/test_performance.py:28`
+  guards on `SIM_1536WP.is_dir()`, which passes because the directory still exists full
+  of dead links, so the test proceeds and dies in tifffile:
+  `FileNotFoundError: .../z_stack_2026-05-15…hongquan/0/B2_1_2_….tiff`. The IMA-183
+  single-thread baseline is currently unrunnable, which means IMA-188's promised
+  apples-to-apples comparison has no baseline to compare against.
+- **Pros:** Restores the only scale fixture; makes the suite honest again.
+- **Cons:** The fan-out is ~120k inodes and needs a real source acquisition to point at.
+- **Context:** Two separate fixes, and the cheap one should land first. (1) Harden the
+  guard to check that a *file* resolves, not just that the directory exists, so the
+  suite skips instead of failing — that is a one-line change and is on IMA-233's
+  critical path. (2) Regenerate the fan-out against a surviving acquisition, or delete
+  the dead trees so nothing points at them. Note `sim_1536wp` is one FOV per well and
+  cannot exercise a stitcher regardless.
+- **Depends on / blocked by:** A surviving source acquisition for the regeneration half.
+
+## Move `20x_scan` out of `~/Downloads` → prerequisite for IMA-233
+- **What:** `~/Downloads/20x_scan_2025-09-05_17-57-50` (144 real TIFFs, 1.2 GB, region
+  C5, 36 FOVs on a 0.705 mm step with per-FOV coordinate rows, 4 channels) is the only
+  working overlapping-grid dataset on this machine. Move it under `~/CEPHLA/Data/`.
+- **Why:** It is the sole viable dev fixture for any stitching or seam-quality work now
+  that the `sim_*` trees are dead, and it currently lives in a directory people empty.
+- **Pros:** Makes the one usable stitching fixture durable and discoverable.
+- **Cons:** 1.2 GB; any hardcoded path referencing the Downloads location needs updating.
+- **Context:** Discovered during the IMA-233 eng review while verifying that
+  `sim_1536wp` could exercise a stitcher — it cannot (one FOV per well, no per-FOV
+  coordinates). `20x_scan` is a genuine overlapping grid.
+- **Depends on / blocked by:** Nothing.
+
+## Record the lost `residual_benchmark` schema before the bytecode rots → stitcher repo
+- **What:** `stitcher/benchmarks/residual_benchmark.py` and `compile_master.py` exist
+  **only** as `.pyc`. Verified: `git log --all -- benchmarks/` empty,
+  `git log --all -S"residual_benchmark"` empty, `git ls-files | grep -i bench` empty,
+  and `.gitignore:5` shadows `__pycache__/`. Any `find -name __pycache__ -delete`, a
+  Python minor-version bump, or a clean checkout destroys them permanently.
+- **Why:** They encode a deliberate cross-machine merge contract — the module docstring
+  calls itself *"the SINGLE source of the benchmark 'language'. Run the exact same file
+  (same git sha) on every machine so the metrics and the CSV schema are identical and
+  the rows merge into one master table"* — plus macOS/Linux peak-RSS unit normalization
+  and dedup to the latest timestamp per `(host, dataset, git_sha)`.
+- **Pros:** Zero-cost to write the schema down; preserves reasoning that is otherwise
+  one `rm` from gone.
+- **Cons:** Low value beyond the schema itself. The IMA-233 review deliberately declined
+  to rebuild the master-table infrastructure, and the fact that the source was never
+  committed suggests someone already decided it didn't belong in the repo. Do not spend
+  an afternoon decompiling.
+- **Context:** The 31 columns, recovered verbatim via `marshal` from the `.pyc`:
+  `timestamp, host, platform, git_sha, dataset, path, n_tiles, tile_y, tile_x,
+  pixel_size_um, n_channels, reg_channel, n_pairs_candidate, n_pairs_locked,
+  n_pairs_rejected, ncc_mean, ncc_median, ncc_min, ncc_weak_frac, n_seams_fit,
+  resid_before_median_px, resid_before_mean_px, resid_before_p90_px,
+  resid_after_median_px, resid_after_mean_px, resid_after_p90_px, reduction_pct_median,
+  t_register_s, t_optimize_s, t_distortion_s, peak_rss_mb`. Its metric definitions:
+  `resid_before` = RMS over sub-blocks of phase-correlation shift magnitude at the
+  optimized tile positions; `resid_after` = leave-one-out CV residual at the CV-chosen
+  polynomial order. Both in full-resolution pixels. Writing this paragraph down *is* the
+  deliverable.
+- **Depends on / blocked by:** Nothing. Do it before the next cache clear.
+
+## Verify a MATLAB / MCR license exists before promising a PetaKit5D adapter → IMA-211
+- **What:** Confirm whether the team has a MATLAB or MATLAB Compiler Runtime license
+  that permits running PetaKit5D headless in a benchmark.
+- **Why:** IMA-211 commits to benchmarking PetaKit5D. If there is no license, that
+  adapter is not hard — it is impossible, and the commitment should be withdrawn rather
+  than discovered late.
+- **Pros:** Removes an unpriced dependency from a ticket already contested on estimate.
+- **Cons:** None; it is a question, not work.
+- **Context:** Surfaced by the IMA-233 eng review outside voice. Nobody had checked. The
+  IMA-233 plan starts with tilefusion + ASHLAR precisely so this is not on the critical
+  path, but IMA-211's scope still assumes all four tools.
+- **Depends on / blocked by:** Whoever owns tooling licenses.
+
 ## Scale-test fixture generator → IMA-188
 - **What:** A generator that fans the 48 real hongquan FOVs across a 1536-well plate via **symlinks** (Squid layout), synthesizing 20 z (cycling the real 3) × 4 channels. On-disk ≈ source (~19 GB); logical read ≈ 1536×20×4×33 MB ≈ **4 TB** (served from OS cache — proves scale/parse/decode/memory, NOT raw disk bandwidth; that needs Nick's real storage).
 - **Why:** It's the harness for the IMA-188 high-throughput scale test, not ingest. Building it in 189 bloats the keystone and risks CI breakage.
