@@ -45,18 +45,40 @@ class OperationStack:
             self._layers = [ly for ly in self._layers if ly.key not in gone]
         return gone
 
-    def toggle(self, key: str, enabled: bool) -> None:
+    def toggle(self, key: str, enabled: bool) -> bool:
+        """Enable/disable a layer. Returns the resulting state.
+
+        The base ('raw') can never be disabled, for the same reason ``remove`` will not drop it:
+        it is the layer everything else is recoverable TO. With raw disableable, unticking every
+        box left ``top_enabled()`` returning None — and the window's ``_apply_layers`` silently
+        does nothing on None, so the plate went on painting the last operator while every checkbox
+        in the tab read OFF. A view that disagrees with its own controls is worse than no toggle.
+        """
+        if key == "raw":
+            return True
         for ly in self._layers:
             if ly.key == key:
                 ly.enabled = enabled
-                return
+                return ly.enabled
+        return False
 
     def move(self, key: str, delta: int) -> None:
-        """Reorder a layer by +/- steps. The base ('raw') never moves off the bottom."""
+        """Reorder a layer by +/- steps. The base ('raw') never moves off the bottom.
+
+        That sentence was the docstring long before it was true: ``move('raw', +1)`` reordered the
+        base like any other layer, and ``move('mip', -1)`` pushed it off index 0 from the other
+        side. Either one puts raw ABOVE an operator, and since the plate renders the topmost
+        ENABLED layer, every operator underneath becomes permanently invisible while its checkbox
+        still reads ON — the layer stack lying about what is on screen. Raw is the floor: it does
+        not move, and nothing moves below it.
+        """
+        if key == "raw":
+            return
         idx = next((i for i, ly in enumerate(self._layers) if ly.key == key), None)
         if idx is None:
             return
-        new = max(0, min(len(self._layers) - 1, idx + delta))
+        floor = 1 if self._layers and self._layers[0].key == "raw" else 0
+        new = max(floor, min(len(self._layers) - 1, idx + delta))
         if new != idx:
             self._layers.insert(new, self._layers.pop(idx))
 

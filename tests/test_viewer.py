@@ -3269,3 +3269,196 @@ def test_exploration_tab_offers_exactly_the_runnable_operators(qapp, stub_detail
     assert "reference" in previews, "a registered projector with no card is unreachable"
     assert not [p for p in previews if "Minerva" in p], "Minerva is not an operator"
     win.close()
+
+
+# --- IMA-227: raw / MIP / stitched as toggleable, reorderable LAYERS ---------------------------
+
+def _montage_px(qapp, ov):
+    """The ACTIVE layer's montage pixels — cropped to the montage, never grab() of the widget.
+
+    The widget paints labels, a 3px grid, status dots, the current-well box and the carrier
+    photograph; on this fixture the plate fits to ~12 px per cell, so a whole-widget comparison
+    stays 'different' (or 'identical') for reasons that have nothing to do with layers."""
+    ov.recomposite(ov._active); qapp.processEvents()
+    img = ov._active_source()
+    a = np.frombuffer(img.constBits().asstring(img.byteCount()), np.uint8)
+    a = a.reshape(img.height(), img.bytesPerLine() // (img.depth() // 8), -1)
+    return a[:, :img.width(), :].copy()
+
+
+def _run_to_completion(qapp, win, key, regions):
+    win.run_operator(key, regions=regions, save=False)
+    t0 = time.time()
+    while win._worker is not None and win._worker.isRunning() and time.time() - t0 < 90:
+        qapp.processEvents(); time.sleep(0.02)
+    for _ in range(25):
+        qapp.processEvents(); time.sleep(0.02)
+
+
+def _layer_rows(win):
+    """{layer label -> (checkbox, up, dn)} from the REAL Layers tab."""
+    lw = win._op_tabs["layers"]
+    rows = {}
+    for cb in lw.findChildren(QCheckBox):
+        row = cb.parentWidget()
+        ups = [b for b in row.findChildren(QPushButton)]
+        rows[cb.text()] = (cb, ups[0], ups[1])
+    return rows
+
+
+def test_layer_toggle_gives_back_raw_mip_and_stitched(qapp, stub_detail, squid_dataset):
+    """IMA-227, driven through the real checkboxes: every operator is a LAYER, and the raw is
+    recoverable by toggling — never destroyed. Measured on the montage, cropped.
+
+    Julio's framing: "each transform is a LAYER, something like CellProfiler does this."
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    _drain_until(qapp, lambda: len(win._overview._tiles) >= 2)
+    ov = win._overview
+    raw_before = _montage_px(qapp, ov)
+
+    for key in ("mip", "stitch"):
+        _run_to_completion(qapp, win, key, ["B2", "B3"])
+    assert [ly.key for ly in win._op_stack.layers()] == ["raw", "mip", "stitch"]
+    assert ov._active == "stitch"
+    stitched = _montage_px(qapp, ov)
+
+    win._open_op_tab("layers", "Layers", win._build_layers_tab)
+    qapp.processEvents()
+    rows = _layer_rows(win)
+
+    # untick the top transform -> the one underneath shows. Nothing was destroyed to get there.
+    rows["Stitch (register + fuse)"][0].setChecked(False)
+    qapp.processEvents()
+    assert ov._active == "mip", f"unticking stitch showed {ov._active!r}"
+    mip_px = _montage_px(qapp, ov)
+    assert not np.array_equal(mip_px, stitched), "the MIP layer renders the stitched pixels"
+
+    # untick that too -> back to the RAW, byte for byte. This is the whole contract.
+    rows["Maximum Intensity Projection"][0].setChecked(False)
+    qapp.processEvents()
+    assert ov._active == "raw", f"unticking every transform showed {ov._active!r}"
+    assert win._plate_mode == "raw"
+    raw_after = _montage_px(qapp, ov)
+    assert raw_after.shape == raw_before.shape
+    assert np.array_equal(raw_after, raw_before), \
+        "the raw acquisition was not recovered by toggling — a transform destroyed it"
+    assert not np.array_equal(raw_after, mip_px), "raw and MIP render identical pixels"
+
+    # and re-ticking brings the transform straight back: the layers kept their pixels
+    rows["Maximum Intensity Projection"][0].setChecked(True)
+    qapp.processEvents()
+    assert ov._active == "mip"
+    assert np.array_equal(_montage_px(qapp, ov), mip_px), "re-enabling a layer lost its pixels"
+    win.close()
+
+
+def test_the_base_layer_can_be_neither_disabled_nor_reordered(qapp, stub_detail, squid_dataset):
+    """The raw must ALWAYS remain recoverable. Two ways it used not to be:
+
+    - ``toggle('raw', False)`` was accepted, so unticking every box left top_enabled() == None and
+      _apply_layers no-opped: the plate kept painting the last operator with every checkbox OFF.
+    - ``move('raw', +1)`` reordered the base like any other layer (and ``move('mip', -1)`` shoved
+      it off index 0 from the other side), putting raw ABOVE an operator — which the plate then
+      renders, hiding an enabled layer with no way to reach it.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    _drain_until(qapp, lambda: len(win._overview._tiles) >= 2)
+    _run_to_completion(qapp, win, "mip", ["B2", "B3"])
+    win._open_op_tab("layers", "Layers", win._build_layers_tab)
+    qapp.processEvents()
+    rows = _layer_rows(win)
+    raw_cb, raw_up, raw_dn = next(v for k, v in rows.items() if k.startswith("raw"))
+
+    # the controls SAY it, rather than accepting a click the model then ignores
+    assert not raw_cb.isEnabled() and raw_cb.isChecked(), "the base layer's checkbox is clickable"
+    assert not raw_up.isEnabled() and not raw_dn.isEnabled(), "the base layer can be reordered"
+
+    # ...and the model enforces it even when driven directly
+    win._on_layer_toggle("raw", False)
+    assert win._op_stack.top_enabled() is not None, "every layer got disabled"
+    assert [ly for ly in win._op_stack.layers() if ly.key == "raw"][0].enabled
+    win._on_layer_move("raw", +1)
+    assert [ly.key for ly in win._op_stack.layers()][0] == "raw", "the base moved off the bottom"
+    win._on_layer_move("mip", -1)
+    assert [ly.key for ly in win._op_stack.layers()] == ["raw", "mip"], \
+        "an operator was pushed below the base"
+    assert win._overview._active == "mip"
+    win.close()
+
+
+def test_layer_reorder_changes_what_the_plate_shows(qapp, stub_detail, squid_dataset):
+    """Reorder, not just toggle: the plate renders the TOPMOST enabled layer, so moving one up
+    must change the pixels on screen — driven through the real ↑ button."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    _drain_until(qapp, lambda: len(win._overview._tiles) >= 2)
+    for key in ("mip", "stitch"):
+        _run_to_completion(qapp, win, key, ["B2", "B3"])
+    ov = win._overview
+    win._open_op_tab("layers", "Layers", win._build_layers_tab)
+    qapp.processEvents()
+    assert ov._active == "stitch"
+    stitched = _montage_px(qapp, ov)
+
+    _layer_rows(win)["Maximum Intensity Projection"][1].click()   # the ↑ GESTURE
+    qapp.processEvents()
+    assert [ly.key for ly in win._op_stack.layers()] == ["raw", "stitch", "mip"]
+    assert ov._active == "mip", f"MIP moved to the top but the plate shows {ov._active!r}"
+    assert not np.array_equal(_montage_px(qapp, ov), stitched), \
+        "the reorder changed the stack but not the plate"
+    win.close()
+
+
+def test_an_exploration_tab_rerun_never_wipes_the_plate_wide_layer(qapp, stub_detail, squid_dataset):
+    """The layer-key bug that already bit once: reset_layer/_recomposite key off the LAYER key
+    ('mip@<tab>'), not the operator key, so a tab re-running MIP must leave the plate-wide 'mip'
+    layer's pixels standing."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    _drain_until(qapp, lambda: len(win._overview._tiles) >= 2)
+    _run_to_completion(qapp, win, "mip", ["B2", "B3"])
+    ov = win._overview
+    plate_wide = ov._store["mip"].copy()
+    assert plate_wide.any()
+
+    key = win.open_exploration_tab(["B3"])
+    win.run_operator("mip", regions=["B3"], save=False, tab_key=key)
+    t0 = time.time()
+    while win._worker is not None and win._worker.isRunning() and time.time() - t0 < 90:
+        qapp.processEvents(); time.sleep(0.02)
+    for _ in range(25):
+        qapp.processEvents(); time.sleep(0.02)
+
+    assert f"mip@{key}" in ov._store, "the tab run did not get its own layer"
+    assert "mip" in ov._store, "the tab run WIPED the plate-wide mip layer"
+    assert np.array_equal(ov._store["mip"], plate_wide), \
+        "the tab run overwrote the plate-wide mip layer's pixels"
+    assert [ly.key for ly in win._op_stack.layers()] == ["raw", "mip", f"mip@{key}"]
+    win._stop_worker(); win.close()
+
+
+def test_dropping_a_layer_frees_its_store_and_composite(qapp, stub_detail, squid_dataset):
+    """~95 MB per layer lives in _store/_final_arr. Dropping a layer must release BOTH — dropping
+    only the canvas looks like a fix and leaks the majority of the memory."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    _drain_until(qapp, lambda: len(win._overview._tiles) >= 2)
+    _run_to_completion(qapp, win, "mip", ["B2", "B3"])
+    ov = win._overview
+    ov.recomposite("mip"); qapp.processEvents()
+    for d in ("_store", "_final_arr", "_op_canvas", "_op_final", "_tiles_by_layer"):
+        assert "mip" in getattr(ov, d), f"mip never reached {d}"
+    ov.drop_layer("mip")
+    for d in ("_store", "_final_arr", "_op_canvas", "_op_final", "_tiles_by_layer"):
+        assert "mip" not in getattr(ov, d), f"drop_layer leaked {d}['mip']"
+    assert ov._active == "raw", "dropping the shown layer left the plate on it"
+    assert "raw" in ov._store, "dropping a layer took the raw with it"
+    win.close()

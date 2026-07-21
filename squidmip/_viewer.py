@@ -3952,13 +3952,23 @@ class PlateWindow(QMainWindow):
         title.setStyleSheet("font-size:14px;font-weight:800;")
         box.addWidget(title)
         for ly in reversed(self._op_stack.layers()):   # topmost first
+            base = ly.key == "raw"
             row = QWidget(); h = QHBoxLayout(row); h.setContentsMargins(0, 0, 0, 0)
-            cb = QCheckBox(ly.label); cb.setChecked(ly.enabled); cb.setStyleSheet("color:#e6edf3;")
+            cb = QCheckBox(ly.label + ("  (base)" if base else ""))
+            cb.setChecked(ly.enabled); cb.setStyleSheet("color:#e6edf3;")
             cb.toggled.connect(lambda on, k=ly.key: self._on_layer_toggle(k, on))
             up = QPushButton("↑"); up.setStyleSheet(_BTN_QSS); up.setFixedWidth(34)
             up.clicked.connect(lambda _=False, k=ly.key: self._on_layer_move(k, +1))
             dn = QPushButton("↓"); dn.setStyleSheet(_BTN_QSS); dn.setFixedWidth(34)
             dn.clicked.connect(lambda _=False, k=ly.key: self._on_layer_move(k, -1))
+            if base:
+                # IMA-227: raw is the layer every transform is recoverable TO — "each transform is
+                # a LAYER, the raw is never destroyed". OperationStack refuses to disable or
+                # reorder it; the controls must SAY so rather than accepting a click the model
+                # then ignores, which reads as a broken checkbox.
+                cb.setEnabled(False)
+                cb.setToolTip("The base layer. Untick the transforms above to see it.")
+                up.setEnabled(False); dn.setEnabled(False)
             h.addWidget(cb, 1); h.addWidget(up); h.addWidget(dn)
             box.addWidget(row)
         box.addStretch(1)
@@ -3973,8 +3983,15 @@ class PlateWindow(QMainWindow):
         self._refresh_layers_tab()
 
     def _apply_layers(self):
-        """Show the topmost enabled layer on the plate; keep the title in sync."""
+        """Show the topmost enabled layer on the plate; keep the title in sync.
+
+        ``top_enabled()`` cannot be None now that raw is undisableable, but this used to no-op on
+        None and leave the plate showing a layer the tab said was OFF. Fall back to raw explicitly
+        instead of silently doing nothing: the plate must never render something no enabled layer
+        accounts for."""
         top = self._op_stack.top_enabled()
+        if top is None:
+            top = next((ly for ly in self._op_stack.layers() if ly.key == "raw"), None)
         if top is not None and self._overview is not None:
             self._overview.set_active_layer(top.key)
             self._plate_mode = "raw" if top.key == "raw" else top.label
