@@ -25,3 +25,20 @@ jobs:
       # Integration tests need the real hongquan dataset, which isn't on CI -> deselect.
       - name: Test
         run: pytest -m "not integration" -v
+
+  # The FOV_ROI_table (IMA-231) is hand-written rather than produced by ngio, so that the runtime
+  # stays lean and `requires-python` stays at 3.10. That trade is only safe if the real consumer
+  # validates the output — this job is that proof. It is SEPARATE from the matrix above because
+  # ngio needs Python >= 3.11: installing it on the 3.10 leg would fail at the install step and
+  # take every other test down with it.
+  oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install (with the ngio oracle)
+        run: python -m pip install --upgrade pip && pip install .[test,oracle]
+      - name: ROI table interop
+        run: pytest -m "not integration" -v -k "roi or ngio or anndata or table"

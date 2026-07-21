@@ -41,16 +41,25 @@ is exactly the array's C-axis order (IMA-183 builds the C axis from that list).
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Iterable, Iterator, Optional, Sequence
 
 import numpy as np
 import tifffile
 
 from squidmip._engine import _default_workers, project_plate
-from squidmip._zarr_store import create_array, write_array, write_group
+from squidmip._zarr_store import (
+    create_array,
+    merge_array_attributes,
+    write_array,
+    write_group,
+    write_string_array,
+)
 from squidmip.projection import select_fovs
+
+logger = logging.getLogger("squidmip")
 
 _NGFF_VERSION = "0.5"
 _WAVELENGTH_RE = re.compile(r"(?<!\d)(\d{3,4})(?!\d)")  # a standalone 3-4 digit nm in a channel name
@@ -216,6 +225,124 @@ def _omero(channels: list[dict], dtype) -> dict:
     return {"channels": out}
 
 
+# --- FOV ROI table (IMA-231) -----------------------------------------------------------------
+#
+# Written per FIELD IMAGE, because that is where fractal-tasks-core resolves a table by name:
+#
+#   plate.ome.zarr/{row}/{col}/{fov}/
+#     tables/                 attributes.tables = ["FOV_ROI_table"]
+#       FOV_ROI_table/        anndata encoding + fractal roi_table type
+#         X/                  (1, 6) float64 — the six Fractal ROI numbers
+#         obs/FieldIndex      the RAW fov id (one row)
+#         var/_index          the six column names
+#
+# SquidMIP does not FUSE — each FOV is its own image — so the honest ROI is the whole image:
+# origin (0,0,0), extent = the field's own physical size. Real per-FOV stage origins need
+# coordinates.csv, which has no fov column; see TODOS.md.
+
+_ROI_COLUMNS = (
+    "x_micrometer", "y_micrometer", "z_micrometer",
+    "len_x_micrometer", "len_y_micrometer", "len_z_micrometer",
+)
+_ANNDATA_VERSION = "0.1.0"
+_DATAFRAME_VERSION = "0.2.0"
+
+
+def roi_table_enabled(metadata: dict) -> bool:
+    """Decide ONCE, UP FRONT, whether the ROI table can be written honestly.
+
+    ``_multiscales`` may fall back to 1.0 because only the RATIO between pyramid levels matters
+    there. An ROI table is an absolute physical claim: with that fallback a 4168 px field would be
+    published to Fractal as 4168 um (~2.8x wrong) with nothing marking it as fabricated. So the
+    rule is: never fabricate — but the two missing inputs mean different things.
+
+    * ``pixel_size_um`` missing -> RAISE. It is always present in a real acquisition
+      (``acquisition.yaml`` -> ``objective.pixel_size_um``); its absence is a misconfiguration
+      worth stopping for, and every projected pixel's physical meaning depends on it.
+    * ``dz_um`` missing -> SKIP the table, keep writing the plate. ``_acquisition.py`` derives it
+      from ``z_stack.delta_z_mm``, which a SINGLE-PLANE acquisition legitimately does not have.
+      Killing an otherwise-fine MIP run over an optional interop sidecar is the wrong trade.
+
+    Called from :func:`write_from_stream` before the first well is submitted, NOT from a writer
+    thread — raising mid-stream would surface via ``f.result()`` only after the plate/well groups
+    and several fields were already on disk, leaving a half-written plate.
+    """
+    if not metadata.get("pixel_size_um"):
+        raise ValueError(
+            "cannot write the plate: metadata['pixel_size_um'] is "
+            f"{metadata.get('pixel_size_um')!r}. Pixel size is what gives every written pixel a "
+            "physical size; without it the FOV_ROI_table would publish fabricated dimensions to "
+            "downstream tools (Fractal). Fix acquisition.yaml (objective.pixel_size_um)."
+        )
+    if not metadata.get("dz_um"):
+        logger.warning(
+            "no dz_um in metadata (single-plane acquisition?) — skipping FOV_ROI_table. The plate "
+            "is written normally; only the Fractal ROI sidecar is omitted, because its "
+            "len_z_micrometer would otherwise be fabricated."
+        )
+        return False
+    return True
+
+
+def _roi_row(image_shape: Sequence[int], pixel_size_um: float, dz_um: float) -> list[float]:
+    """The six Fractal ROI values for a whole-image ROI of a ``(T, C, Z, Y, X)`` field.
+
+    Origin is (0, 0, 0): Fractal's convention puts the ROI origin at the image's top-left, and
+    without fusion each field IS its own image. ``len_z`` is ONE plane thickness, not
+    ``n_z * dz``: the written array has Z=1 and ``_multiscales`` gives it a z scale of ``dz``, so
+    a consumer converting ROI micrometers to raster indices through that scale must land on a
+    length-1 axis.
+    """
+    y, x = int(image_shape[-2]), int(image_shape[-1])
+    p = float(pixel_size_um)
+    return [0.0, 0.0, 0.0, x * p, y * p, float(dz_um)]
+
+
+def _write_roi_table(field_dir: Path, fov, image_shape, pixel_size_um, dz_um) -> None:
+    """Write ``{field}/tables/FOV_ROI_table`` in the anndata-on-zarr layout ngio/Fractal read."""
+    tables_dir = Path(field_dir) / "tables"
+    write_group(tables_dir, attributes={"tables": ["FOV_ROI_table"]})
+
+    table_dir = tables_dir / "FOV_ROI_table"
+    write_group(
+        table_dir,
+        attributes={
+            "encoding-type": "anndata",
+            "encoding-version": _ANNDATA_VERSION,
+            "type": "roi_table",
+            "fractal_table_version": "1",
+        },
+    )
+
+    row = np.asarray([_roi_row(image_shape, pixel_size_um, dz_um)], dtype=np.float64)  # (1, 6)
+    store = create_array(table_dir / "X", row.shape, row.dtype, dimension_names=("obs", "var"))
+    write_array(store, row)
+    merge_array_attributes(table_dir / "X",
+                           {"encoding-type": "array", "encoding-version": "0.2.0"})
+
+    # obs index is the RAW fov id (matching the field directory), so a non-contiguous fov set
+    # stays faithful — same rule the well `images` paths follow.
+    for name, index_key, values in (
+        ("obs", "FieldIndex", [str(fov)]),
+        ("var", "_index", list(_ROI_COLUMNS)),
+    ):
+        group_dir = table_dir / name
+        write_group(group_dir, attributes={
+            "encoding-type": "dataframe",
+            "encoding-version": _DATAFRAME_VERSION,
+            "_index": index_key,
+            "column-order": [],
+        })
+        write_string_array(group_dir / index_key, values,
+                           attributes={"encoding-type": "string-array",
+                                       "encoding-version": "0.2.0"})
+
+    # anndata expects these mapping slots to exist even when empty.
+    for empty in ("layers", "obsm", "obsp", "varm", "varp", "uns"):
+        write_group(table_dir / empty,
+                    attributes={"encoding-type": "dict", "encoding-version": _ANNDATA_VERSION})
+
+
 # --- field + tiff writers --------------------------------------------------------------------
 
 def _validate_image(image: np.ndarray, channels: list[dict]) -> None:
@@ -232,8 +359,10 @@ def _validate_image(image: np.ndarray, channels: list[dict]) -> None:
         )
 
 
-def _write_field(field_dir: Path, image: np.ndarray, channels: list[dict], pixel_size_um, dz_um=None) -> int:
-    """Write one field: pyramid levels ``0..L`` (0 = full-res, pixel-exact) + multiscales + omero.
+def _write_field(field_dir: Path, image: np.ndarray, channels: list[dict], pixel_size_um, dz_um=None,
+                 fov=None, roi_table: bool = False) -> int:
+    """Write one field: pyramid levels ``0..L`` (0 = full-res, pixel-exact) + multiscales + omero,
+    plus the IMA-231 ``tables/FOV_ROI_table`` sidecar.
 
     Returns the number of levels written (1 for a small field with no pyramid)."""
     _validate_image(image, channels)
@@ -250,6 +379,13 @@ def _write_field(field_dir: Path, image: np.ndarray, channels: list[dict], pixel
             "omero": _omero(channels, image.dtype),
         },
     )
+    # IMA-231: written for every persisted field. The viewer's PREVIEW path never reaches here
+    # (it drives project_plate directly), so "persist-to-zarr only" holds by construction — no
+    # user-facing flag. `roi_table` is not that flag: it is the up-front honesty check from
+    # write_from_stream (False only when dz_um is absent, i.e. nothing truthful to write).
+    if roi_table:
+        _write_roi_table(field_dir, fov if fov is not None else field_dir.name,
+                         image.shape, pixel_size_um, dz_um)
     return len(levels)
 
 
@@ -301,6 +437,10 @@ def write_from_stream(
     plate_dir = out_dir / "plate.ome.zarr"
     tiff_root = out_dir / "tiff"
 
+    # IMA-231: settle the ROI table's physical inputs BEFORE anything touches disk, so a missing
+    # pixel size fails instantly and cleanly instead of from a writer thread halfway through.
+    roi_table = roi_table_enabled(metadata)
+
     wells = select_fovs(metadata, n_fovs=n_fovs)  # {region: [fov, ...]}, deterministic
     if regions is not None:   # subset: write only these wells (keep the requested order), for previews
         keep = list(dict.fromkeys(regions))
@@ -326,7 +466,8 @@ def write_from_stream(
     def _write_one(region, fov, image):
         row, col = parse_well_id(region)
         # field directory is the RAW fov id (Squid convention), digit-named for ndviewer.
-        levels = _write_field(plate_dir / row / col / str(fov), image, channels, pixel_size_um, dz_um)
+        levels = _write_field(plate_dir / row / col / str(fov), image, channels, pixel_size_um, dz_um,
+                              fov=fov, roi_table=roi_table)
         if tiff:
             _write_tiffs(tiff_root, region, fov, image, channel_names)
         if on_well is not None:  # live consumer (plate viewer): render tile + push to ndviewer

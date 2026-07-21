@@ -30,6 +30,11 @@ dependencies = [
 # ome-zarr-models: official OME-NGFF v0.5 pydantic schema — validates written plate metadata
 # in tests (test-time only; the runtime writer stays lean, no extra runtime dep).
 test = ["pytest>=7.0", "ome-zarr-models>=1.7"]
+# oracle: the REAL downstream consumer (ngio, the Fractal OME-Zarr library), used to prove the
+# hand-written FOV_ROI_table (IMA-231) is readable by the tool it exists for. Deliberately NOT in
+# [test]: ngio requires Python >= 3.11, so putting it there would fail the *install* step on the
+# 3.10 CI leg and redden every existing test. The ROI tests importorskip when it's absent.
+oracle = ["ngio>=0.5", "anndata>=0.12"]
 # gui: the MIP tool desktop app. PyQt5 + ndviewer_light (the embedded detail viewer). The headless
 # pipeline (reader/projection/engine/output) never imports these, so the CLI installs without them.
 gui = [
