@@ -1,7 +1,7 @@
-"""Coordinate placement: stage millimetres -> pixel offsets (IMA-187).
+"""Coordinate placement: stage micrometres -> pixel offsets (IMA-187).
 
 The pure, GUI-free half of the multi-FOV mosaic. Everything here is arithmetic on
-``fov_positions`` (from the reader) plus one scalar, ``pixel_size_um`` — no Qt, no I/O, no
+``fov_positions_um`` (from the reader) plus one scalar, ``pixel_size_um`` — no Qt, no I/O, no
 numpy dependency on image content — so placement correctness is asserted numerically in
 tests rather than eyeballed on a rendered plate.
 
@@ -15,9 +15,14 @@ The three that actually happen::
 A test that counts tiles catches none of them; a test that compares integer pixel offsets
 catches all three. Hence this module.
 
+Units: input positions are stage MICROMETRES (``metadata["fov_positions_um"]``; the reader
+converts from the mm that coordinates.csv records). This module used to carry the ``* 1000``
+mm->µm conversion itself, which meant an unsuffixed millimetre value travelled through the
+metadata dict — the exact silent-1000x hazard the ``_um`` naming rule exists to prevent.
+
 Geometry::
 
-    stage (mm), origin = per-region min          image (px), origin = mosaic top-left
+    stage (um), origin = per-region min          image (px), origin = mosaic top-left
     ┌─────────────────────────►  +x              ┌─────────────────────────►  +col
     │   (x0,y0)   (x1,y0)                        │   fov0      fov1
     │      ▪         ▪                           │    ▪         ▪
@@ -25,8 +30,8 @@ Geometry::
     │      ▪         ▪                           │    ▪         ▪
     ▼  +y                                        ▼  +row
 
-    col_px = (x_mm - min_x_mm) * 1000 / pixel_size_um
-    row_px = (y_mm - min_y_mm) * 1000 / pixel_size_um * _Y_SIGN
+    col_px = (x_um - min_x_um) / pixel_size_um
+    row_px = (y_um - min_y_um) / pixel_size_um * _Y_SIGN
 
 ``_Y_SIGN`` is +1: Squid rasters +x/+y and image rows increase downward, so increasing stage
 y maps to increasing row. It is a named module constant rather than an inline sign so the
@@ -58,7 +63,7 @@ def _require_pixel_size(pixel_size_um: Optional[float]) -> float:
     if pixel_size_um is None:
         raise ValueError(
             "pixel_size_um is required to place FOVs by stage coordinate, but the acquisition "
-            "metadata has none. Without it, millimetres cannot be converted to pixels and every "
+            "metadata has none. Without it, micrometres cannot be converted to pixels and every "
             "FOV would be drawn at the same spot. Add objective.pixel_size_um to acquisition.yaml."
         )
     p = float(pixel_size_um)
@@ -68,7 +73,7 @@ def _require_pixel_size(pixel_size_um: Optional[float]) -> float:
 
 
 def fov_offsets_px(
-    positions: Mapping[tuple, tuple],
+    positions_um: Mapping[tuple, tuple],
     region: str,
     fovs: Iterable[int],
     pixel_size_um: Optional[float],
@@ -77,8 +82,9 @@ def fov_offsets_px(
 
     Parameters
     ----------
-    positions:
-        ``{(region, fov): (x_mm, y_mm)}`` — ``reader.metadata["fov_positions"]``.
+    positions_um:
+        ``{(region, fov): (x_um, y_um)}`` — ``reader.metadata["fov_positions_um"]``, stage
+        MICROMETRES. Passing millimetres here silently shrinks the mosaic 1000x.
     region:
         The well / region being laid out.
     fovs:
@@ -104,22 +110,22 @@ def fov_offsets_px(
     if not fovs:
         raise ValueError(f"region {region!r}: no FOVs to place.")
 
-    missing = [f for f in fovs if (region, f) not in positions]
+    missing = [f for f in fovs if (region, f) not in positions_um]
     if missing:
         raise KeyError(
             f"region {region!r}: no stage position for FOV(s) {missing[:8]} "
-            f"(have {sum(1 for k in positions if k[0] == region)} of {len(fovs)}). "
+            f"(have {sum(1 for k in positions_um if k[0] == region)} of {len(fovs)}). "
             "coordinates.csv and the image filenames disagree; refusing to draw a mosaic with holes."
         )
 
-    xs = {f: float(positions[(region, f)][0]) for f in fovs}
-    ys = {f: float(positions[(region, f)][1]) for f in fovs}
+    xs = {f: float(positions_um[(region, f)][0]) for f in fovs}
+    ys = {f: float(positions_um[(region, f)][1]) for f in fovs}
     x0, y0 = min(xs.values()), min(ys.values())
 
     out: dict[int, tuple[int, int]] = {}
     for f in fovs:
-        col = (xs[f] - x0) * 1000.0 / p
-        row = (ys[f] - y0) * 1000.0 / p * _Y_SIGN
+        col = (xs[f] - x0) / p
+        row = (ys[f] - y0) / p * _Y_SIGN
         out[f] = (int(round(row)), int(round(col)))
     return out
 

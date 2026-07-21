@@ -26,7 +26,7 @@ def _meta(fovs_per_region):
         "channels": [{"name": "C0", "display_color": "#FF0000"}],
         "n_z": 1, "z_levels": [0], "dz_um": 1.0, "pixel_size_um": 0.5,
         "wellplate_format": "384 well plate", "frame_shape": (4, 4),
-        "dtype": np.dtype("uint16"), "n_t": 1, "fov_positions": {},
+        "dtype": np.dtype("uint16"), "n_t": 1, "fov_positions_um": {},
     }
 
 

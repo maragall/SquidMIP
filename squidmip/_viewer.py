@@ -1231,7 +1231,7 @@ def _mosaic_boxes(meta: dict) -> dict:
     """
     from squidmip._placement import cell_boxes, fov_offsets_px
 
-    positions = meta.get("fov_positions") or {}
+    positions = meta.get("fov_positions_um") or {}
     if not positions or meta.get("pixel_size_um") in (None, 0):
         return {}
     frame_shape = meta["frame_shape"]

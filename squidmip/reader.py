@@ -21,7 +21,7 @@ Discovery flow::
         glob timepoint folders (0/,1/…) ──┤─► n_t
         glob *.tiff in t0, parse stems ───┤─► regions, fovs_per_region, channels, z-levels
         read ONE frame ──────────────────┤─► frame_shape, dtype   (NOT hardcoded)
-        coordinates.csv (dedup by x,y) ───┤─► fov_positions {(region,fov): (x_mm, y_mm)}
+        coordinates.csv (dedup by x,y) ───┤─► fov_positions_um {(region,fov): (x_um, y_um)}
         acquisition.yaml (or JSON) ───────┴─► dz_um, pixel_size_um, wellplate_format, Nz/Nt cross-check
 
 The (region, fov, z, channel) index is parsed from FILENAMES — the ground truth. Scalar
@@ -29,7 +29,7 @@ metadata comes from acquisition.yaml (authoritative pixel size etc.), the flat J
 legacy fallback. read() constructs the path directly and returns exactly what tifffile
 decodes (native dtype), refusing non-2D planes and dtypes outside {uint8, uint16}.
 
-``coordinates.csv`` IS read (IMA-187), into ``metadata["fov_positions"]``, so multiple FOVs
+``coordinates.csv`` IS read (IMA-187), into ``metadata["fov_positions_um"]``, so multiple FOVs
 per region can be placed at their true stage offsets. Its real schema is::
 
     region,x (mm),y (mm),z (mm)
@@ -39,7 +39,13 @@ region's rows, so the Nth row of a region maps to that region's Nth sorted FOV. 
 de-duplicated on (region, x, y) FIRST, because a multi-z / multi-timepoint acquisition can
 repeat a stage position once per z-level; comparing raw row counts against FOV counts would
 then fail on every genuine z-stack. The de-duplicated count IS cross-checked and fails loud
-on a mismatch: a wrong mapping does not crash, it silently draws a scrambled mosaic.
+on a mismatch: a wrong mapping does not crash, it silently draws a scrambled mosaic. That
+failure is CONTAINED to the coordinate half of the metadata (``_fov_positions_um_or_empty``):
+a truncated CSV costs placement, not the whole acquisition.
+
+Units: coordinates.csv records MILLIMETRES, but this package's world space is MICROMETRES and
+every world-space key ends in ``_um`` (see ``squidmip/_tiling.py``). The conversion happens
+here, at the producer, and the metadata key is ``fov_positions_um``.
 """
 
 from __future__ import annotations
@@ -102,8 +108,17 @@ def _coord_columns(fieldnames) -> tuple[str, str]:
     return x, y
 
 
-def load_fov_positions(root, fovs_per_region: dict) -> dict:
-    """Parse ``coordinates.csv`` into ``{(region, fov): (x_mm, y_mm)}``.
+_MM_TO_UM = 1000.0
+
+
+def load_fov_positions_um(root, fovs_per_region: dict) -> dict:
+    """Parse ``coordinates.csv`` into ``{(region, fov): (x_um, y_um)}`` — MICROMETRES.
+
+    The file records millimetres; world space in this package is micrometres (``_tiling.py``),
+    and the units invariant is that every world-space value is µm and every key carrying one
+    ends in ``_um``. The mm -> µm conversion therefore happens HERE, at the single producer,
+    rather than in each consumer — an unsuffixed mm value crossing into µm code is a silent
+    1000x error that draws a plausible picture.
 
     Returns ``{}`` (present but empty — never a missing key) when the file is absent, so a
     consumer can degrade to single-FOV rendering instead of hitting a KeyError.
@@ -155,7 +170,8 @@ def load_fov_positions(root, fovs_per_region: dict) -> dict:
             if key in seen.setdefault(region, set()):
                 continue                    # same position repeated (one row per z / per t)
             seen[region].add(key)
-            ordered.setdefault(region, []).append((x, y))
+            # De-duplication compares the raw mm values; only the stored value is converted.
+            ordered.setdefault(region, []).append((x * _MM_TO_UM, y * _MM_TO_UM))
 
     positions: dict = {}
     for region, coords in ordered.items():
@@ -171,6 +187,33 @@ def load_fov_positions(root, fovs_per_region: dict) -> dict:
         for fov, xy in zip(fovs, coords):
             positions[(region, fov)] = xy
     return positions
+
+
+def _fov_positions_um_or_empty(root, fovs_per_region: dict) -> dict:
+    """``load_fov_positions_um`` degraded to ``{}`` on an unusable coordinates.csv.
+
+    ``metadata`` is the acquisition's whole identity: regions, channels, dtype, frame shape.
+    Those come from the FILENAMES and one decoded frame and are readable whatever the CSV says.
+    Before this, a truncated or malformed coordinates.csv raised out of the middle of the
+    metadata dict literal, so every one of those fields became unreachable and the viewer
+    reported "not a readable Squid acquisition" for an acquisition it could render perfectly
+    well minus the multi-FOV mosaic (IMA-187).
+
+    Degrading to ``{}`` is safe precisely because ``{}`` already means "no stage positions" —
+    consumers fall back to single-tile rendering. It does NOT weaken the cross-check: an
+    ambiguous CSV still never produces a scrambled mosaic, it produces no mosaic, loudly
+    (``UserWarning``). Only :class:`ValueError` (the parse/cross-check failures this module
+    raises deliberately) is absorbed; anything else still propagates.
+    """
+    try:
+        return load_fov_positions_um(root, fovs_per_region)
+    except ValueError as e:
+        warnings.warn(
+            f"{_COORDS_NAME} is unusable ({e}) — continuing WITHOUT stage positions: the "
+            "acquisition still opens, but multi-FOV wells render as a single tile instead of "
+            "a coordinate-placed mosaic."
+        )
+        return {}
 
 
 def _plate_key(region: str):
@@ -298,9 +341,11 @@ class SquidReader:
         self._meta = {
             "regions": regions,
             "fovs_per_region": fovs_per_region,
-            # {(region, fov): (x_mm, y_mm)} — {} when coordinates.csv is absent. Present on BOTH
-            # reader classes so consumers never have to ask which reader they hold (IMA-187).
-            "fov_positions": load_fov_positions(self._path, fovs_per_region),
+            # {(region, fov): (x_um, y_um)} — MICROMETRES, per the package units invariant.
+            # {} when coordinates.csv is absent OR unusable (never raises out of metadata).
+            # Present on BOTH reader classes so consumers never have to ask which reader they
+            # hold (IMA-187).
+            "fov_positions_um": _fov_positions_um_or_empty(self._path, fovs_per_region),
             "channels": resolve_channels(sorted(channels), load_channel_yaml(self._path)),
             "n_z": n_z,
             "z_levels": z_sorted,
@@ -449,7 +494,7 @@ class SquidOMEReader:
             # placement; without one this is {} and the mosaic degrades to a single field.
             # (Positions inside the OME-XML are not read: different parsing path, no dataset
             # on hand to validate it against. See .spec NOT-in-scope.)
-            "fov_positions": load_fov_positions(self._path, fovs_per_region),
+            "fov_positions_um": _fov_positions_um_or_empty(self._path, fovs_per_region),
             "channels": channels,
             "n_z": n_z,
             "z_levels": list(range(n_z)),
