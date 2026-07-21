@@ -43,6 +43,14 @@ so a future session doesn't rediscover it from zero.
 - **Context:** ndviewer_light discovers plates by directory walk and reads array `0` + `omero` only (`ndviewer_light/core.py:1149`, `:1070`). IMA-184's cross commit already proves the plate opens under strict `ome-zarr-py`, so the metadata is spec-valid regardless.
 - **Depends on / blocked by:** IMA-193 design.
 
+## Operator composition / multi-axis consumes + lockstep unlock → IMA-211+
+- **What:** (1) Pipeline composition of operators — plane-op ∘ z-reduce (flatfield-then-MIP) and z-reduce → fov-reduce (MIP-then-stitch). Multi-axis `consumes` (e.g. `{"z","fov"}`) is refused loud today because composition is ordered stages, not one set-tagged callable. (2) When IMA-211 enables fov execution, TWO refusal sites must be relaxed in lockstep: the engine check in `project_plate` (`_engine.py`) and the CLI validator `_known_projector` (`_cli.py`). Both sites and their tests name IMA-211 — `grep IMA-211` finds every one.
+- **Why:** IMA-210 deliberately ships declare-and-refuse-loud (decision 1A): the fov contract needs per-FOV geometry the reader metadata doesn't carry, and IMA-225 already ships a pre-210 decorator mechanism for plane-ops "that 210 will later absorb".
+- **Pros:** Real stitching becomes selectable by name; flatfield's decorator can migrate into the registry; the taxonomy stops being declaration-only.
+- **Cons:** Needs the fov callable contract (geometry, output canvas shape, changed stream cardinality — `project_plate` yields per-(region,fov) and the writer pins Z=1); needs an ordered-stage model, not just the frozenset tag. Outside voice (2026-07-20) flagged the frozenset may prove the wrong shape for composition — revisit the record type when the first real pipeline lands.
+- **Context:** `Operator(fn, consumes)` records in `_engine.py`; `projector_consumes()` + `available_projectors(consumes=)` are the introspection seams. IMA-225's `add_projector` BEFORE/AFTER kwarg composes with `consumes=` (both keyword-only); second branch to merge reconciles the docstring.
+- **Depends on / blocked by:** IMA-211 (fov geometry + stitch engine); IMA-225 (flatfield decorator to absorb).
+
 ## Fix upstream squid2minerva/colors.py display_color nesting → external repo
 - **What:** `squid2minerva/colors.py:load_yaml_colors` reads `channel["display_color"]`, but real `acquisition_channels.yaml` nests it under `channel.camera_settings.<cam>.display_color`. Its Minerva OME-TIFF exports only get right colors via the wavelength-fallback map — a custom yaml color is silently ignored.
 - **Why:** Confirmed against a real dataset yaml. It's correct-by-luck today because the fallback palette matches the standard 4 channels; any non-default color drops silently.

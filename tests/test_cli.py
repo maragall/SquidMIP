@@ -17,6 +17,27 @@ def test_input_folder_validator_rejects_missing(tmp_path):
         ProcessParameters(input_folder=str(tmp_path / "nope"))
 
 
+def test_projector_validator_rejects_unknown_name(tmp_path):
+    with pytest.raises(ValueError, match="unknown projector"):
+        ProcessParameters(input_folder=str(tmp_path), projector="nope")
+
+
+def test_projector_validator_rejects_non_z_operator_before_any_output(tmp_path):
+    # Registered ≠ runnable (IMA-210): a fov-reducer registers fine, but the CLI must
+    # reject it up front — before write_plate creates an output skeleton on disk.
+    import squidmip._engine as engine
+    from squidmip import add_projector
+
+    saved = dict(engine._PROJECTORS)
+    try:
+        add_projector("stitch", lambda tiles: None, consumes={"fov"})
+        with pytest.raises(ValueError, match="IMA-211"):
+            ProcessParameters(input_folder=str(tmp_path), projector="stitch")
+    finally:
+        engine._PROJECTORS.clear()
+        engine._PROJECTORS.update(saved)
+
+
 def test_run_writes_navigable_plate(squid_dataset, tmp_path):
     root, _ = squid_dataset                       # tiny real acquisition (B2, B3)
     params = ProcessParameters(input_folder=str(root), output_folder=str(tmp_path), tiff=False)

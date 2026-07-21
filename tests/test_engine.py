@@ -24,6 +24,7 @@ from squidmip import (
     available_projectors,
     project_plate,
     project_well,
+    projector_consumes,
 )
 
 
@@ -140,6 +141,79 @@ def test_project_plate_unknown_projector_raises_named():
     reader = FakeReader(n_wells=2)
     with pytest.raises(KeyError, match="unknown projector 'nope'"):
         next(project_plate(reader, projector="nope"))
+
+
+# ── IMA-210: operators declare the axis they consume ─────────────────────────────────────
+
+def test_add_projector_defaults_to_z_reducer():
+    add_projector("zz_default", lambda planes: next(iter(planes)))  # pre-210 call shape
+    assert projector_consumes("zz_default") == frozenset({"z"})
+
+
+def test_builtin_operators_consume_z():
+    assert projector_consumes("mip") == frozenset({"z"})
+    assert projector_consumes("reference") == frozenset({"z"})
+
+
+def test_available_projectors_baseline_and_record_roundtrip():
+    # The migration to Operator records must not change the listing, and the snapshot/
+    # restore fixture must round-trip records (the two cheapest regressions of IMA-210).
+    assert available_projectors() == ["mip", "reference"]
+    assert callable(engine._PROJECTORS["mip"].fn)
+    assert engine._PROJECTORS["mip"].consumes == frozenset({"z"})
+
+
+def test_plane_and_fov_operators_register_and_introspect():
+    add_projector("flat", lambda plane: plane, consumes=frozenset())
+    add_projector("stitch", lambda tiles: None, consumes={"fov"})
+    assert projector_consumes("flat") == frozenset()
+    assert projector_consumes("stitch") == frozenset({"fov"})
+    assert {"flat", "stitch"} <= set(available_projectors())
+
+
+def test_available_projectors_consumes_filter():
+    # Registered ≠ runnable: the unfiltered listing shows every kind; consumes= narrows it.
+    add_projector("stitch", lambda tiles: None, consumes={"fov"})
+    assert available_projectors(consumes={"z"}) == ["mip", "reference"]
+    assert available_projectors(consumes={"fov"}) == ["stitch"]
+    assert available_projectors(consumes=frozenset()) == []
+
+
+def test_add_projector_unknown_axis_raises():
+    with pytest.raises(ValueError, match="unknown axis"):
+        add_projector("bad_axis", lambda p: p, consumes={"t"})
+    with pytest.raises(ValueError, match="unknown axis"):  # exact lowercase only
+        add_projector("bad_axis", lambda p: p, consumes={"Z"})
+
+
+def test_add_projector_multi_axis_raises():
+    with pytest.raises(ValueError, match="multi-axis"):
+        add_projector("both", lambda p: p, consumes={"z", "fov"})
+
+
+def test_add_projector_bare_string_consumes_raises():
+    # frozenset("fov") would silently mean {'f','o','v'} — refuse the bare string loudly.
+    with pytest.raises(ValueError, match="bare string"):
+        add_projector("strop", lambda p: p, consumes="fov")
+
+
+def test_projector_consumes_unknown_name_raises_named():
+    with pytest.raises(KeyError, match="unknown projector 'nope'"):
+        projector_consumes("nope")
+
+
+def test_project_plate_refuses_fov_reducer():
+    add_projector("stitch", lambda tiles: None, consumes={"fov"})
+    reader = FakeReader(n_wells=2)
+    with pytest.raises(ValueError, match="fov-reduce.*IMA-211"):
+        next(project_plate(reader, projector="stitch"))
+
+
+def test_project_plate_refuses_plane_op():
+    add_projector("flat", lambda plane: plane, consumes=frozenset())
+    reader = FakeReader(n_wells=2)
+    with pytest.raises(ValueError, match="plane-op"):
+        next(project_plate(reader, projector="flat"))
 
 
 # ── correctness: concurrency changes no pixel ───────────────────────────────────────────

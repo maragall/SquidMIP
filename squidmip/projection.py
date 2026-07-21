@@ -21,7 +21,8 @@ Data flow::
 Design contracts:
   * ``project`` is a pure, dtype-preserving, bounded-memory reduction — it streams planes
     and never materialises the whole z-stack. It is the primitive IMA-188 wraps in its
-    parallel/streaming engine and registers as the projector (MIP now, EDF later).
+    parallel/streaming engine and registers as a z-reducer (``consumes={"z"}`` — registry
+    operators declare the axis they consume, IMA-210; MIP now, EDF later).
   * The z iterator is ``metadata["z_levels"]`` (the real, filename-derived z indices),
     NOT ``range(n_z)`` — ``n_z`` is a *count*, so ``range`` would be wrong the moment z is
     non-contiguous (a partial acquisition: files {0,1,3} -> z_levels [0,1,3], n_z 3).

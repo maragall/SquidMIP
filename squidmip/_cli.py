@@ -79,11 +79,21 @@ class ProcessParameters(BaseModel, use_attribute_docstrings=True):
         # Validate UP FRONT: otherwise the name is only resolved lazily inside project_plate, after
         # write_plate has already written an empty plate skeleton to disk, then crashes with a raw
         # traceback. A clean CLI error before any output is the safe behavior.
-        from squidmip import available_projectors
+        from squidmip import available_projectors, projector_consumes
 
         avail = available_projectors()
         if v not in avail:
             raise ValueError(f"unknown projector {v!r}; available: {sorted(avail)}")
+        axes = projector_consumes(v)
+        if axes != frozenset({"z"}):
+            # Registered ≠ runnable (IMA-210): a plane-op or fov-reducer registers fine but
+            # this pipeline only executes z-reduce — reject here, before any output exists.
+            kind = "plane-op" if not axes else f"{'+'.join(sorted(axes))}-reduce"
+            raise ValueError(
+                f"operator {v!r} is a {kind}; this pipeline runs z-reduce operators only "
+                f"(fov-reduce lands with IMA-211). Available z-reduce operators: "
+                f"{available_projectors(consumes={'z'})}"
+            )
         return v
 
 

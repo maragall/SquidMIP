@@ -20,7 +20,9 @@ Data flow::
         │                              lazy index/time-folders/meta so concurrent read() only
         │                              touches immutable state; no locks needed downstream)
         ▼  select_fovs(meta, n_fovs)  → {region: [fov, ...]}  → flat [(region, fov), ...]
-        ▼  _PROJECTORS[projector]     → the z-reduce callable passed as project_well(reduce=)
+        ▼  _PROJECTORS[projector]     → Operator(fn, consumes); consumes must be {"z"} here —
+        │                              op.fn is passed as project_well(reduce=); any other kind
+        │                              is refused LOUD (see the operator taxonomy below)
         │
         ▼  ThreadPoolExecutor(max_workers=N)          bounded window: ≤ N wells in flight
         │     prime N tasks ─┐                        so completed ~139 MB results can NOT
@@ -36,13 +38,35 @@ Data flow::
 The projector table is the IMA-188 half of the pluggable-projector contract: 183 ships
 ``project`` (MIP); a future EDF/EMF/mean projector is added by name here and runs through
 ``project_plate(..., projector="<name>")`` with **zero engine edits**.
+
+Operator taxonomy (IMA-210): every registry entry declares which axis it consumes,
+so the table can hold more than z-reducers without lying about what runs today::
+
+    _PROJECTORS: name ─► Operator(fn, consumes)
+                              │
+              ┌───────────────┼──────────────────┐
+       consumes = {}     consumes = {"z"}   consumes = {"fov"}
+       plane-op          z-reducer          fov-reducer
+       plane -> plane    Iterable[plane]    contract: IMA-211
+       (filter/correct)    -> plane         (stitch; needs geometry)
+            │                 │                  │
+            │            project_plate           │
+            │            executes TODAY          │
+            └── refuse loud ──┴─── refuse loud ──┘
+                (compose w/ a reducer   (lands with IMA-211)
+                 — not terminal)
+
+A plane-op is never a terminal projector (it would emit (T, C, Nz, Y, X) and break the
+writer's Z=1 contract) and a fov-reducer needs per-FOV geometry the pipeline does not
+carry yet — both register and introspect fine, but selecting one in ``project_plate``
+raises a named error instead of guessing.
 """
 
 from __future__ import annotations
 
 import os
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, NamedTuple
 
 import numpy as np
 
@@ -51,12 +75,40 @@ from squidmip.projection import project, project_reference, project_well, select
 if TYPE_CHECKING:  # avoid import cost / cycle at runtime
     from squidmip.reader import SquidReader
 
-# A projector reduces one channel's z-planes to a single plane (the ``reduce=`` argument of
-# project_well). MIP is the only one 183 ships; the projector table is the seam for the rest.
+# The z-reducer signature (the ``reduce=`` argument of project_well): one channel's z-planes
+# in, a single plane out. Per-kind operator signatures:
+#   plane-op   (consumes = {})      : plane -> plane                (filter/correction; composes
+#                                                                    with a reducer, never terminal)
+#   z-reducer  (consumes = {"z"})   : Iterable[plane] -> plane      (this alias — MIP, reference)
+#   fov-reducer(consumes = {"fov"}) : contract defined by IMA-211   (stitch; needs per-FOV geometry)
 Projector = Callable[[Iterable[np.ndarray]], np.ndarray]
 
-# name -> z-reduction callable. Selected by name in project_plate; extended via add_projector.
-_PROJECTORS: dict[str, Projector] = {"mip": project, "reference": project_reference}
+# The axes an operator may declare it consumes. Exact, lowercase; anything else is refused loud.
+_AXES = frozenset({"z", "fov"})
+
+# The z-axis singleton — the only kind project_plate executes today (and the add_projector default).
+_CONSUMES_Z = frozenset({"z"})
+
+
+class Operator(NamedTuple):
+    """One registry entry: the callable plus which axis it consumes (its kind).
+
+    ``consumes`` is the group-by-then-reduce declaration: the engine groups planes by every
+    axis the operator does NOT consume and folds over the one it does. ``fn`` is typed loosely
+    (``Callable[..., np.ndarray]``) because only the z-reducer signature is pinned today — the
+    fov-reducer contract belongs to IMA-211 (see the per-kind table above).
+    """
+
+    fn: Callable[..., np.ndarray]
+    consumes: frozenset[str]
+
+
+# name -> Operator (fn + consumed axis). One dict, one source of truth — the callable and its
+# kind can never drift apart. Selected by name in project_plate; extended via add_projector.
+_PROJECTORS: dict[str, Operator] = {
+    "mip": Operator(project, _CONSUMES_Z),
+    "reference": Operator(project_reference, _CONSUMES_Z),
+}
 
 
 def _default_workers() -> int:
@@ -77,28 +129,42 @@ def _default_workers() -> int:
     return n or 1
 
 
-def add_projector(name: str, projector: Projector) -> None:
-    """Add a named z-reduction so it can be selected by name in :func:`project_plate`.
+def add_projector(
+    name: str,
+    projector: Callable[..., np.ndarray],
+    *,
+    consumes: Iterable[str] = _CONSUMES_Z,
+) -> None:
+    """Add a named operator so it can be selected by name in :func:`project_plate`.
 
-    This is how a future projector (EDF/EMF/mean) plugs in **without touching the engine**:
-    add a name, then call ``project_plate(..., projector="<name>")``. (Named ``add_``, not
-    ``register_``, to avoid confusion with image *registration* / alignment.)
+    This is how a future operator (EDF/EMF/mean, a plane filter, a stitcher) plugs in
+    **without touching the engine**: add a name, then call
+    ``project_plate(..., projector="<name>")``. (Named ``add_``, not ``register_``, to
+    avoid confusion with image *registration* / alignment.)
 
     Parameters
     ----------
     name:
-        The projector's table key (e.g. ``"mip"``, ``"mean"``). Non-empty.
+        The operator's table key (e.g. ``"mip"``, ``"mean"``). Non-empty.
     projector:
-        A callable with the :func:`squidmip.project` signature — takes an iterable of
-        equal-shape planes and returns one plane. It SHOULD stream (bounded memory) to keep
-        the plate engine's per-worker footprint flat; a projector that materialises the whole
-        z-stack (e.g. EDF) is allowed but owns its own, documented, memory profile.
+        The operator callable. For a z-reducer (the default kind) that is the
+        :func:`squidmip.project` signature — an iterable of equal-shape planes in, one plane
+        out. It SHOULD stream (bounded memory) to keep the plate engine's per-worker footprint
+        flat; an operator that materialises the whole z-stack (e.g. EDF) is allowed but owns
+        its own, documented, memory profile. See the per-kind signature table at the top of
+        this module for plane-ops and fov-reducers.
+    consumes:
+        Which axis this operator consumes — its kind (keyword-only; default ``{"z"}`` so
+        every pre-IMA-210 caller keeps working unchanged). ``{}`` = plane-op, ``{"z"}`` =
+        z-reducer, ``{"fov"}`` = fov-reducer. Exactly zero or one axis from ``{"z", "fov"}``;
+        multi-axis operators are a composition concern (IMA-211+), refused loud today.
 
     Raises
     ------
     ValueError
-        If *name* is empty, *projector* is not callable, or *name* is already defined
-        (a silent clobber of an existing projector would be a quiet correctness bug).
+        If *name* is empty, *projector* is not callable, *name* is already defined
+        (a silent clobber of an existing operator would be a quiet correctness bug),
+        or *consumes* is not zero-or-one axis from ``{"z", "fov"}``.
     """
     if not name:
         raise ValueError("projector name must be a non-empty string")
@@ -109,16 +175,67 @@ def add_projector(name: str, projector: Projector) -> None:
             f"projector {name!r} is already defined; pick a distinct name "
             f"(defined: {available_projectors()})."
         )
-    _PROJECTORS[name] = projector
+    axes = _as_axes(consumes, where=f"add_projector({name!r})")
+    if len(axes) > 1:
+        raise ValueError(
+            f"consumes={sorted(axes)} for {name!r}: multi-axis operators are not defined "
+            "yet — composition (e.g. MIP then stitch) is a pipeline concern (IMA-211+). "
+            "Declare zero or one axis."
+        )
+    _PROJECTORS[name] = Operator(projector, axes)
 
 
-def available_projectors() -> list[str]:
-    """Return the available projector names, sorted (``["mip", ...]``)."""
-    return sorted(_PROJECTORS)
+def _as_axes(consumes: Iterable[str], *, where: str) -> frozenset[str]:
+    """Normalize + validate a ``consumes`` value to a frozenset of known axis names.
+
+    Shared by :func:`add_projector` and :func:`available_projectors` so the axis vocabulary
+    is enforced in exactly one place. Error rule for the whole registry surface: a bad
+    *value* (axis name, kind) raises :class:`ValueError`; an unknown *name* (table key)
+    raises :class:`KeyError` — dict semantics.
+    """
+    if isinstance(consumes, str):  # frozenset("fov") would silently mean {'f','o','v'}
+        raise ValueError(
+            f"{where}: consumes must be a set of axis names, not a bare string; "
+            f"got {consumes!r} — did you mean {{{consumes!r}}}?"
+        )
+    axes = frozenset(consumes)
+    if not axes <= _AXES:
+        raise ValueError(
+            f"{where}: unknown axis {sorted(axes - _AXES)} in consumes; "
+            f"valid axes: {sorted(_AXES)} (exact, lowercase)."
+        )
+    return axes
 
 
-def _resolve_projector(name: str) -> Projector:
-    """Look up a projector by name, failing loud (named) on an unknown key."""
+def available_projectors(*, consumes: Iterable[str] | None = None) -> list[str]:
+    """Return the available operator names, sorted (``["mip", ...]``).
+
+    Lists EVERY registered operator regardless of kind — registered is not the same as
+    runnable (a fov-reducer registers fine but :func:`project_plate` refuses it until
+    IMA-211). Pass ``consumes=`` to filter to one kind, e.g.
+    ``available_projectors(consumes={"z"})`` for the operators the plate engine can
+    execute today.
+    """
+    if consumes is None:
+        return sorted(_PROJECTORS)
+    kind = _as_axes(consumes, where="available_projectors")
+    return sorted(n for n, op in _PROJECTORS.items() if op.consumes == kind)
+
+
+def projector_consumes(name: str) -> frozenset[str]:
+    """Return which axis the named operator consumes (its kind).
+
+    ``frozenset()`` = plane-op, ``{"z"}`` = z-reducer, ``{"fov"}`` = fov-reducer. This is
+    the registry's kind introspection (IMA-210) — e.g. the CLI uses it to reject a non-z
+    operator BEFORE any output is written. Raises the same named :class:`KeyError` as
+    :func:`project_plate` on an unknown name (bad value → ValueError, unknown name →
+    KeyError, everywhere in this registry).
+    """
+    return _resolve_projector(name).consumes
+
+
+def _resolve_projector(name: str) -> Operator:
+    """Look up an operator record by name, failing loud (named) on an unknown key."""
     try:
         return _PROJECTORS[name]
     except KeyError:
@@ -196,7 +313,17 @@ def project_plate(
         raise ValueError(f"workers must be >= 1, got {workers}")
     n_workers = workers if workers is not None else _default_workers()
 
-    reduce = _resolve_projector(projector)
+    op = _resolve_projector(projector)
+    if op.consumes != _CONSUMES_Z:
+        # Declare-then-refuse-loud (IMA-210): non-z operators register and introspect fine,
+        # but this engine only knows how to fold over z. Guessing would corrupt output silently.
+        kind = "plane-op" if not op.consumes else f"{'+'.join(sorted(op.consumes))}-reduce"
+        raise ValueError(
+            f"operator {projector!r} is a {kind} (consumes={sorted(op.consumes)}); "
+            "project_plate only executes z-reduce operators today. Plane-ops compose with "
+            "a reducer (never terminal); fov-reduce (stitch) lands with IMA-211."
+        )
+    reduce = op.fn
 
     # Warm the reader's lazy index/time-folders/metadata single-threaded BEFORE fan-out.
     meta = reader.metadata
