@@ -1,4 +1,4 @@
-"""SquidMIP CLI (IMA-186) — run a post-processing operator over an HCS acquisition, headless.
+"""SquidHCS CLI (IMA-186) — run a post-processing operator over an HCS acquisition, headless.
 
 This is the same engine the GUI drives, exposed for high-throughput/batch use: point it at a Squid
 well-plate acquisition and it iterates the chosen operator (a z-reduction, e.g. MIP) over every well
@@ -9,9 +9,9 @@ docstrings become ``--help`` text) + ``CliApp.run`` + a thin ``run()`` that open
 ``write_plate``. Keeping the "what to run" as data (parameters) and "how to run" as the shared engine
 means a new operator is a new ``--projector`` value, not new CLI plumbing.
 
-    squidmip <acquisition>                      # MIP every well -> <acquisition>.hcs/plate.ome.zarr
-    squidmip <acquisition> --projector mip --workers 8 --output-folder /mnt/big
-    squidmip <acquisition> --tiff               # also write the uncompressed per-plane TIFF export
+    squidhcs <acquisition>                      # MIP every well -> <acquisition>.hcs/plate.ome.zarr
+    squidhcs <acquisition> --projector mip --workers 8 --output-folder /mnt/big
+    squidhcs <acquisition> --tiff               # also write the uncompressed per-plane TIFF export
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import Optional
 from pydantic import BaseModel, field_validator
 from pydantic_settings import CliApp, CliPositionalArg
 
-logger = logging.getLogger("squidmip")
+logger = logging.getLogger("squidhcs")
 
 
 class ProcessParameters(BaseModel, use_attribute_docstrings=True):
@@ -36,7 +36,7 @@ class ProcessParameters(BaseModel, use_attribute_docstrings=True):
 
     projector: str = "mip"
     """Operator to run over every well — a z-reduction. 'mip' = maximum intensity projection.
-    (Register more with squidmip.add_projector; the CLI needs no change to gain one.)"""
+    (Register more with squidhcs.add_projector; the CLI needs no change to gain one.)"""
 
     output_folder: Optional[str] = None
     """Directory to receive ``<acquisition-name>.hcs/`` (plate.ome.zarr). Defaults to a sibling of
@@ -79,7 +79,7 @@ class ProcessParameters(BaseModel, use_attribute_docstrings=True):
         # Validate UP FRONT: otherwise the name is only resolved lazily inside project_plate, after
         # write_plate has already written an empty plate skeleton to disk, then crashes with a raw
         # traceback. A clean CLI error before any output is the safe behavior.
-        from squidmip import available_projectors
+        from squidhcs import available_projectors
 
         avail = available_projectors()
         if v not in avail:
@@ -89,13 +89,13 @@ class ProcessParameters(BaseModel, use_attribute_docstrings=True):
 
 def run(params: ProcessParameters) -> dict:
     """Open the acquisition and write the operator's OME-Zarr plate; return write_plate's manifest."""
-    from squidmip import open_reader, write_plate
+    from squidhcs import open_reader, write_plate
 
     reader = open_reader(params.input_folder)
     # Scope guard: 1536-well plates only for now (not a general product yet). Fail loud, before any write.
     fmt = str(reader.metadata.get("wellplate_format", ""))
     if not any(s in fmt for s in ("384", "1536")):
-        raise SystemExit(f"squidmip currently supports 384- and 1536-well plates (got {fmt or 'unknown'!r}).")
+        raise SystemExit(f"squidhcs currently supports 384- and 1536-well plates (got {fmt or 'unknown'!r}).")
     # Multi-FOV policy (IMA-191): current scope is one FOV per well; sample the first and warn.
     fpr = reader.metadata["fovs_per_region"]
     multi = sum(1 for r in fpr if len(fpr[r]) > 1)

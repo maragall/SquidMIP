@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from squidmip import open_reader, project, project_well, select_fovs
+from squidhcs import open_reader, project, project_well, select_fovs
 
 
 # --------------------------------------------------------------------------------------
@@ -248,7 +248,7 @@ def test_project_reference_picks_sharpest_plane():
     # Reference-plane reduction returns the single sharpest z-plane by Tenengrad focus (streaming,
     # bounded). A high-gradient plane beats flat/dim ones; the exact plane is returned unchanged.
     import numpy as np
-    from squidmip.projection import project_reference
+    from squidhcs.projection import project_reference
     rng = np.random.default_rng(1)
     flat = (np.ones((48, 48)) * 800).astype(np.uint16)
     sharp = rng.integers(0, 4000, (48, 48)).astype(np.uint16)
@@ -256,5 +256,5 @@ def test_project_reference_picks_sharpest_plane():
     out = project_reference(iter([flat, dim, sharp]))
     assert np.array_equal(out, sharp)
     # registered as a pluggable projector, so the engine/CLI can select it by name
-    import squidmip
-    assert "reference" in squidmip.available_projectors()
+    import squidhcs
+    assert "reference" in squidhcs.available_projectors()

@@ -2,11 +2,16 @@
 the cheap guard the maintainer asked for before freezing artifacts."""
 import importlib, sys
 
+# Every entry must be an actual declared dependency or a real module in this package.
+# IMA-213: `squidhcs._video`, `imageio` and `imageio_ffmpeg` were removed — `_video` lives
+# only on the IMA-185/187/205 branches, and the two imageio packages were video-player deps
+# dropped at IMA-185 that were never declared in pyproject.toml. All three failed here, and
+# because `freeze` declares `needs: smoke`, that kept the PyInstaller job from ever running.
 MODULES = [
-    "squidmip", "squidmip.reader", "squidmip._engine", "squidmip.projection",
-    "squidmip._output", "squidmip._zarr_store", "squidmip._montage", "squidmip._cli",
-    "squidmip._video", "squidmip._viewer",           # _viewer needs PyQt5 (gui extra)
-    "numpy", "tifffile", "tensorstore", "pydantic_settings", "imageio", "imageio_ffmpeg",
+    "squidhcs", "squidhcs.reader", "squidhcs._engine", "squidhcs.projection",
+    "squidhcs._output", "squidhcs._zarr_store", "squidhcs._montage", "squidhcs._cli",
+    "squidhcs._viewer",                              # _viewer needs PyQt5 (gui extra)
+    "numpy", "tifffile", "tensorstore", "pydantic_settings",
     "PyQt5.QtWidgets", "ndviewer_light.core",
 ]
 failed = []

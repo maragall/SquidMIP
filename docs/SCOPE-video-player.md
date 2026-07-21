@@ -25,12 +25,12 @@ The one engine: `project_plate` streams per-(well, t) with bounded memory; Recor
 No new execution model.
 
 ## Scripts it leverages
-**Ours (SquidMIP):**
-- `squidmip/reader.py` — read T frames per (well, fov, z, channel, t).
-- `squidmip/_engine.py` + `squidmip/projection.py` — stream wells; reduce Z (MIP/reference) before T.
-- `squidmip/_viewer.py` — Record tab UI + push frames to ndv for the in-app player.
-- `squidmip/_cli.py` — headless export.
-- `squidmip/_video.py` — **new**, thin mp4 encoder.
+**Ours (SquidHCS):**
+- `squidhcs/reader.py` — read T frames per (well, fov, z, channel, t).
+- `squidhcs/_engine.py` + `squidhcs/projection.py` — stream wells; reduce Z (MIP/reference) before T.
+- `squidhcs/_viewer.py` — Record tab UI + push frames to ndv for the in-app player.
+- `squidhcs/_cli.py` — headless export.
+- `squidhcs/_video.py` — **new**, thin mp4 encoder.
 - `ndviewer_light/core.py::register_array` — **built**, the in-app growing/scrubbable player.
 
 **New dependency:** `imageio-ffmpeg` (tried-and-true mp4 writer; bundled ffmpeg, no system install).

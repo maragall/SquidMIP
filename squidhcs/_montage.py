@@ -322,7 +322,7 @@ def build_montage(
     ValueError
         Not an HCS plate, a well missing its field array, or an unresolvable channel color.
     """
-    from PIL import Image  # tried-and-true PNG encoder; imported lazily so import squidmip stays light
+    from PIL import Image  # tried-and-true PNG encoder; imported lazily so import squidhcs stays light
 
     if cell_px < 1:
         raise ValueError(f"cell_px must be >= 1, got {cell_px}")
@@ -401,7 +401,7 @@ def build_montage(
     sidecar_path.write_text(json.dumps(sidecar, indent=2))
 
     # self-contained hover-indicator viewer (uses the sidecar geometry; no server, no deps)
-    viewer_path = _write_viewer_html(out_dir, montage_path.name, sidecar, title="SquidMIP plate montage")
+    viewer_path = _write_viewer_html(out_dir, montage_path.name, sidecar, title="SquidHCS plate montage")
 
     return {
         "montage": str(montage_path),

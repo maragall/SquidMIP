@@ -38,6 +38,81 @@ jobs:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
         run: pytest -q --ignore=tests/test_performance.py
 
+  # ---- IMA-213: prove the rename migration repairs a pre-rename install -------------------------
+  # Setup-Windows.ps1 is the documented install path and, since IMA-213, also the *migration*
+  # path. It had never been executed by CI. This fabricates the exact pre-rename state (an old
+  # %LOCALAPPDATA%\squidmip\venv plus a stale Desktop shortcut pointing at `-m squidmip._viewer`),
+  # runs the real installer, and asserts it repaired everything.
+  windows-migration:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fabricate a pre-rename install (old venv + stale shortcut)
+        shell: pwsh
+        run: |
+          $old = Join-Path $env:LOCALAPPDATA "squidmip\venv"
+          python -m venv $old
+          if (-not (Test-Path (Join-Path $old "Scripts\python.exe"))) {
+            throw "fixture setup failed: could not create the old venv"
+          }
+          $desktop = [Environment]::GetFolderPath("Desktop")
+          $lnk = Join-Path $desktop "MIP tool.lnk"
+          $shell = New-Object -ComObject WScript.Shell
+          $sc = $shell.CreateShortcut($lnk)
+          $sc.TargetPath = Join-Path $old "Scripts\python.exe"
+          $sc.Arguments  = "-m squidmip._viewer"     # the module the rename removes
+          $sc.Save()
+          Write-Host "fixture ready: old venv + shortcut -> -m squidmip._viewer"
+
+      - name: Run the real installer (performs the migration)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts\Setup-Windows.ps1
+
+      - name: Assert the migration repaired the install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $new = Join-Path $env:LOCALAPPDATA "squidhcs\venv"
+          $npy = Join-Path $new "Scripts\python.exe"
+          if (-not (Test-Path $npy)) { throw "new venv missing at $new" }
+
+          # The renamed package must import from the NEW venv.
+          & $npy -c "import squidhcs, sys; print('squidhcs OK', squidhcs.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "squidhcs does not import from the migrated venv" }
+
+          # The old module must be gone, otherwise the rename left a shim behind (D4 = clean cut).
+          & $npy -c "import importlib.util as u, sys; sys.exit(0 if u.find_spec('squidmip') is None else 1)"
+          if ($LASTEXITCODE -ne 0) { throw "squidmip is still importable; the cut was not clean" }
+
+          # Exactly one Desktop icon, repointed at the new venv and the new module.
+          $desktop = [Environment]::GetFolderPath("Desktop")
+          $icons = @(Get-ChildItem $desktop -Filter "*.lnk" | Where-Object { $_.Name -like "*MIP tool*" })
+          if ($icons.Count -ne 1) { throw "expected exactly 1 'MIP tool' icon, found $($icons.Count)" }
+
+          $shell = New-Object -ComObject WScript.Shell
+          $sc = $shell.CreateShortcut($icons[0].FullName)
+          if ($sc.Arguments -notmatch "squidhcs\._viewer") {
+            throw "shortcut still points at '$($sc.Arguments)' - migration did not repoint it"
+          }
+          if ($sc.TargetPath -notmatch "squidhcs") {
+            throw "shortcut target still references the old venv: $($sc.TargetPath)"
+          }
+          Write-Host "migration verified: new venv, clean cut, one repointed icon"
+
+      - name: Assert the installer is idempotent (second run is a no-op)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          powershell -ExecutionPolicy Bypass -File scripts\Setup-Windows.ps1
+          $desktop = [Environment]::GetFolderPath("Desktop")
+          $icons = @(Get-ChildItem $desktop -Filter "*.lnk" | Where-Object { $_.Name -like "*MIP tool*" })
+          if ($icons.Count -ne 1) { throw "re-run produced $($icons.Count) icons; not idempotent" }
+          Write-Host "idempotent re-run OK"
+
   # ---- freeze the GUI per OS via PyInstaller ---------------------------------------------------
   freeze:
     needs: smoke
@@ -56,12 +131,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install "git+https://github.com/maragall/ndviewer_light"
           pip install ".[gui]" pyinstaller
+      # IMA-213: this previously passed BOTH --windowed and -c (--console). They set the same
+      # PyInstaller option, so the trailing -c silently won and the "windowed" intent was a lie.
+      # Console is what we actually want, matching Setup-Windows.ps1, which deliberately launches
+      # via python.exe so a console shows logs/errors next to the app. --collect-all imageio_ffmpeg
+      # is gone with the video player (IMA-185); it is not a declared dependency.
       - name: Freeze hcs-viewer
         run: >
-          pyinstaller --noconfirm --windowed --name hcs-viewer
+          pyinstaller --noconfirm --console --name hcs-viewer
           --collect-all ndviewer_light --collect-all ndv --collect-all tensorstore
-          --collect-all imageio_ffmpeg --collect-submodules squidmip
-          -c scripts/hcs_viewer_entry.py
+          --collect-submodules squidhcs
+          scripts/hcs_viewer_entry.py
+      # A freeze that produced nothing must fail the job. Before IMA-213 this job had never run
+      # at all (`needs: smoke`, and smoke was red), so nothing here was ever exercised.
+      - name: Assert the frozen artifact exists and is non-empty
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="dist/hcs-viewer/hcs-viewer"
+          [ "$RUNNER_OS" = "Windows" ] && bin="dist/hcs-viewer/hcs-viewer.exe"
+          if [ ! -s "$bin" ]; then
+            echo "::error::PyInstaller produced no non-empty binary at $bin"
+            ls -laR dist || true
+            exit 1
+          fi
+          echo "frozen binary OK: $bin ($(wc -c < "$bin") bytes)"
       - name: Package Linux AppImage
         if: runner.os == 'Linux'
         run: |
@@ -71,4 +165,6 @@ jobs:
         with:
           name: hcs-viewer-${{ matrix.os }}
           path: dist/*
-          if-no-files-found: warn
+          # IMA-213: was `warn`, which let an empty freeze report green. A build step that
+          # cannot fail is not a check.
+          if-no-files-found: error

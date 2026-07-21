@@ -1,7 +1,7 @@
 """Low-level zarr v3 store + NGFF group primitives (vendored from tilefusion io/zarr.py).
 
 Vendored, NOT imported: importing ``tilefusion`` runs its heavy ``__init__`` (numba's
-threading-layer pin, GPU/``cupy`` probes, ``basicpy``), which would make SquidMIP fail to
+threading-layer pin, GPU/``cupy`` probes, ``basicpy``), which would make SquidHCS fail to
 install/run on a machine without those. ``create_array`` here is a thin tensorstore-config
 wrapper (the substantive reuse); the group writers are plain ``zarr.json`` JSON.
 

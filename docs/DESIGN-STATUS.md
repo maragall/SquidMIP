@@ -1,5 +1,10 @@
 # DESIGN.md to code, status map
 
+> **Historical record.** Written before the SquidMIP -> SquidHCS rename (IMA-213). The
+> package referred to here as `squidmip` is now `squidhcs`, and the repo is `SquidHCS`.
+> Left unmodified on purpose: it describes decisions as they were made at the time.
+
+
 - Each design object mapped to the module that implements it, with status.
 - done: behavior + tests exist. gap: not built yet. naming: exists under another name.
 - Tests green: 137 SquidMIP, 304 ndviewer_light.

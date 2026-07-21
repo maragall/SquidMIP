@@ -33,7 +33,7 @@ if "PySide6" in sys.modules or "PySide2" in sys.modules:
 from PyQt5.QtCore import Qt  # noqa: E402
 from PyQt5.QtWidgets import QApplication, QSlider, QWidget  # noqa: E402
 
-from squidmip import _viewer as V  # noqa: E402
+from squidhcs import _viewer as V  # noqa: E402
 
 
 class _StubDetail(QWidget):
@@ -66,7 +66,7 @@ class _StubDetail(QWidget):
 @pytest.fixture(scope="module")
 def qapp():
     app = QApplication.instance() or QApplication([])
-    app.setProperty("_squidmip_test", True)  # main() won't call exec_/exit under test
+    app.setProperty("_squidhcs_test", True)  # main() won't call exec_/exit under test
     return app
 
 
@@ -169,7 +169,7 @@ def test_ingest_readable_non_wellplate_reports_not_crashes(qapp, stub_detail, tm
 def test_run_operator_persists_via_write_plate(qapp, stub_detail, squid_dataset, monkeypatch, tmp_path):
     # run_operator now PERSISTS: it drives write_plate with the SELECTED projector, and the GUI must
     # NOT write the uncompressed individual-TIFF copy (tiff=False) — that would double disk use.
-    import squidmip
+    import squidhcs
     captured = {}
 
     def fake_write_plate(reader, out_dir, *, n_fovs=1, workers=None, projector="mip",
@@ -177,7 +177,7 @@ def test_run_operator_persists_via_write_plate(qapp, stub_detail, squid_dataset,
                          regions=None):
         captured.update(projector=projector, tiff=tiff, out_dir=str(out_dir), regions=regions)
         return {"plate": str(out_dir), "levels": 1}      # no wells — we only assert the dispatch
-    monkeypatch.setattr(squidmip, "write_plate", fake_write_plate)
+    monkeypatch.setattr(squidhcs, "write_plate", fake_write_plate)
 
     root, _ = squid_dataset
     win = V.PlateWindow(None)

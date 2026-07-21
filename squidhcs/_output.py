@@ -48,9 +48,9 @@ from typing import Iterable, Iterator, Optional
 import numpy as np
 import tifffile
 
-from squidmip._engine import _default_workers, project_plate
-from squidmip._zarr_store import create_array, write_array, write_group
-from squidmip.projection import select_fovs
+from squidhcs._engine import _default_workers, project_plate
+from squidhcs._zarr_store import create_array, write_array, write_group
+from squidhcs.projection import select_fovs
 
 _NGFF_VERSION = "0.5"
 _WAVELENGTH_RE = re.compile(r"(?<!\d)(\d{3,4})(?!\d)")  # a standalone 3-4 digit nm in a channel name
@@ -337,7 +337,7 @@ def write_from_stream(
     n_levels = 1
     n_writers = max(1, int(write_workers))
     try:
-        with ThreadPoolExecutor(max_workers=n_writers, thread_name_prefix="squidmip-write") as ex:
+        with ThreadPoolExecutor(max_workers=n_writers, thread_name_prefix="squidhcs-write") as ex:
             pending: set = set()
             for region, fov, image in stream:
                 if stop is not None and stop():
@@ -383,7 +383,7 @@ def write_plate(
 ) -> dict:
     """Project a plate (IMA-188) and write the canonical OME-zarr + individual TIFFs.
 
-    Consumes :func:`squidmip.project_plate` lazily — each projected well is written as it
+    Consumes :func:`squidhcs.project_plate` lazily — each projected well is written as it
     arrives, so peak memory stays at the engine's bounded window, never the whole plate.
 
     Parameters
@@ -393,7 +393,7 @@ def write_plate(
     out_dir:
         Destination directory; receives ``plate.ome.zarr/`` and (if *tiff*) ``tiff/``.
     n_fovs, workers, projector:
-        Passed straight to :func:`squidmip.project_plate`.
+        Passed straight to :func:`squidhcs.project_plate`.
     tiff:
         Also write the individual per-plane TIFF export (default False — opt in). This is a SECOND,
         UNCOMPRESSED copy of the output in Squid's ``{region}_{fov}_0_{channel}.tiff`` filename

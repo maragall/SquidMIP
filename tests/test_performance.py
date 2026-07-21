@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from squidmip import open_reader, project_well
+from squidhcs import open_reader, project_well
 
 SIM_1536WP = Path("/Users/julioamaragall/CEPHLA/Data/sim_1536wp")
 

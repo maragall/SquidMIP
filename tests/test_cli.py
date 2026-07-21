@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from squidmip._cli import ProcessParameters, run
+from squidhcs._cli import ProcessParameters, run
 
 
 def test_input_folder_validator_rejects_missing(tmp_path):

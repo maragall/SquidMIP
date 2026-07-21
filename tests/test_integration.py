@@ -1,4 +1,4 @@
-"""Cross-slot integration tests — the "cross commit" surface for SquidMIP.
+"""Cross-slot integration tests — the "cross commit" surface for SquidHCS.
 
 This is the SHARED integration file: each slot appends ONE section here as it lands, testing
 the real seam between it and the slots it depends on — no mocks, on real data. The file grows
@@ -34,8 +34,8 @@ import pytest
 import tensorstore as ts
 import tifffile
 
-from squidmip import build_montage, open_reader, project_plate, project_well, select_fovs, write_plate
-from squidmip._output import plate_metadata, split_well, write_from_stream
+from squidhcs import build_montage, open_reader, project_plate, project_well, select_fovs, write_plate
+from squidhcs._output import plate_metadata, split_well, write_from_stream
 from tests.test_performance import benchmark_single_well  # shared single-thread baseline harness
 
 

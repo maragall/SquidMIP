@@ -1,4 +1,4 @@
-"""SquidMIP reader: format-aware ingest for Squid individual-TIFF acquisitions.
+"""SquidHCS reader: format-aware ingest for Squid individual-TIFF acquisitions.
 
 ``open_reader(path)`` dispatches on the on-disk format and returns a reader. Only the
 individual-TIFFs layout is implemented (IMA-189); the other Squid output formats
@@ -41,8 +41,8 @@ from typing import Optional
 import numpy as np
 import tifffile
 
-from squidmip._acquisition import load_acquisition_metadata
-from squidmip._channels import load_channel_yaml, resolve_channels
+from squidhcs._acquisition import load_acquisition_metadata
+from squidhcs._channels import load_channel_yaml, resolve_channels
 
 # region has no underscore; fov and z are ints; channel is the remainder (may contain _ and -).
 _STEM_RE = re.compile(r"^(?P<region>[^_]+)_(?P<fov>\d+)_(?P<z>\d+)_(?P<channel>.+)$")
@@ -379,7 +379,7 @@ class SquidOMEReader:
 
 
 def _normalize_local(name: str) -> str:
-    from squidmip._channels import normalize
+    from squidhcs._channels import normalize
     return normalize(name)
 
 

@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Callable, Iterable
 import numpy as np
 
 if TYPE_CHECKING:  # avoid import cost / cycle at runtime
-    from squidmip.reader import SquidReader
+    from squidhcs.reader import SquidReader
 
 
 def project(planes: Iterable[np.ndarray]) -> np.ndarray:

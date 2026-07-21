@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from squidmip import open_reader
+from squidhcs import open_reader
 from tests.conftest import CH_IN_YAML, CH_NOT_IN_YAML, _write_timepoint
 
 
@@ -98,7 +98,7 @@ def test_read_is_lazy_one_file(squid_dataset, monkeypatch):
         calls["n"] += 1
         return real(path, *a, **k)
 
-    monkeypatch.setattr("squidmip.reader.tifffile.imread", counting_imread)
+    monkeypatch.setattr("squidhcs.reader.tifffile.imread", counting_imread)
     reader.read("B2", 0, CH_IN_YAML, 0)
     assert calls["n"] == 1
 
@@ -199,7 +199,7 @@ def test_open_reader_uses_ome_reader_when_ome_files_present(tmp_path):
     import numpy as np
     import tifffile
 
-    from squidmip.reader import SquidOMEReader
+    from squidhcs.reader import SquidOMEReader
 
     ome = tmp_path / "ome_tiff"
     ome.mkdir()

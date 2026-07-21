@@ -14,9 +14,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from squidmip import build_montage
-from squidmip._montage import _area_downsample, _hex_to_rgb01, _window
-from squidmip._output import write_from_stream
+from squidhcs import build_montage
+from squidhcs._montage import _area_downsample, _hex_to_rgb01, _window
+from squidhcs._output import write_from_stream
 
 # Two channels: red (638) and blue (405), so composite color is unambiguous per channel.
 CH = [

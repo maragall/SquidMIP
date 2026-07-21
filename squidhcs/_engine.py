@@ -46,10 +46,10 @@ from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
 import numpy as np
 
-from squidmip.projection import project, project_reference, project_well, select_fovs
+from squidhcs.projection import project, project_reference, project_well, select_fovs
 
 if TYPE_CHECKING:  # avoid import cost / cycle at runtime
-    from squidmip.reader import SquidReader
+    from squidhcs.reader import SquidReader
 
 # A projector reduces one channel's z-planes to a single plane (the ``reduce=`` argument of
 # project_well). MIP is the only one 183 ships; the projector table is the seam for the rest.
@@ -89,7 +89,7 @@ def add_projector(name: str, projector: Projector) -> None:
     name:
         The projector's table key (e.g. ``"mip"``, ``"mean"``). Non-empty.
     projector:
-        A callable with the :func:`squidmip.project` signature — takes an iterable of
+        A callable with the :func:`squidhcs.project` signature — takes an iterable of
         equal-shape planes and returns one plane. It SHOULD stream (bounded memory) to keep
         the plate engine's per-worker footprint flat; a projector that materialises the whole
         z-stack (e.g. EDF) is allowed but owns its own, documented, memory profile.
@@ -124,7 +124,7 @@ def _resolve_projector(name: str) -> Projector:
     except KeyError:
         raise KeyError(
             f"unknown projector {name!r}; available: {available_projectors()}. "
-            "Add new modes with squidmip.add_projector(name, fn)."
+            "Add new modes with squidhcs.add_projector(name, fn)."
         ) from None
 
 
@@ -152,7 +152,7 @@ def project_plate(
         up front (single-threaded) so the reader's lazy state is populated before any worker
         calls ``read()`` — concurrent reads then touch only immutable state.
     n_fovs:
-        FOVs per well to project (default 1). Passed to :func:`squidmip.select_fovs`.
+        FOVs per well to project (default 1). Passed to :func:`squidhcs.select_fovs`.
     workers:
         Thread-pool size. ``None`` (default) → :func:`_default_workers` (CPUs usable by this
         process — affinity/cgroup aware, not a hardcoded constant). Peak RSS scales with this,

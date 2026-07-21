@@ -1,5 +1,10 @@
 # IMA-188 — Engineering Review (longform)
 
+> **Historical record.** Written before the SquidMIP -> SquidHCS rename (IMA-213). The
+> package referred to here as `squidmip` is now `squidhcs`, and the repo is `SquidHCS`.
+> Left unmodified on purpose: it describes decisions as they were made at the time.
+
+
 **Ticket:** IMA-188 — High-throughput (1536wp) z-stack max projection
 **Branch:** `juliomaragall/ima-188-high-throughput-1536wp-z-stack-max-projection`
 **Review:** `/plan-eng-review`, then block-by-block code review, completed 2026-07-05.

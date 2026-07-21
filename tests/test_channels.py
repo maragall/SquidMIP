@@ -4,7 +4,7 @@ import warnings
 
 import pytest
 
-from squidmip._channels import (
+from squidhcs._channels import (
     CHANNEL_COLORS_MAP,
     fallback_color,
     load_channel_yaml,

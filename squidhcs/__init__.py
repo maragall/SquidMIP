@@ -1,8 +1,8 @@
-"""SquidMIP — format-aware ingest for Squid well-plate acquisitions.
+"""SquidHCS — format-aware ingest for Squid well-plate acquisitions.
 
 The public surface is intentionally tiny::
 
-    from squidmip import open_reader, select_fovs, project_well
+    from squidhcs import open_reader, select_fovs, project_well
     reader = open_reader("/path/to/acquisition")
     meta = reader.metadata
     plane = reader.read("B3", 15, "Fluorescence_638_nm_-_Penta", z=0)   # (Y, X), native dtype
@@ -17,11 +17,11 @@ The public surface is intentionally tiny::
     build_montage("/path/out")                # static plate montage PNG + region-jump sidecar + hover viewer
 """
 
-from squidmip._engine import add_projector, available_projectors, project_plate
-from squidmip._montage import build_montage
-from squidmip._output import write_plate
-from squidmip.projection import project, project_well, select_fovs
-from squidmip.reader import SquidReader, open_reader
+from squidhcs._engine import add_projector, available_projectors, project_plate
+from squidhcs._montage import build_montage
+from squidhcs._output import write_plate
+from squidhcs.projection import project, project_well, select_fovs
+from squidhcs.reader import SquidReader, open_reader
 
 __all__ = [
     "open_reader",

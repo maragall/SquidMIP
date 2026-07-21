@@ -8,12 +8,12 @@ so a future session doesn't rediscover it from zero.
 - **Why:** IMA-213 had to hand-edit both to complete the rename. Any future structural change has the same tax, and nothing fails when they go stale.
 - **Pros:** Either generating them from source or deleting them removes a class of silent documentation drift.
 - **Cons:** Writing a generator for two pages may cost more than it saves; deleting them loses artifacts someone may be linking to.
-- **Context:** Surfaced by /plan-eng-review on IMA-213 (2026-07-20) while inventorying the 216 `squidmip` occurrences. The IMA-213 rename guard test will keep them free of the *old name*, but nothing keeps them accurate about anything else.
+- **Context:** Surfaced by /plan-eng-review on IMA-213 (2026-07-20) while inventorying the 263 old-name occurrences. The IMA-213 rename guard test will keep them free of the *old name*, but nothing keeps them accurate about anything else.
 - **Depends on / blocked by:** Nothing. Decide generate-vs-delete first.
 
-## GitHub redirect is fragile — never recreate maragall/SquidMIP → standing constraint
-- **What:** After IMA-213 renames the repo to `SquidHCS`, GitHub serves a permanent redirect from the old URL. That redirect dies the instant anyone creates a new repository named `maragall/SquidMIP`.
-- **Why:** The rename's whole no-breakage argument for downstream users rests on that redirect. Nick's existing clone, his `git pull`, and any `pip install git+https://github.com/maragall/SquidMIP` all ride on it.
+## GitHub redirect is fragile — never recreate the old repo name → standing constraint
+- **What:** After IMA-213 renames the repo to `SquidHCS`, GitHub serves a permanent redirect from the old URL. That redirect dies the instant anyone creates a new repository under the pre-rename name in the `maragall` org.
+- **Why:** The rename's whole no-breakage argument for downstream users rests on that redirect. Nick's existing clone, his `git pull`, and any `pip install git+<old-url>` all ride on it.
 - **Pros:** Recording it means the constraint outlives the memory of whoever ran the rename.
 - **Cons:** No mechanism can enforce it; it is documentation only.
 - **Context:** Confirmed during the IMA-213 eng review (2026-07-20) by the outside voice, which also verified the repo has no forks and no GitHub Pages, so there are no other redirect edge cases.
@@ -40,7 +40,7 @@ so a future session doesn't rediscover it from zero.
 - **Why:** IMA-189 `read()` deliberately **raises** on non-2D planes (decision 5). Without this note the raise reads like a bug.
 - **Pros:** Broadens input coverage to brightfield acquisitions.
 - **Cons:** Requires an RGB→2D policy the MIP tool may never need; better decided when brightfield is actually in scope.
-- **Context:** Linked to the `read()` non-2D assertion in `squidmip/reader.py`. tilefusion's `_to_grayscale_2d` is a reference implementation if reduction is chosen.
+- **Context:** Linked to the `read()` non-2D assertion in `squidhcs/reader.py`. tilefusion's `_to_grayscale_2d` is a reference implementation if reduction is chosen.
 - **Depends on / blocked by:** IMA-189 reader.
 
 ## Multi-timepoint iteration / projection → low priority follow-up
@@ -63,6 +63,6 @@ so a future session doesn't rediscover it from zero.
 - **What:** `squid2minerva/colors.py:load_yaml_colors` reads `channel["display_color"]`, but real `acquisition_channels.yaml` nests it under `channel.camera_settings.<cam>.display_color`. Its Minerva OME-TIFF exports only get right colors via the wavelength-fallback map — a custom yaml color is silently ignored.
 - **Why:** Confirmed against a real dataset yaml. It's correct-by-luck today because the fallback palette matches the standard 4 channels; any non-default color drops silently.
 - **Pros:** Fixes silently-wrong colors in a sibling tool's exports.
-- **Cons:** Different repo, different owner; not on any SquidMIP critical path.
-- **Context:** SquidMIP does **not** carry this bug — IMA-189's `squidmip/_channels.py` already resolves `display_color` correctly (top-level v1.0+ *and* nested `camera_settings`, mapped by name, raises on unresolved), and IMA-184 consumes `metadata.channels[].display_color` rather than re-parsing the yaml. This TODO is purely a flag for whoever owns `~/CEPHLA/projects/explorer/squid2minerva`.
+- **Cons:** Different repo, different owner; not on any SquidHCS critical path.
+- **Context:** SquidHCS does **not** carry this bug — IMA-189's `squidhcs/_channels.py` already resolves `display_color` correctly (top-level v1.0+ *and* nested `camera_settings`, mapped by name, raises on unresolved), and IMA-184 consumes `metadata.channels[].display_color` rather than re-parsing the yaml. This TODO is purely a flag for whoever owns `~/CEPHLA/projects/explorer/squid2minerva`.
 - **Depends on / blocked by:** squid2minerva maintainer.

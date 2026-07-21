@@ -1,5 +1,10 @@
 # IMA-184 — Engineering Review (longform)
 
+> **Historical record.** Written before the SquidMIP -> SquidHCS rename (IMA-213). The
+> package referred to here as `squidmip` is now `squidhcs`, and the repo is `SquidHCS`.
+> Left unmodified on purpose: it describes decisions as they were made at the time.
+
+
 Slot 4 of the SquidMIP state machine (189 → 183(+187) → 188 → **184**). Output: a canonical
 multiscale OME-zarr HCS plate + an individual-TIFF export, written by streaming IMA-188's
 `project_plate`. Landed on `main` via `--no-ff` merge; cross commit green on both datasets.

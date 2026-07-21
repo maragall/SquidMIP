@@ -3,7 +3,7 @@
 - **Ticket:** IMA-213
 - **Branch:** juliomaragall/ima-213-rename-squidhcs
 - **Spec:** .spec/open/ima-213.md
-- **Phase:** THINK
+- **Phase:** BUILD (implemented 2026-07-21; T0-T8, T10 landed — T9 is a GitHub settings action)
 - **Mode:** attended
 
 ## Now
@@ -54,3 +54,30 @@ _(distilled in Reflect -> /learn)_
 
 ## Iterations
 _(one line per Build iteration: n — what landed — verify result)_
+
+1 — T0/T7 unblock CI: dropped `_video`, `imageio`, `imageio_ffmpeg` from
+    `smoke_import.py` (all undeclared); gated `ome-zarr-models` behind
+    `python_version >= '3.11'` (verified against PyPI: it declares `<3.14,>=3.11`,
+    so the 3.10 CI leg could never resolve `.[test]`); `ngff_check.py` now
+    `importorskip`s. — `smoke_import.py` prints "all imports OK" for the first
+    time; freeze is unblocked.
+2 — T1 rename: `git mv squidmip squidhcs` + rewrote 263 occurrences across 44
+    files, exact tokens only (never case-insensitive `mip`, which is domain
+    vocabulary). Git recorded every module as `R` so `--follow` survives. —
+    clean-room `pip install .[test]` succeeds; `import squidhcs` OK.
+3 — T2 migration in `Setup-Windows.ps1`: detects `%LOCALAPPDATA%\squidmip\venv`,
+    builds the new venv, repoints the Desktop shortcut at `-m squidhcs._viewer`,
+    removes stale old-name icons, reports the orphaned old venv. Idempotent. —
+    verified by the T6 CI job, not locally (no Windows host).
+4 — T3/T5 freeze: removed the contradictory `--windowed` + `-c` pair (both set
+    the same PyInstaller option; the trailing `-c` silently won), dropped the
+    undeclared `--collect-all imageio_ffmpeg`, `if-no-files-found: warn` ->
+    `error`, added a non-empty-binary assert. — freeze run locally end-to-end:
+    27 MB binary at `dist/hcs-viewer/hcs-viewer`, exit 0.
+5 — T4/T5 regression tests: `test_rename_guard.py` (frozen allowlist + counts,
+    anti-tautology) and `test_entry_points.py` (subprocess all 3 invocation
+    forms + assert old commands are gone). The guard immediately caught 3 files
+    I had missed. — 136 passed, 2 skipped, 0 failed with `.[gui,test]`.
+6 — T6 `windows-migration` CI job; T8 historical-doc headers; T10 deleted
+    `scripts/mip-tool.bat` (conda launcher contradicting the documented
+    "NO conda" venv path). — both workflow files parse as valid YAML.

@@ -13,6 +13,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+# ome-zarr-models requires Python >=3.11 while this package supports >=3.10 (IMA-213/T0).
+# On 3.10 the extra is not installed, so the schema check skips rather than erroring at
+# collection time. 3.11/3.12 still validate every written group against the published schema.
+ome_zarr_models = pytest.importorskip(
+    "ome_zarr_models",
+    reason="ome-zarr-models requires Python >=3.11; NGFF schema validation is skipped on 3.10",
+)
+
 from ome_zarr_models.v05 import image as I
 from ome_zarr_models.v05 import plate as P
 from ome_zarr_models.v05 import well as W

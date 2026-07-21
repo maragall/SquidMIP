@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "squidmip"
+name = "squidhcs"
 version = "0.1.0"
 description = "High-throughput z-stack maximum-intensity projection for Squid well-plate acquisitions"
 readme = "README.md"
@@ -22,14 +22,17 @@ dependencies = [
 ]
 
 # No tilefusion dependency: IMA-189 ingest is self-contained (see docs/ima-189-eng-review.md).
-# tilefusion's OME-zarr writer is vendored (squidmip/_zarr_store.py), not imported, at IMA-184:
+# tilefusion's OME-zarr writer is vendored (squidhcs/_zarr_store.py), not imported, at IMA-184:
 # importing tilefusion runs its heavy __init__ (numba/GPU/basicpy). The vendored piece is the
 # ~40-line tensorstore store-config wrapper; tensorstore is the only new runtime dep.
 
 [project.optional-dependencies]
 # ome-zarr-models: official OME-NGFF v0.5 pydantic schema — validates written plate metadata
 # in tests (test-time only; the runtime writer stays lean, no extra runtime dep).
-test = ["pytest>=7.0", "ome-zarr-models>=1.7"]
+# ome-zarr-models declares requires-python >=3.11, but this package supports >=3.10, so an
+# unconditional pin made `pip install .[test]` unresolvable on the 3.10 CI leg (IMA-213/T0).
+# The marker keeps 3.10 installable; tests/ngff_check.py skips the schema check there.
+test = ["pytest>=7.0", "ome-zarr-models>=1.7; python_version >= '3.11'"]
 # gui: the MIP tool desktop app. PyQt5 + ndviewer_light (the embedded detail viewer). The headless
 # pipeline (reader/projection/engine/output) never imports these, so the CLI installs without them.
 gui = [
@@ -38,14 +41,14 @@ gui = [
 ]
 
 [project.scripts]
-squidmip = "squidmip._cli:main"           # headless CLI (IMA-186): MIP a plate from the terminal
-squidmip-view = "squidmip._viewer:main"   # the MIP tool desktop app
+squidhcs = "squidhcs._cli:main"           # headless CLI (IMA-186): MIP a plate from the terminal
+squidhcs-view = "squidhcs._viewer:main"   # the MIP tool desktop app
 
 [tool.hatch.metadata]
 allow-direct-references = true   # permit the ndviewer_light @ git+... URL in the [gui] extra
 
 [tool.hatch.build.targets.wheel]
-packages = ["squidmip"]
+packages = ["squidhcs"]
 
 [tool.pytest.ini_options]
 markers = [

@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import tensorstore as ts
 
-from squidmip._output import (
+from squidhcs._output import (
     parse_well_id,
     plate_metadata,
     split_well,

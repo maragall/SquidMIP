@@ -18,8 +18,8 @@ import time
 import numpy as np
 import pytest
 
-import squidmip._engine as engine
-from squidmip import (
+import squidhcs._engine as engine
+from squidhcs import (
     add_projector,
     available_projectors,
     project_plate,

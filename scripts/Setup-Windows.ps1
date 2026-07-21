@@ -11,7 +11,7 @@
 # stderr and that would otherwise abort the script. We check exit codes explicitly and Die on failure.
 $ErrorActionPreference = "Continue"
 $AppName = "MIP tool"
-$Module  = "squidmip._viewer"
+$Module  = "squidhcs._viewer"
 $repo = Split-Path $PSScriptRoot -Parent
 
 function Die($msg) { Write-Host ""; Write-Host ("ERROR: " + $msg) -ForegroundColor Red; exit 1 }
@@ -37,9 +37,30 @@ $ver = (& $pyExe @pyArgs --version 2>&1 | Out-String).Trim()
 Write-Host ("Using " + $ver)
 
 # 2. Create the venv (once).
-$venv = Join-Path $env:LOCALAPPDATA "squidmip\venv"
+#
+# IMA-213 rename migration. Before the rename this venv lived at ...\squidmip\venv and the
+# Desktop shortcut ran `-m squidmip._viewer` against an EDITABLE install. So a plain `git pull`
+# (which the README documents as the update path) renames the package on disk and leaves the
+# shortcut pointing at a module that no longer exists:
+#
+#   Desktop\MIP tool.lnk -> ...\squidmip\venv\Scripts\python.exe -m squidmip._viewer
+#                                 |                                    |
+#                                 |  editable -> repo\squidhcs\        v
+#                                 +----------------------------> ModuleNotFoundError
+#
+# Re-running this script repairs that: it builds the venv under the new name, repoints the
+# shortcut, and removes the stale one. Idempotent - safe to run any number of times.
+$venv    = Join-Path $env:LOCALAPPDATA "squidhcs\venv"
+$oldVenv = Join-Path $env:LOCALAPPDATA "squidmip\venv"
 $vpy  = Join-Path $venv "Scripts\python.exe"
 $vpyw = Join-Path $venv "Scripts\pythonw.exe"
+
+$migrating = (Test-Path (Join-Path $oldVenv "Scripts\python.exe")) -and (-not (Test-Path $vpy))
+if ($migrating) {
+    Write-Host ""
+    Write-Host "Found a pre-rename install (squidmip). Migrating it to squidhcs ..." -ForegroundColor Yellow
+}
+
 if (-not (Test-Path $vpy)) {
     Write-Host ("Creating virtual environment at " + $venv + " ...")
     & $pyExe @pyArgs -m venv $venv
@@ -70,5 +91,28 @@ $sc.IconLocation = $vpy + ",0"
 $sc.Description = $AppName
 $sc.Save()
 
+# 5. IMA-213 migration cleanup. The shortcut above is rewritten in place, so a same-named stale
+#    icon is already handled. Remove any old-name variants so the Desktop never shows two icons,
+#    and tell the user about the orphaned pre-rename venv (several hundred MB of PyQt5 +
+#    tensorstore + ndviewer_light) rather than deleting it for them.
+foreach ($stale in @("MIP tool (squidmip).lnk", "SquidMIP.lnk", "squidmip.lnk")) {
+    $stalePath = Join-Path $desktop $stale
+    if (Test-Path $stalePath) {
+        Remove-Item $stalePath -Force -ErrorAction SilentlyContinue
+        Write-Host ("Removed stale shortcut: " + $stale)
+    }
+}
+
+if (Test-Path $oldVenv) {
+    Write-Host ""
+    Write-Host "The old pre-rename environment is still on disk and is no longer used:" -ForegroundColor Yellow
+    Write-Host ("    " + $oldVenv)
+    Write-Host "It is safe to delete if you want the disk space back."
+}
+
 Write-Host ""
 Write-Host ("Done. '" + $AppName + "' is on your Desktop - double-click it, then drop an acquisition folder.")
+if ($migrating) {
+    Write-Host ""
+    Write-Host "Migration complete. Your Desktop icon now points at the renamed package." -ForegroundColor Green
+}

@@ -27,7 +27,7 @@ second operator lands this is a general HCS viewer, not just a MIP tool).
 
 Design notes:
 - ndviewer_light is the embedded detail viewer (its LightweightViewer QWidget + push API); PyQt5 to
-  match its stack. PyQt5 is imported here, never in squidmip/__init__, so the pipeline stays Qt-free.
+  match its stack. PyQt5 is imported here, never in squidhcs/__init__, so the pipeline stays Qt-free.
 - Nothing is written to the user's disk: the detail view reads the acquisition's own read-only
   TIFFs. Memory is NOT one-well-at-a-time on the plate side: the MIP run retains one downsampled
   88x88xC float32 tile PER WELL (_OperatorWorker._raw) for the final global-contrast montage, so
@@ -58,10 +58,10 @@ from PyQt5.QtWidgets import (
     QStyleFactory, QTabBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from squidmip._engine import _default_workers
-from squidmip._layers import OperationStack
-from squidmip._montage import _area_downsample, _hex_to_rgb01, _window
-from squidmip._output import parse_well_id
+from squidhcs._engine import _default_workers
+from squidhcs._layers import OperationStack
+from squidhcs._montage import _area_downsample, _hex_to_rgb01, _window
+from squidhcs._output import parse_well_id
 
 _SUPPORTED_PLATES = ("384", "1536")   # well-plate formats the tool currently accepts (no stitching yet)
 _CELL = 88                 # per-well px in the low-res overview (1536wp -> ~4224x2816)
@@ -136,7 +136,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b
 
 
 class _CmdEdit(QLineEdit):
-    """A command input with up/down history recall (so re-running a `squidmip …` line is one key)."""
+    """A command input with up/down history recall (so re-running a `squidhcs …` line is one key)."""
 
     def __init__(self, terminal):
         super().__init__()
@@ -155,10 +155,10 @@ class _CmdEdit(QLineEdit):
 
 
 class _Terminal(QWidget):
-    """A real, interactive shell embedded in the Process-wells pane — IMA-186's `squidmip` CLI, live.
+    """A real, interactive shell embedded in the Process-wells pane — IMA-186's `squidhcs` CLI, live.
 
     A login shell on a pseudo-terminal (so it echoes input and behaves like a real terminal): type a
-    command, press Enter, see its output. `squidmip` is aliased to THIS app's interpreter, so the batch
+    command, press Enter, see its output. `squidhcs` is aliased to THIS app's interpreter, so the batch
     MIP command runs here even though the console script isn't pip-installed. Pre-seeded with a how-to
     banner (MIP every well; `--tiff` writes FIJI-openable TIFFs). Scrollback is capped (bounded RAM),
     and the shell is killed when the tab or the window closes (no orphan process).
@@ -191,7 +191,7 @@ class _Terminal(QWidget):
         self._in.setStyleSheet(
             "QLineEdit{background:#05070b;color:#e6edf3;border:1px solid #232b3a;border-radius:6px;"
             "padding:6px 8px;font-family:'SF Mono','Menlo',monospace;font-size:12px;}")
-        self._in.setPlaceholderText("type a command and press Enter  (e.g. squidmip … --tiff)")
+        self._in.setPlaceholderText("type a command and press Enter  (e.g. squidhcs … --tiff)")
         self._in.returnPressed.connect(self._send)
         rl.addWidget(tag)
         rl.addWidget(self._in, 1)
@@ -204,7 +204,7 @@ class _Terminal(QWidget):
         env = dict(os.environ)
         env["TERM"] = "dumb"        # minimise escape sequences; still a real interactive shell
         env["PS1"] = "$ "
-        # put the venv's Scripts/bin on PATH so the `squidmip` console script resolves directly.
+        # put the venv's Scripts/bin on PATH so the `squidhcs` console script resolves directly.
         env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
         try:
             self._pid, self._fd = pty.fork()
@@ -231,7 +231,7 @@ class _Terminal(QWidget):
         self._notifier = QSocketNotifier(self._fd, QSocketNotifier.Read, self)
         self._notifier.activated.connect(self._read)
         # Banner is DISPLAY text — print it straight into the pane (NOT echo'd through the shell, which
-        # duplicates + line-wraps it). setup_cmds (e.g. the squidmip alias) run silently in the shell.
+        # duplicates + line-wraps it). setup_cmds (e.g. the squidhcs alias) run silently in the shell.
         self._append("\n".join(banner) + "\n")
         for cmd in setup_cmds:
             self._write(cmd + "\n")
@@ -307,7 +307,7 @@ class _Terminal(QWidget):
 class _ProcTerminal(QWidget):
     """An interactive shell in the pane via QProcess — works on Windows (cmd.exe) AND Unix ($SHELL),
     no PTY needed. Type a command, it runs, output streams back. Not a full VT100 (pipes don't echo,
-    so we echo the typed line ourselves), but `squidmip …` and any command work. `squidmip` is aliased
+    so we echo the typed line ourselves), but `squidhcs …` and any command work. `squidhcs` is aliased
     to this app's interpreter. Used where a PTY is unavailable (i.e. on Windows)."""
 
     def __init__(self, cwd, banner: list, setup_cmds: list, parent=None):
@@ -333,7 +333,7 @@ class _ProcTerminal(QWidget):
         self._in.setStyleSheet(
             "QLineEdit{background:#05070b;color:#e6edf3;border:1px solid #232b3a;border-radius:6px;"
             "padding:6px 8px;font-family:'SF Mono','Menlo',monospace;font-size:12px;}")
-        self._in.setPlaceholderText("type a command and press Enter  (e.g. squidmip … --tiff)")
+        self._in.setPlaceholderText("type a command and press Enter  (e.g. squidhcs … --tiff)")
         self._in.returnPressed.connect(self._send)
         rl.addWidget(tag)
         rl.addWidget(self._in, 1)
@@ -343,7 +343,7 @@ class _ProcTerminal(QWidget):
         self._proc.setProcessChannelMode(QProcess.MergedChannels)
         self._proc.readyRead.connect(self._read)
         self._proc.finished.connect(lambda *a: self._append("\n[shell exited]\n"))
-        # put the venv's Scripts/bin on PATH so the `squidmip` console script resolves directly.
+        # put the venv's Scripts/bin on PATH so the `squidhcs` console script resolves directly.
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PATH", os.path.dirname(sys.executable) + os.pathsep + env.value("PATH"))
         self._proc.setProcessEnvironment(env)
@@ -353,7 +353,7 @@ class _ProcTerminal(QWidget):
         self._proc.start(shell, [])
         self._proc.waitForStarted(3000)
         self._append("\n".join(banner) + "\n")
-        for c in setup_cmds:            # e.g. the squidmip alias/doskey — run silently
+        for c in setup_cmds:            # e.g. the squidhcs alias/doskey — run silently
             self._write(c)
 
     def running(self) -> bool:
@@ -848,7 +848,7 @@ class _OperatorWorker(QThread):
     def run(self):
         try:
             if self._save:
-                from squidmip import write_plate  # persist + project in one bounded, streaming pass
+                from squidhcs import write_plate  # persist + project in one bounded, streaming pass
 
                 write_plate(self._reader, self._out_dir, n_fovs=1, workers=_VIEWER_WORKERS,
                             projector=self._operator, tiff=False, on_well=self._on_well,
@@ -861,7 +861,7 @@ class _OperatorWorker(QThread):
                 # PREVIEW: run the engine over the subset and push each result to the plate + slider,
                 # writing NOTHING to disk (so testing an operator on a few wells costs no disk + only
                 # the subset's compute). Same math as the saved run — a faithful preview.
-                from squidmip import project_plate
+                from squidhcs import project_plate
 
                 stream = project_plate(self._reader, workers=_VIEWER_WORKERS, projector=self._operator,
                                        on_error=self._on_error, regions=self._regions)
@@ -1380,8 +1380,8 @@ class PlateWindow(QMainWindow):
             self._plate_title.setText(f"{self._acq_name}   ·   {self._plate_mode}")
 
     def _build_cli_tab(self) -> QWidget:
-        """A LIVE, interactive shell in the pane: run the `squidmip` batch CLI (IMA-186) right here.
-        Pre-seeded with the how-to (MIP every well; `--tiff` -> FIJI-openable TIFFs). `squidmip` is
+        """A LIVE, interactive shell in the pane: run the `squidhcs` batch CLI (IMA-186) right here.
+        Pre-seeded with the how-to (MIP every well; `--tiff` -> FIJI-openable TIFFs). `squidhcs` is
         aliased to this app's interpreter so it runs regardless of PATH/conda. Falls back to a static
         command preview where a PTY isn't available (e.g. Windows)."""
         # Input must be a RAW acquisition folder; if the current path is a computed .hcs plate (or
@@ -1398,18 +1398,18 @@ class PlateWindow(QMainWindow):
             "  Same MIP as the buttons, on every well. Copy a line and press Enter.",
             "",
             "  - Flatten every well + save FIJI-openable TIFFs:",
-            f'      python -m squidmip "{acq}" --tiff',
+            f'      python -m squidhcs "{acq}" --tiff',
             "",
             "  - Try just the first 8 wells first (quick, little disk):",
-            f'      python -m squidmip "{acq}" --limit 8 --tiff',
+            f'      python -m squidhcs "{acq}" --limit 8 --tiff',
             "",
             "  - Choose where to save:",
-            f'      python -m squidmip "{acq}" --limit 8 --tiff --output-folder ~/Downloads',
+            f'      python -m squidhcs "{acq}" --limit 8 --tiff --output-folder ~/Downloads',
             "",
-            "  - All options:   python -m squidmip --help",
+            "  - All options:   python -m squidhcs --help",
             "",
         ]
-        # The terminals put the venv's Scripts/bin on PATH, so the `squidmip` console script resolves
+        # The terminals put the venv's Scripts/bin on PATH, so the `squidhcs` console script resolves
         # directly — no alias needed (doskey is unreliable in a piped cmd.exe anyway).
         setup: list = []
         cwd = str(self._acq_path.parent) if self._acq_path else str(Path.home())
@@ -1432,7 +1432,7 @@ class PlateWindow(QMainWindow):
             "Process a whole plate from the command line\n"
             "──────────────────────────────\n"
             "Open a terminal, then paste (no conda needed — this is the app's own Python):\n\n"
-            f'    "{py}" -m squidmip "{acq}" --limit 8 --tiff --output-folder ~/Downloads\n\n'
+            f'    "{py}" -m squidhcs "{acq}" --limit 8 --tiff --output-folder ~/Downloads\n\n'
             "This flattens the first 8 wells (MIP) and saves TIFFs you can open in FIJI.\n"
             "Drop --limit 8 to do the whole plate. Add --help to see all options.\n")
         return term
@@ -1483,8 +1483,8 @@ class PlateWindow(QMainWindow):
 
     # -- open an acquisition (no processing yet — that's the Process menu) --
     def ingest(self, path: str):
-        from squidmip import open_reader
-        from squidmip._output import plate_metadata
+        from squidhcs import open_reader
+        from squidhcs._output import plate_metadata
 
         p, is_plate = resolve_plate_root(path)
         if is_plate:
@@ -1920,7 +1920,7 @@ class PlateWindow(QMainWindow):
             return
         if not hasattr(self._detail, "set_current_index"):
             return
-        from squidmip.projection import _tenengrad
+        from squidhcs.projection import _tenengrad
         well = self._current_well
         fov = self._meta["fovs_per_region"][well][0]
         chan = self._meta["channels"][0]["name"]        # rank on one representative channel
@@ -2072,7 +2072,7 @@ def main(dataset_path: str = None):
     win = PlateWindow(path)
     _install_footprint_monitor(app, win)
     win.show()
-    if not app.property("_squidmip_test"):
+    if not app.property("_squidhcs_test"):
         sys.exit(app.exec_())
     return win
 
