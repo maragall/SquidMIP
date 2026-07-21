@@ -1,0 +1,22 @@
+diff --git a/squidmip/_viewer.py b/squidmip/_viewer.py
+index 4af3dd6..4f73534 100644
+--- a/squidmip/_viewer.py
++++ b/squidmip/_viewer.py
+@@ -572,12 +572,14 @@ _OPERATIONS = (
+     # _build_plane_op_tab (preview only) rather than _build_run_tab: write_plate's _validate_image
+     # accepts Z == 1 only and would fail LOUD on save. Loud is correct; offering the button is not.
+     Operation("decon", "Deconvolution (Richardson-Lucy)",
+-              "Sharpen every plane against the microscope's Gaussian PSF -- iterative Richardson-Lucy, "
+-              "no explicit kernel. Keeps the z-stack at full depth.",
++              "Sharpen every plane against a PSF computed from THIS acquisition's optics (NA, "
++              "emission wavelength, pixel size) -- a vectorial model, not a Gaussian guess. "
++              "Keeps the z-stack at full depth.",
+               "_build_decon_tab"),
+     Operation("bgsub", "Background subtraction",
+               "Remove the smooth out-of-focus haze from every plane with a rolling ball (ImageJ's "
+-              "algorithm). A LAYER: the raw is untouched on disk and one toggle away.",
++              "algorithm; a faster Source-Extractor estimator is available but clips far more of "
++              "the frame). A LAYER: the raw is untouched on disk and one toggle away.",
+               "_build_bgsub_tab"),
+     Operation("flatfield", "Flat-field correction",
+               "Divide out the objective's illumination profile so the corners match the centre. "

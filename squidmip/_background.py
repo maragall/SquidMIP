@@ -49,6 +49,44 @@ Prior art surveyed before writing
   operator with a different physical meaning.
 * **BaSiC** — the right tool for the multiplicative shading field, and it is already reused in
   IMA-225. NOT used here: a per-plane additive haze is not what BaSiC estimates.
+
+IMA-247: Julio's ``bgsub`` (sep) is wired in as a METHOD, and is NOT the default
+-------------------------------------------------------------------------------
+``https://github.com/maragall/background_subtraction`` (the ``bgsub`` package, now cloned to
+``/Users/julioamaragall/CEPHLA/projects/background_subtraction``) estimates the background with
+**sep** — the Source Extractor sky estimator from astronomy — over a box grid. It is his code,
+it is 6.5x faster than rolling_ball on a real 2084x2084 plane (0.04 s vs 0.26 s), and
+:func:`estimate_background` now calls it directly for ``method="sep"``.
+
+It is deliberately **not** the default, and the reason is measured, not aesthetic. sep's
+background is a *central* estimator: the sigma-clipped mean of each box, splined. By
+construction roughly half of a plane's pixels sit BELOW it, so on an unsigned acquisition dtype
+half the frame subtracts to a negative number and clips at zero. Measured on real 10x uint16
+data (``manual0_0``, mid-plane):
+
+    ============  =====================  ==================
+    method        clipped pixel fraction  min residual
+    ============  =====================  ==================
+    rolling_ball  0.0384                 -181 counts
+    sep           **0.5068**             -298 counts
+    ============  =====================  ==================
+
+Clipping is the one place this operator destroys information (see point 3 below), so switching
+the default to sep would take the layer from ~4% lossy to ~51% lossy — it would quietly break
+the "the raw is recoverable" guarantee over half of every image. His own CLI has the same
+property, because ``bgsub.core._process_frame_worker`` clips the result back to the input dtype
+before writing; that is fine for his tool, whose output is an analysis product, and not fine
+for a LAYER whose whole contract is that the raw survives.
+
+So: sep is available, it is his implementation verbatim (``bgsub.core._run_sep``), and
+:func:`clipped_fraction` reports what it costs. What sep is genuinely better at is a plane
+whose background is *above* the noise floor everywhere and where negative excursions are
+meaningful — which is photometry, not this MIP pipeline's default.
+
+Note what is reused and what is NOT: ``bgsub.core.BackgroundSubtractor`` is a file-level
+orchestrator that walks an acquisition and WRITES new TIFFs into an output directory. That
+class is not used here at all, because writing files is exactly what a layer must not do. Only
+the pure array-level estimator is called, which is what keeps property 1 below true.
 """
 
 from __future__ import annotations
@@ -62,7 +100,19 @@ from squidmip._engine import add_projector
 from squidmip.projection import plane_op
 
 # The methods this operator knows, in one greppable place (the error message quotes it).
-METHODS: tuple[str, ...] = ("rolling_ball", "gaussian")
+METHODS: tuple[str, ...] = ("rolling_ball", "gaussian", "sep")
+
+_SEP_MISSING = (
+    "background method 'sep' needs Julio's bgsub package, which is not importable.\n"
+    "  repo:    https://github.com/maragall/background_subtraction\n"
+    "           (cloned to /Users/julioamaragall/CEPHLA/projects/background_subtraction)\n"
+    "  install: pip install --no-deps -e "
+    "/Users/julioamaragall/CEPHLA/projects/background_subtraction\n"
+    "           pip install sep\n"
+    "There is deliberately NO fallback to rolling_ball: the two estimators disagree by design "
+    "(sep is a central estimator, rolling_ball a lower envelope) and silently swapping them "
+    "would change how much of the image clips, from ~4% to ~51% (IMA-247)."
+)
 
 # Default ball radius in pixels. At the 10x working point (0.752 um/px) 50 px is ~38 um — a few
 # cell diameters, i.e. comfortably larger than any object we want to KEEP and comfortably
@@ -80,9 +130,13 @@ class BackgroundParams:
         structure the sample does not have and is the method the lab already reads as
         "background subtraction" (ImageJ). ``"gaussian"`` is a heavy low-pass, ~50x faster and
         adequate when the haze is genuinely smooth, but it is pulled up by bright objects
-        (they leak into their own background estimate).
+        (they leak into their own background estimate). ``"sep"`` is Julio's ``bgsub``
+        (Source-Extractor box estimator): the fastest of the three and his own code, but a
+        CENTRAL estimator, so about half the pixels of an unsigned plane clip at zero — see the
+        module docstring's table before selecting it.
     radius_px:
-        Ball radius / low-pass scale in pixels. MUST exceed the largest object to be kept.
+        Ball radius / low-pass scale in pixels — and, for ``"sep"``, the box size ``bw=bh``.
+        MUST exceed the largest object to be kept.
     downsample:
         Estimate the background on a ``1/downsample`` image and enlarge it back — ImageJ's own
         trick, and what makes rolling_ball usable on a 2000px plane. ``0`` (default) picks a
@@ -129,6 +183,18 @@ def estimate_background(plane: np.ndarray, params: Optional[BackgroundParams] = 
         raise ValueError(f"unknown background method {params.method!r}; available: {list(METHODS)}")
 
     img = plane.astype(np.float32, copy=True)
+
+    if params.method == "sep":
+        # Julio's implementation, called at the ARRAY level: bgsub.core._run_sep is a pure
+        # function of one plane and returns (foreground, background), so the background comes
+        # back in hand and nothing is written to disk. Imported lazily and failing loud, the
+        # same shape _flatfield.py uses for tilefusion.
+        try:
+            from bgsub.core import _run_sep
+        except ImportError as exc:
+            raise ImportError(_SEP_MISSING) from exc
+        _, bg = _run_sep(img, params.radius_px)
+        return np.asarray(bg, dtype=np.float32)
 
     if params.method == "gaussian":
         # A heavy low-pass. sigma = radius/2 puts the -3 dB point at about the ball scale.

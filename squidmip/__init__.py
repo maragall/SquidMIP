@@ -69,7 +69,15 @@ from squidmip.reader import SquidReader, open_reader
 # design for now — loud, not silently wrong — and it lifts the moment the writer learns Z > 1.
 from squidmip import _background, _decon, _flatfield  # noqa: E402,F401  (registration side effect)
 from squidmip._background import BackgroundParams, bgsub_op, subtract_background
-from squidmip._decon import decon_op, deconvolve, richardson_lucy_gaussian
+from squidmip._decon import (
+    OpticsParams,
+    decon3d_op,
+    decon_op,
+    deconvolve,
+    deconvolve_plane,
+    deconvolve_stack,
+    set_optics,
+)
 from squidmip._flatfield import FlatfieldProfile, correct_flatfield, estimate_profile, flatfield_op
 
 __all__ = [
@@ -108,9 +116,14 @@ __all__ = [
     "export_selection",
     "launch_minerva",
     # IMA-223/224/225 plane-ops (registered as "decon" / "bgsub" / "flatfield")
-    "richardson_lucy_gaussian",
+    # IMA-247: decon runs on Julio's petakit (real vectorial PSF), not a Gaussian guess.
     "deconvolve",
+    "deconvolve_plane",
+    "deconvolve_stack",
     "decon_op",
+    "decon3d_op",
+    "OpticsParams",
+    "set_optics",
     "subtract_background",
     "BackgroundParams",
     "bgsub_op",

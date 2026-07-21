@@ -49,7 +49,7 @@ def _known_background(size: int = 128, amplitude: float = 600.0, pedestal: float
 
 # --- the core numerical property: a KNOWN added background must come off ------------------
 
-@pytest.mark.parametrize("method", ["rolling_ball", "gaussian"])
+@pytest.mark.parametrize("method", ["rolling_ball", "gaussian", "sep"])
 def test_removes_the_structure_of_a_known_added_background(method):
     """The estimate must reproduce the SHAPE of the planted dome, and subtracting it must
     flatten the empty field.
@@ -94,7 +94,7 @@ def test_rolling_ball_bias_is_conservative_and_measured():
     assert abs(bias[15]) < 0.15
 
 
-@pytest.mark.parametrize("method", ["rolling_ball", "gaussian"])
+@pytest.mark.parametrize("method", ["rolling_ball", "gaussian", "sep"])
 def test_a_gradient_background_is_flattened_across_the_field(method):
     """A single scalar offset cannot do this: with a corner-to-corner ramp, the bright corner
     and the dark corner must end up at the SAME level after subtraction."""
@@ -114,7 +114,7 @@ def test_a_gradient_background_is_flattened_across_the_field(method):
     assert abs(bright - dark) < (raw_bright - raw_dark) * 0.1
 
 
-@pytest.mark.parametrize("method", ["rolling_ball", "gaussian"])
+@pytest.mark.parametrize("method", ["rolling_ball", "gaussian", "sep"])
 def test_foreground_puncta_survive_subtraction(method):
     """Removing the background must not eat the sample: a background estimator with too large
     an effect would flatten the puncta too, which is the failure mode that matters clinically."""
@@ -143,6 +143,28 @@ def test_the_input_plane_is_never_mutated():
     subtract_background(raw, BackgroundParams(radius_px=15))
     estimate_background(raw, BackgroundParams(radius_px=15))
     assert np.array_equal(raw, before)
+
+
+@pytest.mark.parametrize("method", ["rolling_ball", "gaussian", "sep"])
+@pytest.mark.parametrize("dtype", [np.uint16, np.uint8])
+def test_raw_is_exactly_recoverable_wherever_the_result_did_not_clip_for_every_method(dtype, method):
+    """Property 3 of the layer contract, held for EVERY estimator including Julio's sep.
+
+    ``restore()`` must give the raw back exactly (``array_equal``, no tolerance) wherever the
+    subtraction did not clip. This is what keeps 'background subtraction is a layer' true no
+    matter which background was subtracted — the invertibility comes from the additive
+    composition and the rounding cast, not from the choice of estimator.
+    """
+    scale = 255 / 4000 if dtype is np.uint8 else 1.0
+    raw = ((_foreground(96) + _known_background(96)) * scale).astype(dtype)
+    params = BackgroundParams(method=method, radius_px=20)
+    bg = estimate_background(raw, params)
+    corrected = subtract_background(raw, params)
+
+    clipped = np.rint(raw.astype(np.float32) - bg) < 0
+    recovered = restore(corrected, bg, dtype=raw.dtype)
+    assert np.array_equal(recovered[~clipped], raw[~clipped])
+    assert not clipped.all(), f"{method}: every pixel clipped; the test proves nothing"
 
 
 @pytest.mark.parametrize("dtype", [np.uint16, np.uint8])
@@ -188,6 +210,104 @@ def test_integer_clipping_is_reported_not_hidden():
     leaky = BackgroundParams(method="gaussian", radius_px=20)
     assert clipped_fraction(raw, leaky) > 0.0
     assert clipped_fraction(raw.astype(np.float32), leaky) == 0.0   # float has no floor to clip at
+
+
+# --- IMA-247: Julio's sep estimator is wired in, and is deliberately not the default --------
+
+def test_sep_method_is_julios_bgsub_implementation_not_a_reimplementation():
+    """The 'sep' method must be a call INTO bgsub.core, not a local copy of it.
+
+    Pinned by substitution: monkeypatch bgsub.core._run_sep and assert our estimate changes.
+    If this module ever grew its own box-estimator, this test would keep passing while the
+    reuse silently disappeared — so it also asserts the sentinel value flows through.
+    """
+    bgsub_core = pytest.importorskip("bgsub.core")
+    raw = (_foreground(96) + _known_background(96)).astype(np.uint16)
+    params = BackgroundParams(method="sep", radius_px=20)
+
+    sentinel = np.full((96, 96), 1234.0, dtype=np.float32)
+    real = bgsub_core._run_sep
+    bgsub_core._run_sep = lambda img, box: (img - sentinel, sentinel)
+    try:
+        assert np.array_equal(estimate_background(raw, params), sentinel)
+    finally:
+        bgsub_core._run_sep = real
+
+    # and with his real implementation restored it produces a sane, plane-shaped estimate
+    bg = estimate_background(raw, params)
+    assert bg.shape == raw.shape and bg.dtype == np.float32
+    assert 0 < float(bg.mean()) < float(raw.max())
+
+
+def test_sep_is_not_the_default_because_it_clips_far_more_of_the_frame():
+    """The measured reason sep stays opt-in.
+
+    sep is a CENTRAL background estimator (sigma-clipped box mean), so roughly half a plane
+    sits below its estimate and clips at zero on an unsigned dtype. rolling_ball is a lower
+    ENVELOPE and clips almost nothing. Clipping is the one place this layer destroys
+    information, so the default must be the estimator that destroys least.
+    """
+    raw = (_foreground(96) + _known_background(96)).astype(np.uint16)
+
+    assert BackgroundParams().method == "rolling_ball", "the default estimator changed"
+
+    ball = clipped_fraction(raw, BackgroundParams(method="rolling_ball", radius_px=20))
+    sep = clipped_fraction(raw, BackgroundParams(method="sep", radius_px=20))
+
+    assert ball == 0.0
+    assert sep > ball, f"sep ({sep:.3f}) no longer clips more than rolling_ball ({ball:.3f})"
+    assert sep > 0.1, (
+        "sep stopped clipping heavily — if that is real, re-evaluate whether it should be the "
+        f"default; measured {sep:.3f}"
+    )
+
+
+def test_sep_never_writes_to_disk_and_never_mutates_the_caller(tmp_path):
+    """Property 1 of the layer contract for the sep path specifically.
+
+    bgsub ships a BackgroundSubtractor that WRITES corrected TIFFs into an output directory.
+    That orchestrator is deliberately not used: only the pure array-level estimator is called.
+    Asserted by running the operator with the CWD inside an empty directory and checking that
+    nothing appeared, and that the input plane is byte-identical afterwards.
+    """
+    import os
+
+    raw = (_foreground(64) + _known_background(64)).astype(np.uint16)
+    before = raw.copy()
+    params = BackgroundParams(method="sep", radius_px=20)
+
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        subtract_background(raw, params)
+        estimate_background(raw, params)
+        clipped_fraction(raw, params)
+    finally:
+        os.chdir(cwd)
+
+    assert list(tmp_path.iterdir()) == [], "the sep path wrote files; a layer must not"
+    assert np.array_equal(raw, before), "the sep path mutated the caller's plane"
+
+
+def test_a_missing_bgsub_fails_loud_and_never_silently_falls_back_to_rolling_ball():
+    """No silent substitution between estimators: they disagree by design (see the clipping
+    numbers above), so a missing dependency must be an error, not a different algorithm."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _no_bgsub(name, *args, **kwargs):
+        if name.startswith("bgsub"):
+            raise ImportError("simulated: bgsub not installed")
+        return real_import(name, *args, **kwargs)
+
+    builtins.__import__ = _no_bgsub
+    try:
+        with pytest.raises(ImportError, match="background_subtraction|NO fallback"):
+            estimate_background(np.zeros((16, 16), np.uint16),
+                                BackgroundParams(method="sep", radius_px=8))
+    finally:
+        builtins.__import__ = real_import
 
 
 def test_a_bgsub_layer_can_be_toggled_off_to_return_to_raw():
