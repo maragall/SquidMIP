@@ -1546,6 +1546,214 @@ def test_mosaic_cell_composites_real_structured_pixels(qapp, stub_detail, squid_
         win._stop_worker(); win.close()
 
 
+# --- IMA-207: contrast scope, and the two contrast bugs found reviewing it --------------------
+#
+# Ported from the ima-207 branch onto IMA-206's architecture. The branch carried its own parallel
+# `_raw_tiles` retention because PlateOverview did not yet own the pixels; it does now (the
+# per-layer native-dtype store), so the scope re-composites THAT and no second copy of every tile
+# is kept. The design decision is unchanged and is the whole point of the ticket: contrast scope
+# is a DISPLAY control, never a run parameter.
+
+def _plate_rgb(ov):
+    """The overview's composited montage as (H, W, 3) uint8 — the pixels, not the chrome."""
+    img = ov._active_source()
+    buf = img.constBits().asstring(img.byteCount())
+    a = np.frombuffer(buf, np.uint8).reshape(img.height(), img.bytesPerLine() // 3, 3)
+    return a[:, :img.width(), :]
+
+
+def _two_well_plate(bright_peak=40000, dim_peak=600):
+    """A 1x2 plate: one BRIGHT well beside one DIM well, both spread (non-degenerate)."""
+    ov = V.PlateOverview(["A"], ["1", "2"], {(0, 0): "A1", (0, 1): "A2"})
+    ov.resize(400, 300)
+    ov.set_channels(["c0"], np.array([[1.0, 1.0, 1.0]], np.float32), dtype=np.uint16)
+    for (rc, wid), peak in zip({(0, 0): "A1", (0, 1): "A2"}.items(), (bright_peak, dim_peak)):
+        tile = np.linspace(peak * 0.4, peak, V._CELL * V._CELL).astype(np.uint16)
+        ov.add_tile(rc[0], rc[1], wid, tile.reshape(1, V._CELL, V._CELL))
+    return ov
+
+
+def _cell_mean(ov, ri, ci):
+    ov.recomposite(ov._active)
+    return float(_plate_rgb(ov)[ri * V._CELL:(ri + 1) * V._CELL,
+                                ci * V._CELL:(ci + 1) * V._CELL].mean())
+
+
+def test_per_region_makes_dim_and_bright_both_readable(qapp):
+    """The ticket's own oracle, on the real widget.
+
+    GLOBAL keeps the wells COMPARABLE, so the dim well stays far darker than the bright one.
+    PER_REGION gives each well its own window, so both fill their range and land at nearly the
+    same brightness — readable together, but no longer comparable. That trade IS the feature.
+    """
+    ov = _two_well_plate()
+    ov.set_contrast_scope(V.SCOPE_GLOBAL)
+    g_bright, g_dim = _cell_mean(ov, 0, 0), _cell_mean(ov, 0, 1)
+    ov.set_contrast_scope(V.SCOPE_PER_REGION)
+    p_bright, p_dim = _cell_mean(ov, 0, 0), _cell_mean(ov, 0, 1)
+
+    assert g_dim < 0.25 * g_bright, (
+        f"global must keep the wells comparable: dim {g_dim:.1f} vs bright {g_bright:.1f}")
+    assert abs(p_dim - p_bright) < 12, (
+        f"per-region must lift the dim well to the bright one: {p_dim:.1f} vs {p_bright:.1f}")
+    assert p_dim > g_dim * 3, "per-region must actually rescue the dim well"
+
+
+def test_scope_is_a_display_control_and_never_reruns(qapp, stub_detail, squid_dataset, tmp_path):
+    """Flipping the scope repaints from retained tiles; it must NOT start another operator run.
+
+    This is the decision the ticket locked. A 1536wp run is minutes, so a scope that re-ran the
+    plate would be unusable — and would also silently rewrite the plate on disk.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("mip", out_parent=str(tmp_path))
+    _drain_until(qapp, lambda: len(win._overview._tiles) >= 2)
+    qapp.processEvents()
+    try:
+        ov = win._overview
+        ov.recomposite(ov._active)
+        before = _plate_rgb(ov).copy()
+        made = []
+        orig = V._OperatorWorker.__init__
+        V._OperatorWorker.__init__ = lambda self, *a, **k: (made.append(1), orig(self, *a, **k))[1]
+        try:
+            win._scope_combo.setCurrentText(V.SCOPE_PER_REGION)
+            qapp.processEvents()
+        finally:
+            V._OperatorWorker.__init__ = orig
+        assert not made, "a scope flip must not construct another operator worker"
+        assert ov.contrast_scope() == V.SCOPE_PER_REGION, "the combo never reached the widget"
+        after = _plate_rgb(ov)
+        assert after.shape == before.shape
+        assert not np.array_equal(after, before), "the flip did not change the rendered plate"
+    finally:
+        win._stop_worker(); win.close()
+
+
+def test_scope_rejects_an_unknown_value(qapp):
+    ov = _two_well_plate()
+    with pytest.raises(ValueError):
+        ov.set_contrast_scope("per-pixel-vibes")
+
+
+def test_non_global_scope_burns_a_badge_into_the_plate(qapp):
+    """Per-region destroys cross-well comparability, so the caveat must live in the PIXELS.
+
+    A screenshot of this plate is scientifically wrong if read as relative signal, and a dropdown
+    is exactly what a screenshot crops out. Global draws nothing — nothing to warn about.
+    """
+    ov = _two_well_plate()
+
+    def amber_px():
+        qapp.processEvents()
+        im = ov.grab().toImage()
+        a = np.frombuffer(im.constBits().asstring(im.byteCount()), np.uint8)
+        a = a.reshape(im.height(), im.bytesPerLine() // 4, 4)[:, :im.width(), :3]
+        # QImage from grab() is BGRA, so channel 2 is RED: amber = high R, mid G, low B
+        return int(((a[:, :, 2] > 200) & (a[:, :, 1] > 130) & (a[:, :, 0] < 90)).sum())
+
+    ov.set_contrast_scope(V.SCOPE_GLOBAL)
+    assert amber_px() == 0, "global contrast is comparable — there is nothing to warn about"
+    ov.set_contrast_scope(V.SCOPE_PER_REGION)
+    assert amber_px() > 500, "per-region must draw a visible caveat badge into the plate"
+
+
+def test_per_region_leaves_a_manually_latched_channel_alone(qapp):
+    """A user-set window (D4) outranks per-region scoping.
+
+    Silently re-scoping a channel the user latched would make the channel bar's slider lie about
+    what is on screen, which is worse than either scope being wrong.
+    """
+    ov = _two_well_plate()
+    ov.set_contrast_scope(V.SCOPE_PER_REGION)
+    ov.set_channel_window(0, 100.0, 40000.0)
+    store = ov._store_for(ov._active)
+    assert ov._cell_windows(store, 0, 0) == [(100.0, 40000.0)]
+    assert ov._cell_windows(store, 0, 1) == [(100.0, 40000.0)], (
+        "a latched channel must use the user's window in EVERY cell, not a per-cell percentile")
+
+
+# --- IMA-207 review: two live contrast bugs, both pre-existing --------------------------------
+
+def test_running_contrast_flat_channel_yields_degenerate_window():
+    """A flat channel has no contrast to show, so the window must be DEGENERATE (span <= 0) and
+    _window must render it BLACK.
+
+    Regression: window() returned ``max(hi, lo + 1)`` — a 1 data-unit span against a
+    ``65535/512 ~= 128``-unit histogram bin. ``(v - lo) / 1`` then clipped to 1.0, so a blank,
+    dead or saturated well rendered FULL WHITE and read as signal. Blank wells are normal on a
+    partially acquired plate, so this was on screen constantly.
+    """
+    from squidmip._montage import _window
+
+    rc = V._RunningContrast(1, float(np.iinfo(np.uint16).max))
+    flat = np.full((8, 8), 500.0, dtype=np.float32)
+    rc.add(0, flat)
+    lo, hi = rc.window(0)
+    assert hi - lo <= 0, "a flat channel must produce a degenerate window, not a 1-unit span"
+    assert np.all(_window(flat, lo, hi) == 0.0), "a flat channel must render black, not white"
+
+
+def test_running_contrast_saturated_channel_renders_black():
+    """The same guard at the top of the range: a fully saturated well is flat too."""
+    from squidmip._montage import _window
+
+    dmax = float(np.iinfo(np.uint16).max)
+    rc = V._RunningContrast(1, dmax)
+    sat = np.full((8, 8), dmax, dtype=np.float32)
+    rc.add(0, sat)
+    lo, hi = rc.window(0)
+    assert np.all(_window(sat, lo, hi) == 0.0)
+
+
+def test_running_contrast_spread_channel_still_windows():
+    """The degenerate guard must not eat a real channel: a ramp keeps an ordered, usable window."""
+    rc = V._RunningContrast(1, float(np.iinfo(np.uint16).max))
+    rc.add(0, np.linspace(0, 60000, 64 * 64).astype(np.float32).reshape(64, 64))
+    lo, hi = rc.window(0)
+    assert hi > lo
+
+
+def test_running_contrast_empty_histogram_is_full_range():
+    """No tiles yet -> full range, unchanged behaviour."""
+    rc = V._RunningContrast(2, 65535.0)
+    assert rc.window(0) == (0.0, 65535.0)
+
+
+def test_blank_well_renders_black_not_white_through_the_widget(qapp):
+    """End to end: the bug was visible on the PLATE, so assert on the plate's pixels."""
+    ov = V.PlateOverview(["A"], ["1"], {(0, 0): "A1"})
+    ov.set_channels(["c0"], np.array([[1.0, 1.0, 1.0]], np.float32), dtype=np.uint16)
+    ov.add_tile(0, 0, "A1", np.full((1, V._CELL, V._CELL), 7, np.uint16))   # a blank channel
+    ov.recomposite(ov._active)
+    cell = _plate_rgb(ov)[:V._CELL, :V._CELL]
+    assert float(cell.mean()) < 1.0, (
+        f"a blank well rendered at mean {cell.mean():.1f} — it must be black, not white.")
+
+
+def test_reopened_plate_windows_globally_like_the_run_that_wrote_it(qapp):
+    """A reopened plate.ome.zarr must agree with the run that wrote it.
+
+    _ComputedPlateWorker used to window each tile independently with its own percentiles — that is
+    per-region contrast applied unconditionally, so a dim well and a bright well came back
+    indistinguishable and the reopened plate looked nothing like the run. It now emits NATIVE
+    per-channel tiles and lets PlateOverview window them, exactly like every other producer, which
+    is what makes the plate look the same however it got filled.
+    """
+    import inspect
+
+    src = inspect.getsource(V._ComputedPlateWorker)
+    assert "np.percentile" not in src, (
+        "_ComputedPlateWorker is windowing tiles itself again — that is per-region contrast "
+        "imposed on the reopen path, and it makes a reopened plate disagree with its own run.")
+    assert "_window(" not in src, "the reopen path must emit native tiles, not pre-windowed RGB"
+    sig = inspect.signature(V._ComputedPlateWorker.__init__)
+    assert "colors" not in sig.parameters, (
+        "a worker that needs colours is compositing; the widget owns compositing (IMA-206).")
+
+
 # --- IMA-205 + IMA-221: the SHIFT GESTURE opens the exploration tab ---------------------------
 #
 # This is the user's verbatim sentence, end to end: "hold shift to open an 'exploration' tab with

@@ -765,6 +765,10 @@ class _RunningContrast:
         return ch in self._manual
 
     def window(self, ch: int) -> tuple[float, float]:
+        """(lo, hi) for this channel. A DEGENERATE window (hi <= lo) is returned DELIBERATELY when
+        both percentiles land in the same bin — ``_window``'s ``span <= 0`` guard renders that
+        black, which is the honest answer when there is no contrast.
+        """
         if ch in self._manual:      # latched: the user owns this channel's window (D4)
             return self._manual[ch]
         h = self._hist[ch]
@@ -774,10 +778,54 @@ class _RunningContrast:
         cdf = np.cumsum(h) / tot
         lo = np.searchsorted(cdf, self._pct[0] / 100.0) / self._bins * self._dmax
         hi = np.searchsorted(cdf, self._pct[1] / 100.0) / self._bins * self._dmax
-        return float(lo), float(max(hi, lo + 1))
+        # Do NOT widen a collapsed window to lo+1. That +1 is one DATA unit, while a histogram bin
+        # is dmax/bins wide (~128 on uint16) — so for a blank, dead or saturated channel both
+        # percentiles land in one bin and (v - lo)/1 clips to 1.0: the well rendered FULL WHITE and
+        # read as signal. Blank wells are normal on a partially acquired plate. Handing the
+        # degenerate window through instead makes _window's guard reachable, and they render black.
+        return float(lo), float(hi)
 
     def windows(self) -> list[tuple[float, float]]:
         return [self.window(ch) for ch in range(len(self._hist))]
+
+
+# --- contrast scope (IMA-207): how wide a net each contrast window is computed over ------------
+#
+#   GLOBAL      one window per channel across the whole plate. Wells stay COMPARABLE — a dim well
+#               looks dim — but a dim region can be crushed to black beside a bright one.
+#   PER_REGION  one window per channel PER CELL. Every region fills its own range, so a dim and a
+#               bright region are both readable at once — at the cost of comparability: two wells
+#               that look identical may differ by orders of magnitude. That is why the active
+#               scope is drawn INTO the plate (see paintEvent) rather than living only in a
+#               dropdown that a screenshot would crop out.
+#
+# Scope is a DISPLAY control, NOT a run parameter. Flipping it re-composites from the native-dtype
+# tiles PlateOverview already retains (IMA-206's per-layer store); it never re-runs the plate,
+# because a 1536wp run is minutes and that would make the control unusable.
+#
+# PER_FOV is deliberately absent. It slots into `_scoped_windows`' bucketing when someone wants
+# per-field windows inside a mosaic cell — no other change.
+SCOPE_GLOBAL = "global"
+SCOPE_PER_REGION = "per-region"
+SCOPES = (SCOPE_GLOBAL, SCOPE_PER_REGION)
+
+_PCT = (1.0, 99.8)   # clip the darkest 1% / brightest 0.2% so hot pixels don't crush the window
+
+
+def _pct_window(a: np.ndarray, pct=_PCT) -> tuple[float, float]:
+    """EXACT percentile window over *a*.
+
+    Exactness is the point. ``_RunningContrast`` quantizes to a bin ~dmax/bins wide (~128 counts on
+    uint16), so a dim region spanning a few hundred counts collapses into two or three bins and its
+    window comes out garbage — precisely the region PER_REGION exists to rescue. The histogram
+    stays the live during-run approximation; this is what the final render uses.
+
+    A degenerate result (hi <= lo) is returned as-is on purpose: ``_window`` renders it black.
+    """
+    if a.size == 0:
+        return 0.0, 0.0
+    lo, hi = np.percentile(a, pct)
+    return float(lo), float(hi)
 
 
 # --- loupe (IMA-208): press-and-hold magnifier over the plate ------------------------------
@@ -1278,6 +1326,8 @@ class PlateOverview(QWidget):
         self._store: dict[str, np.ndarray] = {}   # layer -> (C, nr*_CELL, nc*_CELL), allocated lazily
         self._mask = None                 # (C,) bool: which channels composite into the plate
         self._contrast = None             # _RunningContrast: global per-channel window + auto/manual
+        self._scope = SCOPE_GLOBAL        # contrast scope (IMA-207): a DISPLAY control. A flip
+        #                                   re-composites from the store above — it never re-runs.
         self._full = QTimer(self)         # coalesces the full-res recomposite behind a gesture
         self._full.setSingleShot(True)    # (a drag repaints at DISPLAY res; full-res lands once)
         self._full.timeout.connect(self._on_full_timeout)
@@ -1492,6 +1542,70 @@ class PlateOverview(QWidget):
         """The effective (lo, hi) per channel — the latched manual window, else the running one."""
         return self._contrast.windows() if self._contrast is not None else []
 
+    # -- contrast scope (IMA-207) --
+    def contrast_scope(self) -> str:
+        return self._scope
+
+    def set_contrast_scope(self, scope: str) -> bool:
+        """Switch how wide a net each contrast window is computed over, and REPAINT — never re-run.
+
+        Returns False when there is nothing retained to re-composite yet; the scope is still
+        recorded, so the next tile to land renders under it.
+        """
+        if scope not in SCOPES:
+            raise ValueError(f"unknown contrast scope {scope!r}; expected one of {SCOPES}")
+        if scope == self._scope:
+            return False
+        self._scope = scope
+        self.update()                 # the badge changes even with nothing to re-composite
+        if self._store.get(self._active) is None:
+            return False
+        self.recomposite(self._active)
+        return True
+
+    def _cell_windows(self, store: np.ndarray, ri: int, ci: int) -> list:
+        """Per-channel windows for ONE cell, computed exactly over that cell's own pixels.
+
+        A latched channel (D4) keeps the user's manual window even under per-region: the user
+        setting a window explicitly outranks any automatic scoping, and silently overriding it
+        would make the channel bar's slider lie about what is on screen.
+        """
+        y0, x0 = ri * _CELL, ci * _CELL
+        cell = store[:, y0:y0 + _CELL, x0:x0 + _CELL]
+        out = []
+        for ch in range(cell.shape[0]):
+            if self._contrast is not None and self._contrast.is_manual(ch):
+                out.append(self._contrast.window(ch))
+            else:
+                out.append(_pct_window(cell[ch]))
+        return out
+
+    def _composite_per_region(self, store: np.ndarray, step: int) -> np.ndarray:
+        """Composite the plate one CELL at a time, each under its own window (SCOPE_PER_REGION).
+
+        Only cells that actually HAVE a tile are composited; an untiled cell's zero padding would
+        percentile to a degenerate window and, worse, is not data. Everything else stays black,
+        exactly as the global path leaves it.
+
+        *step* is the same sub-sampling stride the global path uses for a quick repaint. Cell
+        bounds are converted into the strided frame by ceil-division rather than by dividing the
+        cell size, so a stride that does not divide _CELL cannot drift cells apart by a pixel.
+        """
+        n_ch = store.shape[0]
+        h = len(range(0, store.shape[1], step))
+        w = len(range(0, store.shape[2], step))
+        rgb = np.zeros((h, w, 3), np.uint8)
+        for ri, ci in self._tiles_by_layer.get(self._active, set()):
+            ys, ye = -(-ri * _CELL // step), -(-(ri + 1) * _CELL // step)     # ceil-div bounds
+            xs, xe = -(-ci * _CELL // step), -(-(ci + 1) * _CELL // step)
+            ye, xe = min(ye, h), min(xe, w)
+            if ys >= ye or xs >= xe:
+                continue
+            cell = store[:, ys * step:ye * step:step, xs * step:xe * step:step]
+            rgb[ys:ye, xs:xe] = composite(cell, self._colors,
+                                          self._cell_windows(store, ri, ci), self._mask)
+        return rgb
+
     def set_channel_visible(self, ch: int, on: bool):
         """Toggle a channel in/out of the plate composite. Recomposites from the RETAINED store —
         no reader I/O, no re-projection (that is the whole point of keeping the channel axis)."""
@@ -1544,7 +1658,10 @@ class PlateOverview(QWidget):
         if store is None or self._colors is None:
             return
         step = max(1, int(round(_CELL / max(1.0, self._cd)))) if quick else 1
-        rgb = composite(store[:, ::step, ::step], self._colors, self.channel_windows(), self._mask)
+        if self._scope == SCOPE_PER_REGION:
+            rgb = self._composite_per_region(store, step)
+        else:
+            rgb = composite(store[:, ::step, ::step], self._colors, self.channel_windows(), self._mask)
         self._final_arr[layer] = rgb          # hold the buffer: the QImage below only wraps it
         h, w, _ = rgb.shape
         self.set_final(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888), layer)
@@ -1603,8 +1720,9 @@ class PlateOverview(QWidget):
               x0 + left:x0 + left + tw] = tile
         for c_i in range(tile.shape[0]):
             self._contrast.add(c_i, tile[c_i])     # real FOV pixels only — see the docstring
-        cell = composite(store[:, y0:y0 + _CELL, x0:x0 + _CELL], self._colors,
-                         self.channel_windows(), self._mask)
+        wins = (self._cell_windows(store, ri, ci) if self._scope == SCOPE_PER_REGION
+                else self.channel_windows())      # per-region windows THIS cell, not the plate
+        cell = composite(store[:, y0:y0 + _CELL, x0:x0 + _CELL], self._colors, wins, self._mask)
         img = QImage(cell.data, _CELL, _CELL, 3 * _CELL, QImage.Format_RGB888)
         p = QPainter(self._canvas_for(layer))
         p.drawImage(x0, y0, img)           # drawImage COPIES, so `cell` may die after p.end()
@@ -2097,6 +2215,23 @@ class PlateOverview(QWidget):
                        int(abs(mx1 - mx0)), int(abs(my1 - my0)))
         if self._loupe is not None:        # press-and-hold magnifier, over everything else
             self._paint_loupe(p)
+        # CONTRAST SCOPE BADGE (IMA-207), drawn INTO the plate. Per-region contrast stretches every
+        # well to its own range, so a dim and a bright well can look identical — a screenshot of
+        # this plate is scientifically wrong if read as relative signal. The badge travels with the
+        # pixels; a dropdown would be cropped out of that screenshot. Nothing is drawn for global:
+        # there is no caveat to give when the wells are comparable.
+        if self._scope != SCOPE_GLOBAL:
+            label = f"contrast: {self._scope}  ·  wells NOT comparable"
+            p.setFont(QFont("Helvetica Neue", 10, QFont.Bold))
+            fm = p.fontMetrics()
+            tw = fm.horizontalAdvance(label) if hasattr(fm, "horizontalAdvance") else fm.width(label)
+            bw, bh = tw + 18, 24
+            bx, by = self.width() - bw - 10, self.height() - bh - 10
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(255, 176, 0, 235))            # amber: a caveat, not an error
+            p.drawRoundedRect(bx, by, bw, bh, 6, 6)
+            p.setPen(QPen(QColor("#1b1300")))
+            p.drawText(bx + 9, by + bh - 7, label)
         # a fine outer white frame around the whole plate view
         p.setPen(QPen(QColor("#c9d1d9"), 1))
         p.setBrush(Qt.NoBrush)
@@ -2768,9 +2903,29 @@ class PlateWindow(QMainWindow):
         # bottom-left: plate view (drop target until an acquisition opens). Its FIXED title bar names
         # the wellplate we're on (the acquisition) — the plate's identity lives with the plate.
         self._plate_title = QLabel("well plate")   # plate name; shows the hovered well (large) on hover
-        self._plate_title.setStyleSheet(
-            "color:#e6edf3;font-size:17px;font-weight:800;padding:9px 14px;"
-            "background:#0b0e14;border-bottom:1px solid #232b3a;")
+        self._plate_title.setStyleSheet(           # the BAR below now carries background + border
+            "color:#e6edf3;font-size:17px;font-weight:800;padding:9px 14px;border:none;")
+        # CONTRAST SCOPE selector (IMA-207), in the plate's OWN title bar because it governs the
+        # plate, not the run — flipping it re-composites the retained tiles and never re-runs.
+        self._scope_combo = QComboBox()
+        self._scope_combo.setStyleSheet(_COMBO_QSS)
+        self._scope_combo.addItems(list(SCOPES))
+        self._scope_combo.setToolTip(
+            "How wide a net each contrast window is computed over.\n"
+            "global — one window across the plate; wells stay comparable.\n"
+            "per-region — every well fills its own range, so a dim and a bright well are both\n"
+            "readable, but they are NO LONGER comparable.")
+        self._scope_combo.currentTextChanged.connect(self._on_scope_changed)
+        _scope_lbl = QLabel("contrast")
+        _scope_lbl.setStyleSheet("color:#8b98ad;font-size:12px;border:none;")
+        plate_title_bar = QWidget()
+        plate_title_bar.setStyleSheet("background:#0b0e14;border-bottom:1px solid #232b3a;")
+        _tb = QHBoxLayout(plate_title_bar)
+        _tb.setContentsMargins(0, 0, 12, 0)
+        _tb.setSpacing(8)
+        _tb.addWidget(self._plate_title, 1)
+        _tb.addWidget(_scope_lbl)
+        _tb.addWidget(self._scope_combo)
         self._drop = QLabel("Drop a Squid acquisition folder here\n\n"
                             "then pick an operator in  Process wells")
         self._drop.setAlignment(Qt.AlignCenter)
@@ -2780,7 +2935,7 @@ class PlateWindow(QMainWindow):
         self._left_l = QVBoxLayout(plate_host)
         self._left_l.setContentsMargins(0, 0, 0, 0)
         self._left_l.setSpacing(0)
-        self._left_l.addWidget(self._plate_title)
+        self._left_l.addWidget(plate_title_bar)
         self._left_l.addWidget(self._drop, 1)    # the plate overview replaces this on ingest
 
         left_col = QSplitter(Qt.Vertical)
@@ -3887,6 +4042,7 @@ class PlateWindow(QMainWindow):
         # build_plate RESOLVED (measured pitch beat the 2x2's mis-declared "384 well plate"), so the
         # background can only ever be drawn at the same scale the grid is laid out at.
         self._overview.set_carrier(plate)
+        self._overview.set_contrast_scope(self._scope_combo.currentText())   # IMA-207
         self._selected_regions = []                  # a new acquisition starts with nothing picked
         self._overview.hovered.connect(self._on_hover)
         self._overview.wellActivated.connect(self.activate_well)
@@ -4097,6 +4253,7 @@ class PlateWindow(QMainWindow):
         except (PlateShapeError, PlateBuildError):
             self._plate = None
         self._overview.set_carrier(self._plate)
+        self._overview.set_contrast_scope(self._scope_combo.currentText())   # IMA-207
         self._overview.hovered.connect(self._on_hover)
         self._overview.wellActivated.connect(self.activate_well)
         self._active_op_key = "computed"
@@ -4439,6 +4596,22 @@ class PlateWindow(QMainWindow):
         """The current selection as (region, fov) pairs — the payload IMA-205 will consume."""
         per = (self._meta or {}).get("fovs_per_region", {})
         return [(r, f) for r in self._selected_regions for f in (per.get(r) or [0])]
+
+    def _on_scope_changed(self, scope: str):
+        """Contrast scope picked (IMA-207). A DISPLAY control: re-composite, never re-run.
+
+        Deliberately does not touch the operator, the reader or any worker. The plate re-windows
+        from the native-dtype tiles PlateOverview already retains, so the flip is instant even on a
+        1536wp — where re-running would be minutes and would make the control unusable.
+        """
+        if self._overview is None:
+            return
+        self._overview.set_contrast_scope(scope)
+        if scope == SCOPE_GLOBAL:
+            self._readout.setText("contrast: global — wells are comparable")
+        else:
+            self._readout.setText(f"contrast: {scope} — each well fills its own range, "
+                                  "wells are NOT comparable")
 
     def _on_hover(self, text: str):
         # BOTTOM-LEFT plate title bar: "<acq>  ·  <mode>" (mode = raw / the operator that processed it),
