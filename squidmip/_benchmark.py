@@ -863,3 +863,329 @@ def write_json(results: Sequence[OperatorResult], path, *, meta: Optional[dict] 
     }
     path.write_text(json.dumps(payload, indent=2, default=str))
     return path
+
+
+# --------------------------------------------------------------------------------------
+# IMA-256: per-REGION decomposition, and the registration-scope probe
+# --------------------------------------------------------------------------------------
+# `benchmark_operator` above answers "which operator is faster" — it times a whole
+# `stitch_plate` run and reports ONE row. That is the wrong granularity for two questions
+# that were asked directly and had never been measured:
+#
+#   Q1  How fast is tile assembly, per region and per tile, and where does the time go —
+#       I/O, registration, or blend? A single wall-clock number cannot be optimised
+#       against, because `project` (the dominant stage on a z-stack) is mostly disk and
+#       `fuse` is mostly numba, and those two have nothing to do with each other.
+#   Q2  Does registration solve PER REGION, once globally, or per FOV pair?
+#
+# Both are answered by driving `stitch_region` directly, one region at a time, with its
+# own StageTimer and its own read recorder — which `stitch_plate` cannot give you because
+# it shares one timer across every well it yields.
+# --------------------------------------------------------------------------------------
+
+
+@dataclass
+class RegionTiming:
+    """One region's tile assembly, decomposed into the phases you can actually optimise."""
+
+    region: str
+    tiles: int
+    channels: int
+    n_z: int
+    mosaic_shape: tuple = ()
+    total_ms: float = 0.0
+    # phases. `project_ms` is the whole z-reduction stage; `io_ms` is the part of it spent
+    # inside reader.read, so `project_ms - io_ms` is the MIP arithmetic itself.
+    io_ms: float = 0.0
+    project_ms: float = 0.0
+    register_ms: float = 0.0
+    optimize_ms: float = 0.0
+    fuse_ms: float = 0.0
+    read_calls: int = 0
+    read_mb: float = 0.0
+    offsets_px: tuple = ()
+
+    @property
+    def mosaic_megapixels(self) -> float:
+        return float(np.prod(self.mosaic_shape)) / 1e6 if self.mosaic_shape else 0.0
+
+    @property
+    def ms_per_tile(self) -> float:
+        return self.total_ms / self.tiles if self.tiles else float("nan")
+
+    @property
+    def mpix_per_s(self) -> float:
+        """Mosaic megapixels produced per second — the output-side throughput."""
+        return self.mosaic_megapixels / (self.total_ms / 1000.0) if self.total_ms else float("nan")
+
+    @property
+    def read_mb_per_s(self) -> float:
+        """Bytes actually pulled off disk per second of I/O time — the number to compare
+        against the drive, as opposed to ``mpix_per_s`` which is output-side."""
+        return self.read_mb / (self.io_ms / 1000.0) if self.io_ms else float("nan")
+
+    @property
+    def mip_ms(self) -> float:
+        """z-reduction arithmetic: the project stage minus the time spent in reader.read."""
+        return max(0.0, self.project_ms - self.io_ms)
+
+    @property
+    def registration_ms(self) -> float:
+        """Everything geometric: phase correlation plus the pose-graph solve."""
+        return self.register_ms + self.optimize_ms
+
+    def shares(self) -> dict:
+        """Phase -> fraction of this region's wall clock. Sums to <= 1; the remainder is
+        allocation of the output mosaic and other work outside any stage span."""
+        t = self.total_ms or float("nan")
+        return {
+            "io": self.io_ms / t,
+            "mip": self.mip_ms / t,
+            "register": self.register_ms / t,
+            "optimize": self.optimize_ms / t,
+            "fuse": self.fuse_ms / t,
+        }
+
+
+def time_region(
+    reader,
+    region: str,
+    fovs: Sequence[int],
+    *,
+    operator: str = "stitch",
+    channels: Optional[Sequence[int]] = (1,),
+    **operator_kwargs,
+) -> RegionTiming:
+    """Fuse ONE region and return its phase decomposition.
+
+    Uses the same two instruments the operator table uses — Julio's ``StageTimer`` for the
+    project/register/optimize/fuse spans, and :class:`_ReadRecorder` for the I/O — but
+    scoped to a single region so the numbers are per-well rather than per-plate.
+
+    The returned mosaic is dropped before returning: a 36-FOV single-channel mosaic is
+    ~270 MB and holding one per region is how a benchmark becomes an OOM.
+    """
+    stages_mod = _profiling()[0]
+    from squidmip._stitch import _resolve_region_operator
+
+    op = _resolve_region_operator(operator)
+    meta = reader.metadata
+    fovs = list(fovs)
+    if channels is not None:
+        operator_kwargs.setdefault("channels", list(channels))
+        operator_kwargs.setdefault("registration_channel", list(channels)[0])
+    n_channels = len(operator_kwargs.get("channels") or meta["channels"])
+
+    geometry: dict = {}
+    recorder = _ReadRecorder()
+    t0 = time.perf_counter()
+    timer = stages_mod.StageTimer(t0)
+    with recorder.wrap(reader):
+        image = op(reader, region, fovs, timer=timer, geometry=geometry, **operator_kwargs)
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    mosaic_shape = tuple(image.shape[-2:])
+    del image
+
+    stage_ms = _aggregate_stage_ms(timer.spans)
+    return RegionTiming(
+        region=region,
+        tiles=len(fovs),
+        channels=n_channels,
+        n_z=int(meta.get("n_z") or 1),
+        mosaic_shape=mosaic_shape,
+        total_ms=total_ms,
+        io_ms=recorder.ms,
+        project_ms=stage_ms.get("project", 0.0),
+        register_ms=stage_ms.get("register", 0.0),
+        optimize_ms=stage_ms.get("optimize", 0.0),
+        fuse_ms=stage_ms.get("fuse", 0.0),
+        read_calls=recorder.calls,
+        read_mb=recorder.nbytes / _MB,
+        offsets_px=tuple(map(tuple, np.asarray(geometry.get("offsets_px", [])).tolist())),
+    )
+
+
+def benchmark_regions(
+    reader,
+    *,
+    operator: str = "stitch",
+    regions: Optional[Sequence[str]] = None,
+    channels: Optional[Sequence[int]] = (1,),
+    repeats: int = 1,
+    warmup: bool = True,
+    on_region: Optional[Callable[[RegionTiming], None]] = None,
+    **operator_kwargs,
+) -> list:
+    """Time every selected region, ``repeats`` times, returning a flat list of timings.
+
+    ``warmup`` fuses the FIRST region once and discards it. ``tilefusion``'s blend kernels
+    are numba-JIT'd, so without it the first region measured is charged several seconds of
+    compilation that belong to no region at all — the same trap ``tools/benchmark.py``
+    documents on ``--warmup``, at region granularity.
+    """
+    from squidmip.projection import select_fovs
+
+    meta = reader.metadata
+    wells = select_fovs(meta, n_fovs=None)
+    if regions is not None:
+        keep = list(dict.fromkeys(regions))
+        wells = {r: wells[r] for r in keep if r in wells}
+    wells = {r: f for r, f in wells.items() if f}
+    if not wells:
+        raise ValueError("no regions with FOVs to time")
+
+    if warmup:
+        first = next(iter(wells))
+        time_region(reader, first, wells[first], operator=operator,
+                    channels=channels, **operator_kwargs)
+
+    out: list = []
+    for _ in range(max(1, repeats)):
+        for region, fovs in wells.items():
+            timing = time_region(reader, region, fovs, operator=operator,
+                                 channels=channels, **operator_kwargs)
+            out.append(timing)
+            if on_region is not None:
+                on_region(timing)
+    return out
+
+
+def registration_scope_probe(
+    reader,
+    *,
+    regions: Optional[Sequence[str]] = None,
+    channels: Optional[Sequence[int]] = (1,),
+    **operator_kwargs,
+) -> dict:
+    """Decide EMPIRICALLY whether registration is per-region, global, or per-pair.
+
+    Reading the code says per-region; this proves it on data, which is what makes the
+    answer safe to quote. Two facts are collected per region:
+
+    ``solo``
+        the offsets from solving that region ALONE.
+    ``in_plate``
+        the offsets that same region got when every region was stitched in one
+        ``stitch_plate`` call.
+
+    If the two are identical for every region, no information crosses a region boundary:
+    the solve is per-region, and adding or removing a well cannot move any other well's
+    tiles. That is the correct behaviour on a well plate, where two wells are physically
+    separate samples whose stage error is independent — a solve pooled across wells would
+    let one well's blunder drag another well's tiles, and there is no overlap between
+    wells for it to be constrained by in the first place.
+
+    A per-region anchor is the second half of the evidence: each region's own tile 0 is
+    pinned at zero, so each region carries its own gauge freedom rather than sharing one.
+    """
+    from squidmip import stitch_plate
+    from squidmip.projection import select_fovs
+
+    meta = reader.metadata
+    wells = select_fovs(meta, n_fovs=None)
+    if regions is not None:
+        keep = list(dict.fromkeys(regions))
+        wells = {r: wells[r] for r in keep if r in wells}
+    wells = {r: f for r, f in wells.items() if f}
+
+    kwargs: dict = dict(operator_kwargs)
+    if channels is not None:
+        kwargs["channels"] = list(channels)
+        kwargs["registration_channel"] = list(channels)[0]
+
+    solo = {
+        r: np.asarray(
+            time_region(reader, r, f, channels=channels, **operator_kwargs).offsets_px,
+            dtype=float,
+        )
+        for r, f in wells.items()
+    }
+
+    in_plate: dict = {}
+    geometry: dict = {}
+    for region, _fov, image in stitch_plate(
+        reader, n_fovs=None, workers=1, regions=list(wells), geometry=geometry, **kwargs
+    ):
+        in_plate[region] = np.asarray(geometry["offsets_px"], dtype=float)
+        del image
+
+    per_region = all(
+        region in in_plate and np.array_equal(solo[region], in_plate[region])
+        for region in solo
+    )
+    anchored_per_region = all(
+        arr.size and np.allclose(arr[0], 0.0) for arr in solo.values()
+    )
+    return {
+        "regions": list(wells),
+        "solo": {r: v.tolist() for r, v in solo.items()},
+        "in_plate": {r: v.tolist() for r, v in in_plate.items()},
+        "max_abs_diff": {
+            r: float(np.abs(solo[r] - in_plate[r]).max()) if r in in_plate and solo[r].size else 0.0
+            for r in solo
+        },
+        "per_region": bool(per_region),
+        "anchored_per_region": bool(anchored_per_region),
+        "scope": "per-region" if per_region else "cross-region (POOLED)",
+    }
+
+
+_REGION_COLUMNS = ("region", "tiles", "mosaic_Mpix", "total_ms", "ms_per_tile", "Mpix_s",
+                   "io_ms", "mip_ms", "register_ms", "optimize_ms", "fuse_ms")
+
+
+def _mean(values: Iterable[float]) -> float:
+    values = list(values)
+    return sum(values) / len(values) if values else float("nan")
+
+
+def format_region_timings(timings: Sequence[RegionTiming]) -> str:
+    """One row per (region, repeat), then a mean row and the phase split as percentages."""
+    rows = []
+    for t in timings:
+        rows.append({
+            "region": t.region, "tiles": t.tiles,
+            "mosaic_Mpix": f"{t.mosaic_megapixels:.1f}",
+            "total_ms": f"{t.total_ms:.0f}", "ms_per_tile": f"{t.ms_per_tile:.0f}",
+            "Mpix_s": f"{t.mpix_per_s:.1f}",
+            "io_ms": f"{t.io_ms:.0f}", "mip_ms": f"{t.mip_ms:.0f}",
+            "register_ms": f"{t.register_ms:.0f}", "optimize_ms": f"{t.optimize_ms:.1f}",
+            "fuse_ms": f"{t.fuse_ms:.0f}",
+        })
+    widths = {c: max(len(c), *(len(str(r[c])) for r in rows)) for c in _REGION_COLUMNS}
+    lines = ["  ".join(c.rjust(widths[c]) for c in _REGION_COLUMNS),
+             "  ".join("-" * widths[c] for c in _REGION_COLUMNS)]
+    for r in rows:
+        lines.append("  ".join(str(r[c]).rjust(widths[c]) for c in _REGION_COLUMNS))
+
+    lines.append("")
+    lines.append(f"mean over {len(timings)} region-run(s): "
+                 f"{_mean(t.total_ms for t in timings):.0f} ms/region, "
+                 f"{_mean(t.ms_per_tile for t in timings):.0f} ms/tile, "
+                 f"{_mean(t.mpix_per_s for t in timings):.1f} Mpix/s out")
+    shares = {k: _mean(t.shares()[k] for t in timings)
+              for k in ("io", "mip", "register", "optimize", "fuse")}
+    lines.append("phase split: " + "  ".join(
+        f"{k}={v * 100:.0f}%" for k, v in shares.items()))
+    lines.append(f"  (I/O = time inside reader.read; mip = project stage minus I/O; "
+                 f"register+optimize = geometry; fuse = blend/paste. "
+                 f"Remainder {100 * (1 - sum(shares.values())):.0f}% is mosaic allocation "
+                 f"and setup outside any stage span.)")
+    return "\n".join(lines)
+
+
+def format_scope_probe(probe: dict) -> str:
+    """The registration-scope verdict, with the evidence that produced it."""
+    lines = [f"registration scope: {probe['scope'].upper()}",
+             f"  regions probed          : {', '.join(probe['regions'])}",
+             f"  solo == in-plate solve  : {probe['per_region']} "
+             f"(max |diff| {max(probe['max_abs_diff'].values(), default=0.0):.3g} px)",
+             f"  each region anchored at its own tile 0: {probe['anchored_per_region']}"]
+    if probe["per_region"]:
+        lines.append("  => no information crosses a region boundary. Correct for a well "
+                     "plate: separate wells are separate samples with independent stage "
+                     "error and no shared overlap to constrain a pooled solve.")
+    else:
+        lines.append("  => offsets CHANGE depending on which other regions were in the "
+                     "run. That is a bug on a well plate.")
+    return "\n".join(lines)

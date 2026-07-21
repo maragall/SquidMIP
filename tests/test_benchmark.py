@@ -223,3 +223,132 @@ def test_every_default_operator_documents_its_quality_direction():
     """A quality number whose desired direction the reader has to guess is not a
     measurement."""
     assert set(bm.DEFAULT_OPERATORS) <= set(bm.QUALITY_NOTES)
+
+
+# ---------------------------------------------------------------------------------------
+# IMA-259: per-region decomposition and the registration-scope probe
+# ---------------------------------------------------------------------------------------
+# These reuse test_stitch's synthetic mosaic reader rather than a real acquisition, for the
+# same reason the rest of this file does: the CONTRACTS are what must not drift (the phase
+# split adds up, a region's solve is unaffected by its neighbours). The real milliseconds
+# come from `tools/tile_bench.py` on real data, and a wall-clock asserted against a 256 px
+# fixture would only be measuring the fixture.
+
+
+def _stitch_fixture(regions=("A1",), error_px=None):
+    """The 2x2 / 64 px-overlap synthetic mosaic reader from ``tests/test_stitch.py``."""
+    pytest.importorskip("tilefusion")
+    pytest.importorskip("profiling")
+    from tests.test_stitch import _FakeReader, _master
+
+    return _FakeReader(_master(), regions=regions, error_px=error_px)
+
+
+_FAST = {"blend_px": 24, "block_px": 512, "max_workers": 2}
+
+
+def test_time_region_decomposes_the_wall_clock_into_phases():
+    """Every phase must be accounted for: the parts cannot exceed the whole, and the
+    stage the reader is told dominates must be a real measurement, not a residual."""
+    reader = _stitch_fixture()
+    t = bm.time_region(reader, "A1", [0, 1, 2, 3], channels=[0], **_FAST)
+
+    assert t.tiles == 4
+    assert t.total_ms > 0
+    # 4 FOVs x 2 CHANNELS, even though channels=[0] was asked for: `stitch_region` calls
+    # `project_well` (which has no channel selector) and slices the result afterwards, so a
+    # one-channel mosaic still pays full-channel I/O and full-channel z-reduction. That is a
+    # measured inefficiency, not an accident of this fixture — pinned here so the day it is
+    # fixed, this number drops and the test says so.
+    assert t.read_calls == 4 * 2
+    assert t.io_ms > 0                          # the fixture still goes through reader.read
+    assert t.project_ms >= t.io_ms              # I/O happens INSIDE the project stage
+    assert t.register_ms > 0 and t.fuse_ms > 0
+    # mip is the project stage net of I/O, not an independent stopwatch
+    assert t.mip_ms == pytest.approx(t.project_ms - t.io_ms)
+    # the phases are disjoint spans of one wall clock
+    assert t.project_ms + t.register_ms + t.optimize_ms + t.fuse_ms <= t.total_ms + 1e-6
+
+
+def test_time_region_normalises_per_tile_and_per_megapixel():
+    reader = _stitch_fixture()
+    t = bm.time_region(reader, "A1", [0, 1, 2, 3], channels=[0], **_FAST)
+
+    assert t.mosaic_shape == (448, 448)          # 2x2 tiles of 256 at step 192
+    assert t.mosaic_megapixels == pytest.approx(448 * 448 / 1e6)
+    assert t.ms_per_tile == pytest.approx(t.total_ms / 4)
+    assert t.mpix_per_s == pytest.approx(t.mosaic_megapixels / (t.total_ms / 1000.0))
+    assert sum(t.shares().values()) <= 1.0 + 1e-9
+
+
+def test_shares_are_fractions_of_this_regions_own_wall_clock():
+    t = bm.RegionTiming(region="A1", tiles=4, channels=1, n_z=1, total_ms=1000.0,
+                        io_ms=400.0, project_ms=500.0, register_ms=200.0,
+                        optimize_ms=10.0, fuse_ms=250.0)
+    s = t.shares()
+    assert s == {"io": 0.4, "mip": 0.1, "register": 0.2, "optimize": 0.01, "fuse": 0.25}
+    assert t.registration_ms == 210.0
+
+
+def test_benchmark_regions_runs_every_region_every_repeat():
+    reader = _stitch_fixture(regions=("A1", "A2"))
+    seen = []
+    out = bm.benchmark_regions(reader, regions=None, channels=[0], repeats=2,
+                               warmup=False, on_region=seen.append, **_FAST)
+    assert [t.region for t in out] == ["A1", "A2", "A1", "A2"]
+    assert seen == out                           # the callback sees each region as it lands
+
+
+def test_benchmark_regions_refuses_an_empty_selection():
+    reader = _stitch_fixture()
+    with pytest.raises(ValueError, match="no regions"):
+        bm.benchmark_regions(reader, regions=["nope"], channels=[0], warmup=False)
+
+
+def test_registration_solves_per_region_not_across_the_plate():
+    """The Q2 answer, asserted rather than asserted-about.
+
+    Two regions with DIFFERENT injected stage error. If any information crossed the region
+    boundary — one pooled pose graph, one shared anchor — then A1's offsets would depend on
+    whether A2 was in the run. They must not.
+    """
+    reader = _stitch_fixture(regions=("A1", "A2"), error_px={3: (6.0, -4.0)})
+    probe = bm.registration_scope_probe(reader, channels=[0], **_FAST)
+
+    assert probe["scope"] == "per-region"
+    assert probe["per_region"] is True
+    assert max(probe["max_abs_diff"].values()) == 0.0
+    # each region carries its OWN gauge: its own tile 0 is pinned, not one plate-wide tile
+    assert probe["anchored_per_region"] is True
+
+
+def test_scope_probe_recovers_the_injected_error_it_is_probing():
+    """A probe that reported "per-region" while registering nothing would be worthless, so
+    the offsets it compares must be real: tile 3 was displaced by a known 6 px."""
+    reader = _stitch_fixture(regions=("A1",), error_px={3: (6.0, -4.0)})
+    probe = bm.registration_scope_probe(reader, channels=[0], **_FAST)
+    offsets = np.asarray(probe["solo"]["A1"])
+    assert offsets[3] == pytest.approx((-6.0, 4.0), abs=0.5)   # correction undoes the error
+
+
+def test_format_scope_probe_calls_a_pooled_solve_a_bug():
+    """The negative branch must be reachable and must say the word, or nobody will notice
+    the day it changes."""
+    text = bm.format_scope_probe({
+        "regions": ["A1", "A2"], "scope": "cross-region (POOLED)",
+        "per_region": False, "anchored_per_region": False,
+        "max_abs_diff": {"A1": 3.5, "A2": 3.5},
+        "solo": {}, "in_plate": {},
+    })
+    assert "CROSS-REGION (POOLED)" in text
+    assert "bug" in text
+
+
+def test_format_region_timings_reports_per_tile_and_the_phase_split():
+    timings = [bm.RegionTiming(region="A1", tiles=4, channels=1, n_z=1,
+                               mosaic_shape=(448, 448), total_ms=1000.0, io_ms=400.0,
+                               project_ms=500.0, register_ms=200.0, optimize_ms=10.0,
+                               fuse_ms=250.0)]
+    out = bm.format_region_timings(timings)
+    assert "ms_per_tile" in out and "250 ms/tile" in out
+    assert "io=40%" in out and "fuse=25%" in out
