@@ -746,6 +746,35 @@ def operator_layer_key(op_key: str, tab_key: Optional[str]) -> str:
     return f"{op_key}@{tab_key}" if tab_key else op_key
 
 
+def runnable_operators() -> list[str]:
+    """Every operator ``run_operator`` can stream live (IMA-226) — read off the ENGINE registry,
+    never off ``_OPERATIONS``.
+
+    The two lists are not the same set and never were:
+
+    * ``reference`` is a registered projector with no card, so ``_OPERATIONS_BY_KEY[key].label``
+      raised a bare ``KeyError`` out of the event loop the moment anything asked to run it.
+    * ``minerva`` is a card that is NOT an operator — it is an export hand-off. Handing its key to
+      the engine dies with a raw ``KeyError: unknown projector 'minerva'`` in the status line.
+
+    Both are cured by asking the engine what it can run. A z-reducer and a region operator stream
+    through the SAME ``_OperatorWorker`` (it already branches ``project_plate``/``stitch_plate`` on
+    ``available_region_operators``), so both belong in one list.
+    """
+    from squidmip import available_projectors, available_region_operators
+
+    return sorted(set(available_projectors()) | set(available_region_operators()))
+
+
+def operator_label(key: str) -> str:
+    """Human label for an operator: its card's if it has one, else the registry name itself.
+
+    A card is presentation, not capability (IMA-226) — an operator with no card must still be
+    runnable and must still name itself in the status line and the layer stack."""
+    op = _OPERATIONS_BY_KEY.get(key)
+    return op.label if op is not None else key
+
+
 class _RunningContrast:
     """Per-channel global contrast that updates as wells stream in (histogram over tiles so far).
 
@@ -2461,6 +2490,7 @@ class _OperatorWorker(QThread):
         self._lock = threading.Lock()             # guards _done (on_well runs on writer threads)
         self._done = 0
         self._seen_fovs: dict[tuple, set] = {}    # (ri,ci) -> FOVs composited so far, for progress
+        self._failed_regions: set = set()         # regions whose fields raised (IMA-226: report it)
         self._stop = threading.Event()            # set by the window to end the run cleanly
 
     @property
@@ -2472,6 +2502,21 @@ class _OperatorWorker(QThread):
         second chance to disagree, and a disagreement opens a different FOV than the one clicked.
         """
         return self._boxes
+
+    @property
+    def landed(self) -> int:
+        """Wells that actually produced pixels. IMA-226: a live run whose every well raised used to
+        finish "✓ · 1 well" with an empty plate behind it — flat-field with no illumination profile
+        raises per field, `_on_error` painted the dots red, and the success message printed anyway.
+        The status line must not claim a result the plate does not have."""
+        with self._lock:
+            return self._done
+
+    @property
+    def skipped(self) -> int:
+        """Regions where at least one field raised and was skipped."""
+        with self._lock:
+            return len(self._failed_regions)
 
     def stop(self):
         """Ask the run to stop; write_plate polls this and abandons after in-flight wells drain."""
@@ -2523,6 +2568,8 @@ class _OperatorWorker(QThread):
     def _on_error(self, region, fov, exc):
         """A well's projection failed (corrupt/missing plane): SKIP it, mark its dot failed, keep the
         run alive. One bad file must not abort a whole-plate run."""
+        with self._lock:
+            self._failed_regions.add(region)
         info = self._fov_index.get(region)
         if info is not None:
             self.wellFailed.emit(*info["rc"])
@@ -3648,13 +3695,18 @@ class PlateWindow(QMainWindow):
         lab = QLabel("RUN ON THIS SUBSET")
         lab.setStyleSheet("color:#57606a;font-size:10px;font-weight:800;letter-spacing:1.5px;padding-top:4px;")
         v.addWidget(lab)
-        for op in _OPERATIONS:
-            btn = QPushButton(f"{op.label} (preview)")
+        # IMA-226: one live-preview button per RUNNABLE operator, off the engine registry rather
+        # than off _OPERATIONS. That is the same edit in both directions: `reference` gains a
+        # button it never had (it has no card, so the card loop skipped it), and `minerva` loses
+        # one it should never have had (it is an export hand-off, not an operator — clicking it
+        # handed "minerva" to the engine and the run died with a raw KeyError in the status line).
+        for k in runnable_operators():
+            btn = QPushButton(f"{operator_label(k)} (preview)")
             btn.setStyleSheet(_BTN_QSS)
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(
-                lambda _=False, k=op.key: self.run_operator(k, regions=regions, save=False,
-                                                            tab_key=tab_key))
+                lambda _=False, k=k: self.run_operator(k, regions=regions, save=False,
+                                                       tab_key=tab_key))
             v.addWidget(btn)
 
         save_btn = QPushButton("Save this subset to disk…")
@@ -4438,7 +4490,16 @@ class PlateWindow(QMainWindow):
         if self._busy():
             self._readout.setText("already processing — let the current run finish first")
             return
-        label = _OPERATIONS_BY_KEY[key].label
+        # IMA-226: gate on the ENGINE registry, not on the card table. `_OPERATIONS_BY_KEY[key]`
+        # raised a bare KeyError for `reference` (a registered projector with no card) and let
+        # `minerva` (a card that is not an operator) through to die inside the engine instead.
+        # Refuse BY NAME here, in the readout, the same way an unknown region is refused below.
+        if key not in runnable_operators():
+            self._readout.setText(
+                f"'{key}' is not a runnable operator — this viewer can run: "
+                f"{', '.join(runnable_operators())}")
+            return
+        label = operator_label(key)
         # Scope the run: an explicit `regions` list wins (an exploration tab and the preview spinner
         # both build one), else a plate SELECTION scopes it (IMA-221), else the whole plate.
         # regions=None keeps the existing whole-plate path byte-for-byte.
@@ -4550,8 +4611,24 @@ class PlateWindow(QMainWindow):
         self._worker.wellFailed.connect(                     # a skipped well -> red x, run continues
             lambda ri, ci: self._overview.set_status(ri, ci, "failed") if self._overview else None)
         self._worker.failed.connect(self._on_failed)
-        self._worker.finished_ok.connect(lambda: self._readout.setText(
-            f"✓ {label} · {scope}{dest}" + ("  (re-openable OME-Zarr)" if save else "")))
+        # IMA-226: report what the plate ACTUALLY got. A run where every well raised (flat-field
+        # with no profile is the routine case) still reaches finished_ok — the per-well on_error
+        # path is what keeps one bad file from aborting a plate — and used to print "✓" over an
+        # empty plate. Landed==0 is a failure however politely the engine returned.
+        def _done_msg(w=self._worker):
+            if w.landed == 0:
+                self._readout.setText(
+                    f"⚠ {label} · {scope} produced nothing — all {w.skipped or self._worker._total} "
+                    f"well(s) were skipped (see the red markers)")
+            elif w.skipped:
+                self._readout.setText(
+                    f"✓ {label} · {scope}{dest} — {w.skipped} well(s) skipped"
+                    + ("  (re-openable OME-Zarr)" if save else ""))
+            else:
+                self._readout.setText(
+                    f"✓ {label} · {scope}{dest}" + ("  (re-openable OME-Zarr)" if save else ""))
+
+        self._worker.finished_ok.connect(_done_msg)
         # a run that FINISHED wrote a complete plate — forget the path so a later stop can never
         # retroactively flag it incomplete
         self._worker.finished_ok.connect(lambda: setattr(self, "_run_out_dir", None))

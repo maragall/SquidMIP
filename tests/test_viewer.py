@@ -3158,3 +3158,114 @@ def test_flatfield_card_gates_preview_on_a_profile(qapp, stub_detail, squid_data
     assert not [b for b in win._op_tabs["decon"].findChildren(QPushButton)
                 if "illumination profile" in b.text()], "decon grew a profile chooser"
     win.close()
+
+
+# --- IMA-226: EVERY operator streams live to the plate and the ndviewer slider -----------------
+
+def _run_live(qapp, win, key, regions=("B3",)):
+    """Drive a real preview run to completion and return (tiles, pushes)."""
+    win._detail.arrays.clear()
+    tiles = []
+    win.run_operator(key, regions=list(regions), save=False)
+    if win._worker is None:
+        return None, None
+    win._worker.tileReady.connect(lambda *a: tiles.append(a))
+    t0 = time.time()
+    while win._worker.isRunning() and time.time() - t0 < 90:
+        qapp.processEvents(); time.sleep(0.02)
+    for _ in range(25):
+        qapp.processEvents(); time.sleep(0.02)
+    return tiles, list(win._detail.arrays)
+
+
+@pytest.mark.parametrize("key", ["mip", "reference", "stitch", "decon", "bgsub", "coordinate"])
+def test_every_operator_streams_live_to_plate_and_slider(qapp, stub_detail, squid_dataset, key):
+    """IMA-226. Not 'MIP streams and the rest are TODO': every operator the ENGINE can run must
+    reach the plate canvas and the ndviewer slider through the same _OperatorWorker.
+
+    `reference` is the one this test was written for — a registered projector with NO card, so
+    run_operator's `_OPERATIONS_BY_KEY[key].label` raised a bare KeyError out of the event loop
+    and it could not be run live at all. `coordinate` is the same story on the region-operator
+    side. Both stream here.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    tiles, pushes = _run_live(qapp, win, key)
+    assert tiles is not None, f"{key}: no worker started — {win._readout.text()!r}"
+    assert tiles, f"{key}: nothing reached the PLATE — {win._readout.text()!r}"
+    assert pushes, f"{key}: nothing reached the ndviewer SLIDER — {win._readout.text()!r}"
+    assert win._active_op_key == key, f"{key} streamed into layer {win._active_op_key!r}"
+    assert win._readout.text().startswith("✓"), win._readout.text()
+    # The tiles carry the operator's own pixels, not an empty canvas. Checked for the per-FOV
+    # operators only: on this 4x4-frame fixture a REGION operator's blend weights divide by zero
+    # (_montage.py:142) and the fused mosaic comes back NaN -> 0 on the uint16 cast. That is the
+    # fixture's degenerate geometry, not the stream — the tile still arrives, which is what
+    # IMA-226 is about, and test_ima222_* cover stitch's pixels on real extents.
+    if key not in ("stitch", "coordinate"):
+        assert any(np.asarray(t[3]).any() for t in tiles), f"{key} streamed all-zero tiles"
+    win._stop_worker(); win.close()
+
+
+def test_flatfield_streams_live_once_a_profile_is_installed(qapp, stub_detail, squid_dataset):
+    """The last operator: flat-field cannot run without a profile, so with one installed it must
+    stream exactly like the rest — and without one it must SAY it produced nothing."""
+    from squidmip import FlatfieldProfile
+    from squidmip._flatfield import set_profile
+    import squidmip._flatfield as FF
+
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    ny, nx = win._meta["frame_shape"]
+
+    prev = FF.active_profile()
+    try:
+        FF._active = None                                   # no profile -> every field raises
+        tiles, pushes = _run_live(qapp, win, "flatfield")
+        assert not tiles and not pushes
+        assert win._readout.text().startswith("⚠"), \
+            f"a run that produced NOTHING reported success: {win._readout.text()!r}"
+        assert "produced nothing" in win._readout.text()
+
+        set_profile(FlatfieldProfile(np.ones((ny, nx), np.float32)))
+        tiles, pushes = _run_live(qapp, win, "flatfield")
+        assert tiles, f"flat-field with a profile still reached no tile: {win._readout.text()!r}"
+        assert pushes, "flat-field reached the plate but not the ndviewer slider"
+        assert win._readout.text().startswith("✓"), win._readout.text()
+    finally:
+        FF._active = prev
+    win._stop_worker(); win.close()
+
+
+def test_run_operator_refuses_a_non_operator_by_name(qapp, stub_detail, squid_dataset):
+    """`minerva` is a CARD, not an operator — it is an export hand-off. Before IMA-226 the
+    exploration tab built it a '(preview)' button from _OPERATIONS and clicking it handed
+    'minerva' to the engine, which died with a raw KeyError printed into the status line."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("minerva", regions=["B3"], save=False)
+    assert win._worker is None, "a non-operator started a run"
+    assert "not a runnable operator" in win._readout.text()
+    assert "KeyError" not in win._readout.text(), "raw engine exception leaked into the UI"
+    win.run_operator("no_such_op", regions=["B3"], save=False)
+    assert win._worker is None and "not a runnable operator" in win._readout.text()
+    win.close()
+
+
+def test_exploration_tab_offers_exactly_the_runnable_operators(qapp, stub_detail, squid_dataset):
+    """The subset tab's preview buttons come off the ENGINE registry, so a registered operator
+    with no card (reference) is reachable and a card that is not an operator (minerva) is not."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    key = win.open_exploration_tab(["B3"])
+    tab = win._op_tabs[key]
+    previews = [b.text()[:-len(" (preview)")]
+                for b in tab.findChildren(QPushButton) if b.text().endswith(" (preview)")]
+    expected = [V.operator_label(k) for k in V.runnable_operators()]
+    assert previews == expected, f"{previews} != {expected}"
+    assert "reference" in previews, "a registered projector with no card is unreachable"
+    assert not [p for p in previews if "Minerva" in p], "Minerva is not an operator"
+    win.close()
