@@ -26,6 +26,7 @@ from squidmip._minerva import (
 )
 from squidmip.reader import open_reader
 from tests.conftest import CH_IN_YAML, CH_NOT_IN_YAML, NZ, _pixel_value
+from tests.writer_fixtures import WRITERS as _WRITERS
 
 
 # --- export_selection ------------------------------------------------------------------------
@@ -127,6 +128,28 @@ def test_export_goes_through_the_region_operator_seam(squid_dataset, tmp_path):
     assert calls == [("B2", (0, 1))], "the whole region reached the operator in one call"
     assert len(pairs) == 1 and name in pairs[0][0].name
     assert root  # the fixture root was used
+
+
+@pytest.mark.parametrize("label, build", [(w[0], w[1]) for w in _WRITERS])
+def test_export_is_one_mosaic_per_region_from_every_squid_writer(label, build, tmp_path):
+    """IMA-254 made the reader cover every Squid writer; the Minerva export rides that seam.
+
+    The export must not care which writer produced the acquisition — it goes through
+    ``open_reader`` and ``stitch_plate`` like everything else. One mosaic per region from
+    individual TIFF, multi-page TIFF, OME-TIFF and all three zarr layouts, or the export has
+    grown a format assumption it has no business having.
+    """
+    root = build(tmp_path / "acq")
+    reader = open_reader(root)
+    region = list(reader.metadata["fovs_per_region"])[0]
+    fovs = reader.metadata["fovs_per_region"][region]
+    assert len(fovs) > 1, f"{label}: fixture must have >1 FOV or 'mosaic' means nothing"
+    pairs = export_selection(reader, [(region, f) for f in fovs], tmp_path / "out", blend_px=0)
+    assert len(pairs) == 1, f"{label}: {len(fovs)} FOVs gave {len(pairs)} files, want 1 mosaic"
+    with tifffile.TiffFile(str(pairs[0][0])) as tf:
+        assert len(tf.series) == 1
+        # fused, not passed through: wider than the single 8 px fixture tile
+        assert tf.series[0].shape[-1] > 8
 
 
 def test_export_rejects_an_unknown_region_operator(squid_dataset, tmp_path):
