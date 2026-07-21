@@ -16,6 +16,7 @@ import sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # headless Qt; must precede the PyQt import
 
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -3879,3 +3880,303 @@ def test_ima253_empty_slots_are_visibly_distinct_from_occupied_ones(qapp, stub_d
     assert abs(float(occupied.mean()) - float(empty.mean())) > 1.5, \
         "an empty slot must not look like an occupied one"
     ov.deleteLater()
+
+
+# ================================================================================ IMA-262
+# The slide carrier built DOWN the screen and clicks between the regions missed. Julio, driving
+# the tissue set:
+#
+#   "Clicking between regions on the tissue slide carrier is not working well. Also, the slide
+#    carrier is building down vertically when it should actually be building horizontally. You
+#    have to find a way to shape it into the canvas and what's going to be the size."
+#
+# DIAGNOSIS -- measured, and pinned by the first test below: the stacking is FAITHFUL STAGE
+# GEOMETRY, not a clustering axis error. manual0 spans stage y 10186..18805 and manual1
+# 21113..29733: a 2308 um gap with ZERO overlap, while their x ranges overlap 84%. Both lie
+# inside x 82500..107500, which is slot 4 of the 4-up carrier. That is two tissue sections on ONE
+# slide, stacked along the slide's long (75 mm) axis -- which in the carrier runs down the screen.
+# So freeform_grid was right and the mosaics belong exactly where they are.
+#
+# What was wrong is the CARRIER: it was drawn as the bounding box of that 2x1 cluster, a tall
+# 115 x 270 px sliver, instead of as the real holder -- the ANSI/SLAS footprint, 127.76 x
+# 85.48 mm, four slots SIDE BY SIDE. Fixing the holder is also what fixes the clicking: the
+# regions stop being two small targets separated by a dead band in an otherwise empty pane.
+
+@pytest.fixture
+def open_tissue(qapp, stub_detail, real_dataset):
+    """Open the acquisition in a REAL, SHOWN, 1600x900 window, and ALWAYS tear it down.
+
+    Showing matters: the pane only gets its true size once laid out, and the carrier fit is a
+    function of that size. The preview is drained rather than slept on -- it streams 55 fields.
+
+    Teardown is a fixture, not a trailing call in each test, because a SHOWN PlateWindow that
+    reaches the garbage collector still delivers hideEvent to a half-destroyed C++ object and
+    aborts the interpreter with SIGABRT. A test that failed before its cleanup line would take
+    the rest of the run down with it -- which it did, once, while these tests were being written.
+    """
+    wins = []
+
+    def _open(path=None):
+        win = V.PlateWindow(None)
+        wins.append(win)
+        win.resize(1600, 900)
+        win.show()
+        qapp.processEvents()
+        win.ingest(str(path or real_dataset))
+        assert _drain_until(qapp, lambda: win._preview is None or not win._preview.isRunning(), 180)
+        return win
+
+    yield _open
+    for win in wins:
+        win._stop_worker()
+        win.close()
+        win.deleteLater()
+    qapp.processEvents()
+
+
+def _carrier_body_px(ov):
+    """The holder body as the widget actually lays it out, in widget px.
+
+    Falls back to the union of the cell rectangles -- which is exactly what the parent commit
+    drew as the body -- so these tests measure the REAL drawn holder either way.
+    """
+    if hasattr(ov, "carrier_body_rect"):
+        return ov.carrier_body_rect()
+    rects = [ov._cell_rect(r, c) for r in range(ov._nr) for c in range(ov._nc)]
+    bx0 = min(r[0] for r in rects)
+    by0 = min(r[1] for r in rects)
+    bx1 = max(r[0] + r[2] for r in rects)
+    by1 = max(r[1] + r[3] for r in rects)
+    return (bx0, by0, bx1 - bx0, by1 - by0)
+
+
+def _footprint_aspect():
+    """The holder's true aspect, from the vendored art constants -- never a literal here."""
+    from squidmip._plate import carrier_footprint_um
+
+    fw, fh = carrier_footprint_um("4 slide carrier")
+    return fw / fh
+
+
+def test_ima262_the_vertical_stacking_is_FAITHFUL_stage_geometry(real_dataset):
+    """Pin the diagnosis so nobody later "fixes" placement that is reporting the stage correctly.
+
+    This is the test that says (a) not (b): the y separation is real, the x overlap is real, and
+    both regions sit in the SAME carrier slot. If this ever fails the acquisition changed -- it
+    is not licence to change the clustering.
+    """
+    from squidmip import open_reader
+    from squidmip._plate import FOUR_SLIDE_CARRIER, PlateGeometry, region_stage_boxes_um
+
+    meta = open_reader(str(real_dataset)).metadata
+    boxes = region_stage_boxes_um(meta)
+    (x0, y0, w0, h0) = boxes["manual0"]
+    (x1, y1, w1, h1) = boxes["manual1"]
+    assert y0 + h0 < y1, f"the y ranges must be disjoint: {y0 + h0:.0f} vs {y1:.0f}"
+    overlap_x = min(x0 + w0, x1 + w1) - max(x0, x1)
+    assert overlap_x > 0.8 * min(w0, w1), \
+        f"x overlap is only {overlap_x:.0f} um of {min(w0, w1):.0f} -- these are not one slide"
+    g = PlateGeometry.vendored(FOUR_SLIDE_CARRIER)
+    slots = [(g.a1_x_um + k * g.pitch_x_um - g.cell_size_um / 2,
+              g.a1_x_um + k * g.pitch_x_um + g.cell_size_um / 2) for k in range(g.cols)]
+    hit0 = [k for k, (lo, hi) in enumerate(slots) if lo <= x0 and x0 + w0 <= hi]
+    hit1 = [k for k, (lo, hi) in enumerate(slots) if lo <= x1 and x1 + w1 <= hi]
+    assert hit0 == hit1 == [3], f"both tissues must be in the SAME slot, got {hit0} / {hit1}"
+
+
+def test_ima262_the_carrier_is_drawn_HORIZONTALLY_at_the_real_holder_aspect(qapp, open_tissue):
+    """THE REPRODUCTION for "building down vertically".
+
+    Measured on the parent commit: the body is 115.1 x 270.0 px, aspect 0.426 -- half again
+    taller than it is wide. A 4-up slide carrier is 127.76 x 85.48 mm, aspect 1.494.
+    """
+    ov = open_tissue()._overview
+    bx, by, bw, bh = _carrier_body_px(ov)
+    assert bw > bh, f"the carrier must build HORIZONTALLY, got {bw:.1f} x {bh:.1f}"
+    want = _footprint_aspect()
+    assert bw / bh == pytest.approx(want, rel=0.02), \
+        f"body aspect {bw / bh:.3f} is not the holder's {want:.3f}"
+
+
+def test_ima262_the_carrier_is_aspect_fitted_to_the_canvas_it_is_given(qapp, open_tissue):
+    """"...shape it into the canvas and what's going to be the size."
+
+    The on-screen size must be EXACTLY the aspect-preserving fit of the real footprint into the
+    pane, computed here from the footprint and the measured pane rather than read back off the
+    widget, so this cannot pass by agreeing with whatever the widget happens to do.
+
+    On the parent commit the body was 115 x 270: it saturated the pane VERTICALLY (270 of 270)
+    while using 14% of the width, because the box being fitted was the 1x2 cluster and not the
+    holder. So a `max(fill) > 0.9` check PASSES on the parent -- the discriminating quantity is
+    the whole rectangle, which is what is asserted.
+    """
+    ov = open_tissue()._overview
+    bx, by, bw, bh = _carrier_body_px(ov)
+    avail_w = ov.width() - V._HDR - 2 * V._PAD
+    avail_h = ov.height() - V._COLH - 2 * V._PAD
+    a = _footprint_aspect()
+    s = min(avail_w / a, avail_h)                  # one scale, both axes: an aspect fit
+    want_w, want_h = a * s, s
+    assert bw == pytest.approx(want_w, rel=0.03) and bh == pytest.approx(want_h, rel=0.03), (
+        f"the holder is {bw:.0f}x{bh:.0f}; an aspect fit of a {a:.3f} footprint into "
+        f"{avail_w:.0f}x{avail_h:.0f} is {want_w:.0f}x{want_h:.0f}")
+    assert bw <= avail_w + 1 and bh <= avail_h + 1, "the fit must not overflow the canvas"
+
+
+def test_ima262_a_press_and_hold_at_a_regions_centre_magnifies_that_regions_centre(
+        qapp, open_tissue):
+    """THE HIT-TEST BUG: _loupe_geometry still assumed UNIFORM cd-sized cells at (ax + ci*cd).
+
+    IMA-253 made a freeform cell its own rectangle and converted _fov_at, but the loupe was
+    missed, so the fraction-within-cell it computes was taken against the wrong box. Measured on
+    the parent commit, pressing at the dead centre of a region gave fx=fy=0.437 for manual0 and
+    0.556 for manual1 instead of 0.5 -- the loupe magnified a point ~6% of a cell from where the
+    user pressed, in OPPOSITE directions for the two regions.
+    """
+    ov = open_tissue()._overview
+    assert ov._loupe_src is not None, "the loupe must be armed for this test to mean anything"
+    for rc, region in sorted(ov._by_rc.items()):
+        x, y, w, h = ov._cell_rect(*rc)
+        px, py = int(x + w / 2), int(y + h / 2)
+        geo = ov._loupe_geometry(px, py)
+        assert geo is not None, f"{region}: its own centre must be on the loupe"
+        well, level, (y0, x0, ch, cw), _s, _m = geo
+        assert well == region
+        span = max(1, ov._loupe_src.well_px >> level)
+        fy, fx = (y0 + ch / 2) / span, (x0 + cw / 2) / span
+        # The press point is an INTEGER pixel, so the expectation is the fraction that pixel
+        # really is across the cell -- not a nominal 0.5. On the fitted carrier a cell is ~23 px,
+        # where one screen pixel is 4% of it, and demanding an exact 0.5 would be asserting that
+        # the mouse can land on a fractional pixel. Tolerance is one screen pixel, expressed as a
+        # fraction of the cell; the defect being caught was 6%, several times larger.
+        want_x, want_y = (px - x) / w, (py - y) / h
+        tol = 1.0 / min(w, h)
+        assert fx == pytest.approx(want_x, abs=tol), \
+            f"{region}: crop centre x is {fx:.3f}, but the press was {want_x:.3f} across the cell"
+        assert fy == pytest.approx(want_y, abs=tol), \
+            f"{region}: crop centre y is {fy:.3f}, but the press was {want_y:.3f} down the cell"
+
+
+def test_ima262_clicking_BETWEEN_the_two_tissues_resolves_the_nearer_region(qapp, open_tissue):
+    """"Clicking between regions ... is not working well" -- literally: the gap was dead.
+
+    The two mosaics are separated by a real 2308 um stage gap, which renders as a band of bare
+    holder. On the parent commit a click there returned None, so nothing happened and the user
+    clicked again. A click on the HOLDER now resolves to the nearest region.
+    """
+    ov = open_tissue()._overview
+    r0 = ov._cell_rect(*next(k for k, v in ov._by_rc.items() if v == "manual0"))
+    r1 = ov._cell_rect(*next(k for k, v in ov._by_rc.items() if v == "manual1"))
+    gap = r1[1] - (r0[1] + r0[3])
+    assert gap > 2, f"there must BE a gap between the two mosaics to click in, got {gap:.1f} px"
+    gx, gy = int(r0[0] + r0[2] / 2), int(r0[1] + r0[3] + gap * 0.25)
+    hit = ov._cell(gx, gy)
+    assert hit is not None and hit["well_id"] == "manual0", \
+        f"a click at ({gx},{gy}), just under manual0, resolved to {hit and hit['well_id']!r}"
+    gx2, gy2 = int(r1[0] + r1[2] / 2), int(r1[1] - gap * 0.25)
+    hit2 = ov._cell(gx2, gy2)
+    assert hit2 is not None and hit2["well_id"] == "manual1", \
+        f"a click at ({gx2},{gy2}), just above manual1, resolved to {hit2 and hit2['well_id']!r}"
+
+
+def test_ima262_a_real_double_click_on_each_tissue_opens_THAT_tissue(qapp, open_tissue):
+    """Drive QTest, not the handler: a click at a SCREEN POINT must open the region under it."""
+    from PyQt5.QtCore import QPoint
+    from PyQt5.QtTest import QTest
+
+    ov = open_tissue()._overview
+    seen: list = []
+    ov.wellActivated.connect(seen.append)
+    for rc, region in sorted(ov._by_rc.items()):
+        x, y, w, h = ov._cell_rect(*rc)
+        seen.clear()
+        QTest.mouseDClick(ov, Qt.LeftButton, Qt.NoModifier,
+                          QPoint(int(x + w / 2), int(y + h / 2)))
+        qapp.processEvents()
+        assert seen == [region], f"double-clicking {region}'s own pixels opened {seen}"
+
+
+def test_ima262_clicking_OFF_the_holder_still_resolves_nothing(qapp, open_tissue):
+    """The nearest-region fallback is BOUNDED by the holder. Off the carrier is still a miss --
+    otherwise every stray click in the pane margin would open a tissue."""
+    ov = open_tissue()._overview
+    bx, by, bw, bh = _carrier_body_px(ov)
+    assert ov._cell(int(bx - 14), int(by + bh / 2)) is None, "left of the holder is not a region"
+    assert ov._cell(int(bx + bw / 2), int(by - 14)) is None, "above the holder is not a region"
+    assert ov._cell(int(bx + bw + 14), int(by + bh / 2)) is None, "right of the holder is not one"
+
+
+def test_ima262_a_well_plate_is_untouched_by_the_carrier_fit(qapp, stub_detail, tmp_path):
+    """The freeform carrier fit must not leak into the uniform grid every well plate is.
+
+    A 2x2 plate has no cell_layout, so its cells stay square and its fit stays the historical
+    nc/nr one. This is the regression guard for the shared _fit path.
+    """
+    plate = Path("/Users/julioamaragall/Downloads/synthetic_2x2_wellplate")
+    if not plate.is_dir():
+        pytest.skip("synthetic 2x2 wellplate not present")
+    win = V.PlateWindow(None)
+    try:
+        win.resize(1600, 900)
+        win.show()
+        qapp.processEvents()
+        win.ingest(str(plate))
+        assert _drain_until(qapp, lambda: win._preview is None or not win._preview.isRunning(), 180)
+        ov = win._overview
+        assert ov._layout is None, "a well plate must keep the uniform grid"
+        r00 = ov._cell_rect(0, 0)
+        assert r00[2] == pytest.approx(r00[3]), f"a well cell must stay SQUARE, got {r00}"
+        assert r00[2] == pytest.approx(ov._cd), "a well cell must be exactly cd across"
+    finally:
+        win._stop_worker()
+        win.close()
+        win.deleteLater()
+        qapp.processEvents()
+
+
+def test_ima262_a_double_click_navigates_the_detail_view_with_the_region_id_VERBATIM(
+        qapp, open_tissue):
+    """The click must actually REACH the detail viewer, carrying the region's own id.
+
+    ``activate_well`` used to split the id with ``parse_well_id`` and re-join the halves inside a
+    bare ``except Exception: pass``. Measured: on THIS acquisition that round trip is the identity
+    (``manual0 -> ("manual", "0") -> "manual0"``), so the tissue set navigated correctly and the
+    reported "the detail viewer is never navigated on the tissue set" does not reproduce. This
+    test pins the behaviour that was already right so the verbatim rewrite cannot regress it.
+    """
+    win = open_tissue()
+    ov = win._overview
+    from PyQt5.QtCore import QPoint
+    from PyQt5.QtTest import QTest
+
+    win._detail.nav.clear()
+    rc = next(k for k, v in ov._by_rc.items() if v == "manual1")
+    x, y, w, h = ov._cell_rect(*rc)
+    QTest.mouseDClick(ov, Qt.LeftButton, Qt.NoModifier, QPoint(int(x + w / 2), int(y + h / 2)))
+    qapp.processEvents()
+    assert win._detail.nav and win._detail.nav[-1][0] == "manual1", \
+        f"the detail view was navigated with {win._detail.nav!r}, not 'manual1'"
+
+
+def test_ima262_a_NON_canonical_region_id_still_navigates_instead_of_failing_silently(
+        qapp, open_tissue):
+    """THE REAL half of the parse_well_id defect, and its reproduction.
+
+    ``parse_well_id`` asserts ``letters + digits == region``, so it RAISES on any freeform id that
+    is not ``<letters><digits>``: ``region_A``, ``tissue-1``, ``scan 3``, a bare ``manual``. The
+    old call sat in ``except Exception: pass``, so for those acquisitions the detail viewer was
+    never navigated and nothing was said anywhere -- the project's silent-failure shape, sixth
+    instance. On the parent commit ``nav`` stays EMPTY here; the id is now passed through untouched.
+    """
+    win = open_tissue()
+    win._detail.nav.clear()
+    # a freeform id of the shape parse_well_id refuses, wired in the way activate_well needs
+    bad = "tissue-1"
+    win._fov_index[bad] = dict(win._fov_index["manual0"], well_id=bad)
+    win._order = list(win._order) + [bad]
+    win._pushed.add(bad)                      # skip the raw push; this is about NAVIGATION
+    win._active_op_key = "stub"               # take the already-pushed branch
+    win.activate_well(bad, 0)
+    assert win._detail.nav and win._detail.nav[-1][0] == bad, (
+        f"a region id parse_well_id cannot split was dropped silently; nav={win._detail.nav!r}, "
+        f"readout={win._readout.text()!r}")

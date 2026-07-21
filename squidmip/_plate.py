@@ -125,12 +125,17 @@ __all__ = [
     "WellPlate",
     "build_plate",
     "carrier_art",
+    "carrier_box_um",
+    "carrier_footprint_um",
+    "carrier_layout",
     "format_from_pitch_um",
     "freeform_grid",
     "freeform_layout",
     "load_sample_formats",
     "measure_region_pitch_um",
     "region_stage_boxes_um",
+    "slot_boxes_um",
+    "slot_layout",
     "squid_images_dir",
 ]
 
@@ -184,6 +189,91 @@ _ART = {
 }
 # Upstream hardcodes the art origin for the two slide holders instead of deriving it from a1.
 _ART_ORIGIN_PX = {GLASS_SLIDE: (200.0, 120.0), FOUR_SLIDE_CARRIER: (50.0, 0.0)}
+
+# The holder's physical OUTLINE, in art pixels (IMA-262). Upstream never writes a footprint down;
+# it writes a background image SIZE and the mm/px that image is drawn at, which is the same fact.
+# The sizes below are the ones in upstream's own filenames, so they are transcribed, not derived:
+#
+#     1509 px x 0.084665 mm/px = 127.76 mm      1010 px x 0.084665 mm/px = 85.51 mm
+#
+# i.e. the ANSI/SLAS 1-2004 microplate footprint (127.76 x 85.48 mm). That is not a coincidence:
+# every Squid holder is built to it, slide carriers included, which is exactly why one background
+# image size serves every well plate AND the 4-up carrier. So the carrier's aspect ratio is
+# 127.76/85.48 = 1.494 -- LANDSCAPE. A holder drawn taller than it is wide is drawn wrong, whatever
+# the acquisition inside it happens to look like.
+#
+#   format -> (art_w_px, art_h_px)
+_ART_SIZE_PX = {
+    GLASS_SLIDE: (828, 662),
+    FOUR_SLIDE_CARRIER: (1509, 1010),
+    "6 well plate": (1509, 1010),
+    "12 well plate": (1509, 1010),
+    "24 well plate": (1509, 1010),
+    "96 well plate": (1509, 1010),
+    "384 well plate": (1509, 1010),
+    "1536 well plate": (1509, 1010),
+}
+
+
+def carrier_footprint_um(format_name) -> tuple[float, float]:
+    """``(width_um, height_um)`` of the holder's physical outline.
+
+    Micrometres, per the module's units invariant. A 4-up slide carrier comes back as
+    ``(127759, 85512)`` -- tens of thousands of um, as a real holder must be.
+    """
+    key = _canonical_format(format_name)
+    if key not in _ART_SIZE_PX or key not in _ART:
+        raise PlateShapeError(f"{format_name!r} has no known holder footprint.")
+    w_px, h_px = _ART_SIZE_PX[key]
+    mm_per_px = _ART[key][1]
+    return (w_px * mm_per_px * 1000.0, h_px * mm_per_px * 1000.0)
+
+
+def carrier_box_um(format_name) -> tuple[float, float, float, float]:
+    """The holder outline as ``(x_um, y_um, w_um, h_um)`` in STAGE coordinates.
+
+    Placing the outline needs its ORIGIN as well as its size. Squid's art transform is
+    ``origin_px = a1_pixel - a1_mm / mm_per_pixel``, and for the two slide holders upstream
+    hardcodes ``origin_px`` outright (:data:`_ART_ORIGIN_PX`) -- it is the art pixel that sits at
+    stage (0, 0). The outline therefore starts at ``-origin_px * mm_per_pixel`` and runs one
+    footprint from there.
+
+    Checked against the real tissue acquisition: this puts the 4-up carrier at stage
+    x -4233..123526, y 0..85512 um, and both of its regions (x 96814..105146, y 10186..29733) land
+    inside it, in the slot whose centre is a1_x + 3*pitch = 95000 um. A footprint that did not
+    contain its own acquisition's stage coordinates would be the first sign this is wrong.
+    """
+    key = _canonical_format(format_name)
+    w_um, h_um = carrier_footprint_um(key)
+    ox_px, oy_px = _ART_ORIGIN_PX.get(key, (0.0, 0.0))
+    mm_per_px = _ART[key][1]
+    return (-ox_px * mm_per_px * 1000.0, -oy_px * mm_per_px * 1000.0, w_um, h_um)
+
+
+# ISO 8037/1: a standard microscope slide is 75 x 25 mm. sample_formats.csv carries the 25 mm as
+# ``cell_size``; the 75 mm length has no column, so it is named here rather than guessed at a call site.
+_SLIDE_LENGTH_UM = 75000.0
+
+
+def slot_boxes_um(geometry: PlateGeometry) -> list[tuple[float, float, float, float]]:
+    """Every SLOT of a slide carrier as ``(x, y, w, h)`` in stage micrometres.
+
+    A slot is one slide. ``cell_size_um`` is the slide's WIDTH (25 mm) and the slots are pitched
+    along x, so the four slots of a 4-up carrier stand SIDE BY SIDE -- which is the structure the
+    holder is supposed to show and the thing the old drawing lost entirely. The slide's LENGTH
+    (75 mm, the ISO 8037 standard) runs along y; it is not in ``sample_formats.csv`` because
+    upstream only ever needed the slot centres, so it is stated here as the standard it is.
+    """
+    length_um = _SLIDE_LENGTH_UM
+    out = []
+    for r in range(geometry.rows):
+        for c in range(geometry.cols):
+            cx = geometry.a1_x_um + c * geometry.pitch_x_um
+            cy = geometry.a1_y_um + r * geometry.pitch_y_um
+            out.append((cx - geometry.cell_size_um / 2.0, cy - length_um / 2.0,
+                        geometry.cell_size_um, length_um))
+    return out
+
 
 # Fractional slack when matching a measured pitch to a standard one. The closest pair of standard
 # pitches is 96wp/384wp at 2.0x apart, so 5% is loose enough for stage noise and nowhere near
@@ -590,7 +680,9 @@ class SlideCarrier(Plate):
 
     def __init__(self, geometry, occupancy=None, cell_ids: Optional[Iterable[str]] = None,
                  placement: Optional[Mapping[str, tuple]] = None,
-                 layout: Optional[Mapping[str, tuple]] = None, **kw):
+                 layout: Optional[Mapping[str, tuple]] = None,
+                 carrier_rect: Optional[tuple] = None,
+                 slot_rects: Optional[Sequence[tuple]] = None, **kw):
         """*placement* / *layout* carry the GEOMETRIC assignment (IMA-253).
 
         ``placement`` is ``{region: (row, col)}`` derived from stage coordinates by
@@ -617,6 +709,11 @@ class SlideCarrier(Plate):
         self._pos = {cid: i for i, cid in enumerate(self._ids)}
         self._layout = {str(k): tuple(float(v) for v in val)
                         for k, val in (layout or {}).items()} or None
+        # IMA-262: the HOLDER's own rectangle, in the same grid units as ``_layout``, and its slot
+        # rectangles. Both None/empty on the union-fit fallback, where there is no absolute origin
+        # to place a holder outline against and the honest thing is to draw no holder.
+        self._carrier_rect = tuple(float(v) for v in carrier_rect) if carrier_rect else None
+        self._slot_rects = [tuple(float(v) for v in r) for r in (slot_rects or ())]
         super().__init__(geometry, occupancy, **kw)
 
     @classmethod
@@ -625,6 +722,14 @@ class SlideCarrier(Plate):
 
     def cell_layout(self):
         return dict(self._layout) if self._layout else None
+
+    def carrier_rect(self):
+        """The holder outline in GRID UNITS, or None when it could not be placed (IMA-262)."""
+        return self._carrier_rect
+
+    def slot_rects(self):
+        """The holder's slide slots in GRID UNITS -- four, side by side, on a 4-up carrier."""
+        return list(self._slot_rects)
 
     def _sole(self, axis: int, i: int) -> Optional[str]:
         """The id of the ONLY real region on row/column *i*, or None when it is not unique."""
@@ -758,6 +863,49 @@ def freeform_layout(boxes_um: Mapping[str, tuple], rows: int, cols: int
     ox, oy = (cols - uw * s) / 2.0, (rows - uh * s) / 2.0
     return {r: (ox + (b[0] - x0) * s, oy + (b[1] - y0) * s, b[2] * s, b[3] * s)
             for r, b in boxes_um.items()}
+
+
+def carrier_layout(boxes_um: Mapping[str, tuple], carrier_um: tuple, rows: int
+                   ) -> tuple[Optional[tuple], dict[str, tuple]]:
+    """``(carrier_rect, {region: rect})`` in GRID UNITS -- the HOLDER and its regions, one transform.
+
+    This is :func:`freeform_layout`'s replacement for the drawn holder (IMA-262). The difference is
+    only in WHAT box is fitted, and it is the whole defect: ``freeform_layout`` fits the union of
+    the region boxes, so a 2x1 cluster of tissues emitted a tall 1x2 canvas and the holder was
+    drawn as that sliver. Here the fitted box is the holder's real footprint, and the regions are
+    placed at their true stage offsets INSIDE it. The tissue set's mosaics therefore stay exactly
+    where the stage put them -- stacked in y, overlapping in x, in slot 4 -- while the holder
+    around them becomes the 127.76 x 85.48 mm landscape rectangle it physically is.
+
+    One grid unit is one grid ROW, so the holder is ``rows`` units tall and ``rows * aspect`` wide.
+    Keeping the unit tied to a row is what lets ``_cd`` go on meaning roughly "pixels per cell" for
+    the callers that still read it that way.
+
+    Returns ``(None, {})`` when the regions do not lie inside the footprint. That is not a rounding
+    question: it means this acquisition's stage origin is not the one the vendored art assumes, and
+    drawing it anyway would put the mosaics off the edge of their own holder. The caller falls back
+    to the union fit, which is always self-consistent even when the absolute origin is unknown.
+    """
+    cx, cy, cw, ch = (float(v) for v in carrier_um)
+    if not (cw > 0 and ch > 0) or not boxes_um:
+        return None, {}
+    for b in boxes_um.values():
+        if not (cx <= b[0] and b[0] + b[2] <= cx + cw and cy <= b[1] and b[1] + b[3] <= cy + ch):
+            return None, {}
+    s = float(rows) / ch
+    return ((0.0, 0.0, cw * s, ch * s),
+            {r: ((b[0] - cx) * s, (b[1] - cy) * s, b[2] * s, b[3] * s)
+             for r, b in boxes_um.items()})
+
+
+def slot_layout(geometry: PlateGeometry, carrier_um: tuple, rows: int) -> list[tuple]:
+    """The carrier's SLOTS in the same grid units :func:`carrier_layout` returns."""
+    cx, cy, _cw, ch = (float(v) for v in carrier_um)
+    if not ch > 0:
+        return []
+    s = float(rows) / ch
+    return [((x - cx) * s, (y - cy) * s, w * s, h * s)
+            for (x, y, w, h) in slot_boxes_um(geometry)]
 
 
 # --------------------------------------------------------------------------- measurement
@@ -930,11 +1078,26 @@ def _make(name, regions, fovs_per_region, stage_boxes=None, **kw) -> Plate:
         # where the regions physically are, not from the vendored holder's slot count, because the
         # slot count is exactly the thing that was inventing "side by side in columns 0 and 1".
         placement = layout = None
+        carrier_rect = None
+        slot_rects: list = []
         if stage_boxes and len(stage_boxes) == n:
             rows, cols, placement = freeform_grid(stage_boxes)
-            layout = freeform_layout(stage_boxes, rows, cols)
+            # IMA-262: place the regions on the HOLDER, at their true stage offsets, so the drawn
+            # carrier is the real 127.76 x 85.48 mm landscape footprint instead of the bounding box
+            # of whatever the clustering emitted (which for the tissue set was a tall 2x1 sliver).
+            # The clustered (rows, cols) still decide the cell KEYS -- that part was never wrong.
+            slot_geom = PlateGeometry.vendored(name)
+            carrier_rect, layout = carrier_layout(stage_boxes, carrier_box_um(name), rows)
+            if carrier_rect is not None:
+                slot_rects = slot_layout(slot_geom, carrier_box_um(name), rows)
+            else:
+                # The regions do not sit inside the vendored footprint, so this acquisition's
+                # stage origin is not the one the art assumes. Fall back to the self-consistent
+                # union fit and draw NO holder rather than one the mosaics hang off the edge of.
+                layout = freeform_layout(stage_boxes, rows, cols)
             if not layout:                          # degenerate geometry -> keep the nominal grid
-                placement = None
+                placement = carrier_rect = None
+                slot_rects = []
             else:
                 geom = PlateGeometry(**{**vars(geom), "rows": rows, "cols": cols})
         if placement is None and n > geom.rows * geom.cols:
@@ -942,5 +1105,6 @@ def _make(name, regions, fovs_per_region, stage_boxes=None, **kw) -> Plate:
             # this, and carrier_art() will correctly return None instead of a wrong-scale PNG.
             geom = PlateGeometry(**{**vars(geom), "cols": n})
         return SlideCarrier(geom, occupancy, cell_ids=list(regions), placement=placement,
-                            layout=layout, format_name=geom.name, **kw)
+                            layout=layout, carrier_rect=carrier_rect, slot_rects=slot_rects,
+                            format_name=geom.name, **kw)
     return WellPlate(PlateGeometry.vendored(name), occupancy, format_name=name, **kw)

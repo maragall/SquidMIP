@@ -565,3 +565,98 @@ def test_real_tissue_regions_are_stacked_in_y_and_overlap_in_x():
     p = build_plate(md)
     assert (p.rows, p.cols) == (2, 1)
     assert p.cell_index("manual0") == (0, 0) and p.cell_index("manual1") == (1, 0)
+
+
+# ============================================================================ IMA-262
+# The holder's own geometry: a footprint, an origin, and slots. See the IMA-262 block in
+# tests/test_viewer.py for the diagnosis these pin.
+
+def test_ima262_the_carrier_footprint_is_the_ANSI_SLAS_microplate_footprint():
+    """127.76 x 85.48 mm, and LANDSCAPE. Derived from upstream's own art size x its mm/px."""
+    from squidmip._plate import FOUR_SLIDE_CARRIER, carrier_footprint_um
+
+    w_um, h_um = carrier_footprint_um(FOUR_SLIDE_CARRIER)
+    assert w_um == pytest.approx(127760, rel=0.001), f"width is {w_um} um"
+    assert h_um == pytest.approx(85480, rel=0.001), f"height is {h_um} um"
+    assert w_um > h_um, "a slide carrier is WIDER than it is tall"
+    assert w_um / h_um == pytest.approx(1.494, rel=0.005)
+    # units invariant: a holder is tens of thousands of um. Tens would be a 1000x bug.
+    assert w_um > 10000 and h_um > 10000
+
+
+def test_ima262_the_carrier_box_CONTAINS_the_real_acquisitions_stage_coordinates():
+    """The footprint is only right if the acquisition's own stage boxes fall inside it.
+
+    This is the check that would catch a wrong origin or a mm/um slip: a holder that does not
+    contain its own regions is not the holder they were imaged in.
+    """
+    from squidmip import open_reader
+    from squidmip._plate import FOUR_SLIDE_CARRIER, carrier_box_um, region_stage_boxes_um
+
+    path = Path("/Users/julioamaragall/Downloads/"
+                "test_10x_laser_af_z_stack_2025-10-28_13-40-43.939945 yy")
+    if not path.is_dir():
+        pytest.skip("real tissue acquisition not present")
+    cx, cy, cw, ch = carrier_box_um(FOUR_SLIDE_CARRIER)
+    for region, (x, y, w, h) in region_stage_boxes_um(open_reader(str(path)).metadata).items():
+        assert cx <= x and x + w <= cx + cw, f"{region} is outside the holder in x"
+        assert cy <= y and y + h <= cy + ch, f"{region} is outside the holder in y"
+
+
+def test_ima262_the_four_slots_stand_SIDE_BY_SIDE_along_x():
+    """The structure the old drawing lost. Four 25x75 mm slots, pitched 27 mm along x."""
+    from squidmip._plate import FOUR_SLIDE_CARRIER, PlateGeometry, slot_boxes_um
+
+    slots = slot_boxes_um(PlateGeometry.vendored(FOUR_SLIDE_CARRIER))
+    assert len(slots) == 4
+    assert all(w == pytest.approx(25000) and h == pytest.approx(75000) for _x, _y, w, h in slots)
+    xs = [x for x, _y, _w, _h in slots]
+    assert xs == sorted(xs) and all(b - a == pytest.approx(27000) for a, b in zip(xs, xs[1:])), \
+        f"slots must march along x at the 27 mm pitch, got {xs}"
+    ys = [y for _x, y, _w, _h in slots]
+    assert len(set(ys)) == 1, "all four slots share one row -- that is what side by side MEANS"
+
+
+def test_ima262_carrier_layout_places_the_regions_where_the_STAGE_put_them():
+    """One transform for the holder and its regions, so relative position survives."""
+    from squidmip._plate import carrier_layout
+
+    carrier = (0.0, 0.0, 120000.0, 80000.0)
+    boxes = {"a": (10000.0, 20000.0, 5000.0, 5000.0), "b": (10000.0, 50000.0, 5000.0, 5000.0)}
+    rect, layout = carrier_layout(boxes, carrier, rows=2)
+    assert rect == pytest.approx((0.0, 0.0, 2 * 120000 / 80000, 2.0))
+    # same x, b lower in y -- exactly as the stage says
+    assert layout["a"][0] == pytest.approx(layout["b"][0])
+    assert layout["b"][1] > layout["a"][1]
+    # and the ratio of the y offsets is preserved by the single scale
+    assert layout["b"][1] / layout["a"][1] == pytest.approx(50000 / 20000)
+
+
+def test_ima262_carrier_layout_REFUSES_regions_that_fall_outside_the_footprint():
+    """Fail to a self-consistent fallback rather than draw mosaics hanging off their own holder.
+
+    A region outside the footprint means this acquisition's stage origin is not the one the
+    vendored art assumes. Returning None is what makes build_plate fall back to the union fit.
+    """
+    from squidmip._plate import carrier_layout
+
+    carrier = (0.0, 0.0, 120000.0, 80000.0)
+    rect, layout = carrier_layout({"a": (119000.0, 10000.0, 5000.0, 5000.0)}, carrier, rows=1)
+    assert rect is None and layout == {}
+
+
+@pytest.mark.skipif(not (Path.home() / "Downloads" /
+                         "test_10x_laser_af_z_stack_2025-10-28_13-40-43.939945 yy").is_dir(),
+                    reason="real tissue acquisition not present")
+def test_ima262_a_freeform_plate_exposes_a_landscape_carrier_rect():
+    """End to end through build_plate: the holder the viewer will draw is landscape."""
+    from squidmip.reader import open_reader
+
+    md = open_reader(Path.home() / "Downloads" /
+                     "test_10x_laser_af_z_stack_2025-10-28_13-40-43.939945 yy").metadata
+    plate = build_plate(md)
+    rect = plate.carrier_rect()
+    assert rect is not None, "the tissue carrier must be placeable"
+    assert rect[2] > rect[3], f"the carrier must be landscape, got {rect}"
+    assert rect[2] / rect[3] == pytest.approx(1.494, rel=0.005)
+    assert len(plate.slot_rects()) == 4

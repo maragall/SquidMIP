@@ -1343,7 +1343,8 @@ class PlateOverview(QWidget):
                                            # at a time and deliberately does NOT fire it — otherwise
                                            # every corrective click spawns another tab.
 
-    def __init__(self, rows, cols, wells: dict, layout: Optional[dict] = None):
+    def __init__(self, rows, cols, wells: dict, layout: Optional[dict] = None,
+                 carrier_rect: Optional[tuple] = None, slots: Optional[list] = None):
         """``wells``: (row_index, col_index) -> well_id for every acquired well (drawn grey until
         processed). Tiles/status arrive as an operator runs.
 
@@ -1353,11 +1354,19 @@ class PlateOverview(QWidget):
         uniform grid every well plate is, and keeps the single-blit fast path a 1536-well plate
         needs. Cells absent from the map fall back to their nominal ``(c, r, 1, 1)`` square, which
         is what an EMPTY slot (no stage coordinates to place it by) can honestly be drawn as.
+
+        ``carrier_rect`` / ``slots`` (IMA-262) are the HOLDER's own rectangle and its slide slots,
+        in those same grid units. When present the view FITS THE HOLDER rather than the grid, which
+        is what makes a slide carrier render as the 127.76 x 85.48 mm landscape rectangle it is
+        instead of the bounding box of whichever cells happened to be acquired. ``None`` keeps the
+        historical ``nc x nr`` fit that every well plate uses.
         """
         super().__init__()
         self._rows, self._cols = list(rows), list(cols)
         self._layout: Optional[dict] = ({tuple(k): tuple(float(v) for v in val)
                                          for k, val in layout.items()} if layout else None)
+        self._carrier_rect = tuple(float(v) for v in carrier_rect) if carrier_rect else None
+        self._slots = [tuple(float(v) for v in r) for r in (slots or ())]
         self._nr, self._nc = len(self._rows), len(self._cols)
         self._by_rc: dict[tuple, str] = dict(wells)            # every acquired well (for status + hit-test)
         self._status: dict[tuple, str] = {rc: "empty" for rc in wells}
@@ -1476,13 +1485,27 @@ class PlateOverview(QWidget):
         c = self._cell(x, y)
         if src is None or not c or not c["well_id"]:
             return None
-        s_loupe, mag = loupe_scale(self._cd, src.well_px)
+        # The plate's scale is THIS CELL's on-screen size over its image px -- not ``_cd``, which
+        # is a grid unit. On a well plate the two are the same number and nothing changes. On a
+        # freeform carrier drawn at its true footprint (IMA-262) they differ by 6x (a 23 px mosaic
+        # inside a 135 px grid unit), and feeding the grid unit in would overstate the plate scale
+        # by that factor -- so the loupe would under-magnify and then REPORT a magnification it was
+        # not delivering, which is the one thing IMA-263 must not do.
+        rx, ry, rw, rh = self._cell_rect(c["row_index"], c["col_index"])
+        cell_px = max(2.0, min(rw, rh))
+        s_loupe, mag = loupe_scale(cell_px, src.well_px)
         level = loupe_level(s_loupe, src.n_levels)
         crop = loupe_crop_px(s_loupe, level)
-        # cursor -> position within the cell -> image px at level 0 -> image px at ``level``
-        ax, ay = self._ox + _HDR, self._oy + _COLH
-        fy = (y - (ay + c["row_index"] * self._cd)) / max(1e-9, self._cd)
-        fx = (x - (ax + c["col_index"] * self._cd)) / max(1e-9, self._cd)
+        # cursor -> position within the cell -> image px at level 0 -> image px at ``level``.
+        #
+        # Against the cell's OWN rectangle (IMA-262). This used to read (ax + ci*cd, cd, cd), the
+        # uniform-grid cell -- which IMA-253 stopped being true for a freeform holder, where a cell
+        # is its mosaic's bounding box at its own offset and its own size. `_fov_at` was converted
+        # then and this was missed, so pressing at the dead centre of a region resolved to 0.437 of
+        # the way across it for manual0 and 0.556 for manual1: the loupe magnified a point several
+        # percent of a cell from the one under the finger, in opposite directions per region.
+        fx = (x - rx) / max(1e-9, rw)
+        fy = (y - ry) / max(1e-9, rh)
         span = max(1, src.well_px >> level)
         cy, cx = int(fy * span), int(fx * span)
         # Clamp HERE as well as in the source. Two reasons beyond belt-and-braces: the request
@@ -1540,18 +1563,57 @@ class PlateOverview(QWidget):
         self._loupe_img, self._loupe_note = img, ""
         self.update()
 
+    def _extent(self) -> tuple:
+        """``(width, height)`` of the thing being fitted, in GRID UNITS.
+
+        For a well plate that is the grid itself, ``(nc, nr)`` -- unchanged, forever. For a holder
+        that declares its own outline (IMA-262) it is the HOLDER, which is the whole point: fitting
+        the acquired cells' bounding box is what drew the tissue set's carrier as a tall 115 x 270
+        sliver, because those two mosaics occupy 8 x 20 mm of a 128 x 85 mm carrier and their
+        bounding box says nothing whatever about the shape of the holder they sit in.
+        """
+        if self._carrier_rect is not None:
+            _x, _y, w, h = self._carrier_rect
+            if w > 0 and h > 0:
+                return (w, h)
+        return (float(self._nc), float(self._nr))
+
     def _fit(self):
-        """Reset the view: the whole plate fits the widget, centered (zoom = 1)."""
+        """Reset the view: the whole holder fits the widget, centered (zoom = 1)."""
         if self._nr == 0 or self._nc == 0:
             return
         w, h = self.width(), self.height()
-        self._cd = max(2.0, min((w - _HDR - 2 * _PAD) / self._nc, (h - _COLH - 2 * _PAD) / self._nr))
-        self._ox = max(_PAD, (w - _HDR - self._nc * self._cd) / 2)
-        self._oy = max(_PAD, (h - _COLH - self._nr * self._cd) / 2)
+        ew, eh = self._extent()
+        self._cd = self._fit_cd()
+        self._ox = max(_PAD, (w - _HDR - ew * self._cd) / 2)
+        self._oy = max(_PAD, (h - _COLH - eh * self._cd) / 2)
 
     def _fit_cd(self) -> float:
+        """Screen px per grid unit at zoom 1: ONE scale for both axes, so aspect is preserved."""
         w, h = self.width(), self.height()
-        return max(2.0, min((w - _HDR - 2 * _PAD) / self._nc, (h - _COLH - 2 * _PAD) / self._nr))
+        ew, eh = self._extent()
+        return max(2.0, min((w - _HDR - 2 * _PAD) / ew, (h - _COLH - 2 * _PAD) / eh))
+
+    def carrier_body_rect(self) -> tuple:
+        """The holder outline in WIDGET px at the current zoom/pan.
+
+        One place computes it, so the painter, the hit-test bound and the tests cannot disagree
+        about where the holder is. Falls back to the union of the cell rects for a holder that
+        declares no outline (and for a well plate, whose body has always been that union).
+        """
+        cd = self._cd
+        ax, ay = self._ox + _HDR, self._oy + _COLH
+        if self._carrier_rect is not None:
+            x, y, w, h = self._carrier_rect
+            return (ax + x * cd, ay + y * cd, w * cd, h * cd)
+        rects = [self._cell_rect(r, c) for r in range(self._nr) for c in range(self._nc)]
+        if not rects:
+            return (ax, ay, 0.0, 0.0)
+        bx0 = min(r[0] for r in rects)
+        by0 = min(r[1] for r in rects)
+        bx1 = max(r[0] + r[2] for r in rects)
+        by1 = max(r[1] + r[3] for r in rects)
+        return (bx0, by0, bx1 - bx0, by1 - by0)
 
     def _canvas_for(self, layer: str) -> QImage:
         if layer == "raw":
@@ -1918,10 +1980,40 @@ class PlateOverview(QWidget):
         for rc in list(reversed(placed)) + [rc for rc in self._by_rc if rc not in self._layout]:
             rx, ry, rw, rh = self._cell_rect(*rc)
             if rx <= x < rx + rw and ry <= y < ry + rh:
-                ri, ci = rc
-                return {"row_index": ri, "col_index": ci, "row": self._rows[ri],
-                        "col": self._cols[ci], "well_id": self._by_rc.get(rc)}
-        return None
+                return self._cell_info(rc)
+        return self._nearest_on_carrier(x, y)
+
+    def _cell_info(self, rc) -> dict:
+        ri, ci = rc
+        return {"row_index": ri, "col_index": ci, "row": self._rows[ri],
+                "col": self._cols[ci], "well_id": self._by_rc.get(rc)}
+
+    def _nearest_on_carrier(self, x, y):
+        """A click on the HOLDER but not on a mosaic resolves to the NEAREST region (IMA-262).
+
+        "Clicking between regions is not working well" was literal: the tissue set's two mosaics
+        are separated by a real 2308 um stage gap, and a click in the band between them hit no
+        rectangle and returned None, so nothing happened and the user clicked again. Two tiny
+        targets in a large holder is a lot of dead pixels.
+
+        BOUNDED BY THE HOLDER, deliberately. Off the carrier is still a miss -- otherwise a stray
+        click anywhere in the pane margin would open a tissue, which is a worse failure than the
+        one being fixed. A holder that declares no outline gets no fallback at all, because
+        without an outline "on the carrier" has no meaning.
+        """
+        if self._carrier_rect is None or not self._by_rc:
+            return None
+        bx, by, bw, bh = self.carrier_body_rect()
+        if not (bx <= x < bx + bw and by <= y < by + bh):
+            return None
+
+        def _d2(rc):
+            rx, ry, rw, rh = self._cell_rect(*rc)
+            dx = max(rx - x, 0.0, x - (rx + rw))      # 0 inside the span, else the gap to it
+            dy = max(ry - y, 0.0, y - (ry + rh))
+            return dx * dx + dy * dy
+
+        return self._cell_info(min(sorted(self._by_rc), key=_d2))
 
     def _cells_in(self, x0, y0, x1, y1) -> list:
         """Widget px -> acquired cells, via the pure helper (same margin removal as _cell)."""
@@ -2390,20 +2482,38 @@ class PlateOverview(QWidget):
             return
         cd = self._cd
         ax, ay = self._ox + _HDR, self._oy + _COLH
-        # The holder BODY: the union of every cell rectangle, padded by the margin the geometry
-        # implies (half a pitch beyond the outer cell centres on a well plate).
-        rects = [self._cell_rect(r, c) for r in range(self._nr) for c in range(self._nc)]
-        if not rects:
-            return
-        bx0 = min(r[0] for r in rects)
-        by0 = min(r[1] for r in rects)
-        bx1 = max(r[0] + r[2] for r in rects)
-        by1 = max(r[1] + r[3] for r in rects)
-        pad = max(4.0, cd * 0.18)
-        body = QRectF(bx0 - pad, by0 - pad, (bx1 - bx0) + 2 * pad, (by1 - by0) + 2 * pad)
+        # The holder BODY. When the holder declares its own outline (IMA-262) that outline IS the
+        # body, at its true footprint and aspect, and no padding is invented around it. Otherwise
+        # it is the union of every cell rectangle padded by the margin the geometry implies (half a
+        # pitch beyond the outer cell centres on a well plate) -- the historical well-plate body.
+        if self._carrier_rect is not None:
+            bx, by, bw, bh = self.carrier_body_rect()
+            if not (bw > 0 and bh > 0):
+                return
+            body = QRectF(bx, by, bw, bh)
+            pad = max(4.0, cd * 0.18)
+        else:
+            rects = [self._cell_rect(r, c) for r in range(self._nr) for c in range(self._nc)]
+            if not rects:
+                return
+            bx0 = min(r[0] for r in rects)
+            by0 = min(r[1] for r in rects)
+            bx1 = max(r[0] + r[2] for r in rects)
+            by1 = max(r[1] + r[3] for r in rects)
+            pad = max(4.0, cd * 0.18)
+            body = QRectF(bx0 - pad, by0 - pad, (bx1 - bx0) + 2 * pad, (by1 - by0) + 2 * pad)
         p.setBrush(QColor(28, 32, 40))
         p.setPen(QPen(QColor(90, 100, 116), 2))
         p.drawRoundedRect(body, min(10.0, pad), min(10.0, pad))
+        # The SLOTS: where a slide goes. Four of them, side by side, on a 4-up carrier -- this is
+        # the structure the old drawing lost, and it is what tells the user at a glance that the
+        # tissue they are looking at sits on one slide of a holder that takes four.
+        if self._slots:
+            p.setPen(QPen(QColor(74, 84, 100), 1, Qt.DashLine))
+            p.setBrush(Qt.NoBrush)
+            for sx, sy, sw, sh in self._slots:
+                r = QRectF(ax + sx * cd, ay + sy * cd, sw * cd, sh * cd)
+                p.drawRoundedRect(r.intersected(body), 3.0, 3.0)
         # An orientation cue instead of a picture of one: the A1 / first-slot corner is chamfered,
         # the way a real plate's notched corner reads.
         p.setPen(QPen(QColor(120, 132, 150), 2))
@@ -4535,7 +4645,13 @@ class PlateWindow(QMainWindow):
         # returns None here and keeps the uniform grid it has always had.
         cl = plate.cell_layout() if hasattr(plate, "cell_layout") else None
         layout = ({plate.cell_index(cid): rect for cid, rect in cl.items()} if cl else None)
-        self._overview = PlateOverview(rows, cols, wells, layout=layout)
+        # IMA-262: the holder's own outline and slots, in the SAME grid units as `layout`, so the
+        # view can fit the CARRIER instead of the acquired cells' bounding box. A well plate has
+        # neither and keeps the uniform nc x nr fit it has always had.
+        carrier_rect = plate.carrier_rect() if hasattr(plate, "carrier_rect") else None
+        slots = plate.slot_rects() if hasattr(plate, "slot_rects") else None
+        self._overview = PlateOverview(rows, cols, wells, layout=layout,
+                                       carrier_rect=carrier_rect, slots=slots)
         # Carrier art behind the cells (IMA-220). Hand over the PLATE, not its name: `plate` is what
         # build_plate RESOLVED (measured pitch beat the 2x2's mis-declared "384 well plate"), so the
         # background can only ever be drawn at the same scale the grid is laid out at.
@@ -5277,11 +5393,7 @@ class PlateWindow(QMainWindow):
         if self._overview is not None:                 # current well at view = the red BOX
             self._overview.select(*self._fov_index[well_id]["rc"])
         if self._active_op_key is not None or self._reader is None:   # processed/computed: already pushed
-            try:
-                row, col = parse_well_id(well_id)
-                self._detail.go_to_well_fov(f"{row}{col}", fov_index)
-            except Exception:
-                pass
+            self._navigate_detail(well_id, fov_index)
             return
         if well_id not in self._pushed:
             fov = self._meta["fovs_per_region"][well_id][0]
@@ -5293,13 +5405,34 @@ class PlateWindow(QMainWindow):
                     except (KeyError, IndexError, OSError, RuntimeError):
                         continue   # a genuinely-missing plane / closed viewer shouldn't block the rest
             self._pushed.add(well_id)
+        self._navigate_detail(well_id, fov_index)
+
+    def _navigate_detail(self, well_id: str, fov_index: int):
+        """Point the detail viewer at *well_id*, passing the region id VERBATIM.
+
+        It used to run the id through ``parse_well_id`` and re-join the halves, inside a bare
+        ``except Exception: pass``. The re-join is a no-op by construction -- ``parse_well_id``
+        asserts ``letters + digits == region`` and raises otherwise -- so the parse could only ever
+        return the string it was given, or raise. On the tissue set it returns
+        ``("manual", "0") -> "manual0"``, i.e. the round trip is the identity and the tissue set
+        navigated correctly; the claim that this silently broke the demo set does not survive
+        measurement.
+
+        It DID silently break every other freeform id. ``region_A``, ``tissue-1``, ``scan 3`` and
+        a bare ``manual`` are not ``<letters><digits>``, so the parse raised, the bare except ate
+        it, and the detail viewer was never navigated with no message anywhere -- the project's
+        silent-failure shape again. Passing the id through untouched removes the failure mode
+        rather than widening the parser: a freeform region genuinely has no row and column, and
+        inventing one is how "a region is a FOV" got in originally. The labels the detail viewer
+        was handed are built from the region id verbatim (``f"{region}:0"``), so verbatim is also
+        the only thing that can match them.
+        """
         try:
-            # Region ids are not necessarily well ids (a slide carrier's are freeform), and this
-            # is only a label for the detail viewer's well/FOV combo -- never worth raising over.
-            row, col = parse_well_id(well_id)
-            self._detail.go_to_well_fov(f"{row}{col}", fov_index)
-        except Exception:
-            pass
+            self._detail.go_to_well_fov(well_id, fov_index)
+        except (AttributeError, KeyError, ValueError, RuntimeError) as e:
+            # A stub/closed viewer or an id the detail pane does not hold. Named exceptions, and
+            # SAID rather than swallowed, so this can never become another silent no-op.
+            self._readout.setText(f"could not open {well_id} in the detail view: {e}")
 
     def _on_fov_slider(self, flat_idx: int):
         """ndviewer FOV slider moved -> move the red box on the plate to that well."""
