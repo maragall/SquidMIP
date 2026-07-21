@@ -58,3 +58,19 @@ so a future session doesn't rediscover it from zero.
 - **Cons:** Different repo, different owner; not on any SquidMIP critical path.
 - **Context:** SquidMIP does **not** carry this bug — IMA-189's `squidmip/_channels.py` already resolves `display_color` correctly (top-level v1.0+ *and* nested `camera_settings`, mapped by name, raises on unresolved), and IMA-184 consumes `metadata.channels[].display_color` rather than re-parsing the yaml. This TODO is purely a flag for whoever owns `~/CEPHLA/projects/explorer/squid2minerva`.
 - **Depends on / blocked by:** squid2minerva maintainer.
+
+## Evaluate `original_coordinates/` as the geometry source → IMA-219 follow-up
+- **What:** Both real acquisitions (`~/Downloads/20x_scan_2025-09-05_17-57-50`, `~/Downloads/synthetic_2x2_wellplate`) ship an `original_coordinates/` directory alongside `coordinates.csv` — planned vs. actual stage positions. Determine whether it is a cleaner input for plate-shape inference than the as-executed `coordinates.csv`.
+- **Why:** IMA-219 infers well pitch from `coordinates.csv`, which records *actual* per-FOV stage positions and therefore carries autofocus drift, backlash, and any operator intervention. Planned coordinates would be exactly on the nominal grid, making pitch matching tighter and the tolerance smaller.
+- **Pros:** Potentially removes the need for a ~5% pitch tolerance; a planned grid is noise-free by construction.
+- **Cons:** Unknown format and unknown guarantee of presence — neither the reader nor any test touches it today. Adding a second geometry source doubles the "which file won" debugging surface.
+- **Context:** Surfaced by the `/plan-eng-review` outside voice on 2026-07-20 and confirmed present in both datasets. IMA-219 measured `coordinates.csv` centroid pitch at exactly 9.000mm on `synthetic_2x2_wellplate`, so the as-executed file is already good enough — this is an optimization, not a fix. Start by diffing `original_coordinates/` against `coordinates.csv` on both datasets to see whether they differ at all.
+- **Depends on / blocked by:** IMA-219 inference landing first, so there is something to compare against.
+
+## Cross-check a declared wellplate_format against inferred geometry → future ticket
+- **What:** When `acquisition.yaml` declares a format AND `coordinates.csv` is present, compute the inferred format anyway and warn on disagreement.
+- **Why:** IMA-219 D1 trusts the declared field unconditionally when present. A stale or hand-edited yaml therefore renders the wrong plate silently, and the ticket's own inference machinery would have caught it. Precedent exists: `reader.py:180-188` already warns when declared Nz/Nt disagrees with the filenames.
+- **Pros:** Reuses inference already built by IMA-219 for near-zero extra cost; catches a silent-wrong-plate class that nothing detects today.
+- **Cons:** Disagreement is *expected* on sparse acquisitions (four wells of a 384-plate legitimately span 2x2), so a naive warning becomes noise. Needs a confidence threshold before it can be enabled.
+- **Context:** Deliberately deferred during the 2026-07-20 eng review to keep IMA-219 to a fallback-only trigger. `sim_1536wp` in `~/CEPHLA/Data` is a live example of the hazard — its `coordinates.csv` spacing does not correspond to its declared "24 well plate".
+- **Depends on / blocked by:** IMA-219 inference + its confidence score.
