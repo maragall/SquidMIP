@@ -1,0 +1,240 @@
+IMA-223 / IMA-224 / IMA-225 — the _viewer.py half
+=================================================
+
+I do not own `squidmip/_viewer.py` (another agent holds it this wave), so the GUI change is
+here rather than applied. Two patches in this stack have already failed to apply after
+_viewer.py moved, so READ THE PROSE FIRST — the diff below is a convenience, the prose is the
+specification. If the diff rejects, hand-apply from the prose; it is two edits and one new
+method.
+
+Verified, not guessed: this exact patch was applied to a scratch copy of _viewer.py at
+493045d, and against it `tests/test_viewer.py` ran 157 passed, plus an added check that opens
+all three new tabs on the `squid_dataset` fixture (1 passed). _viewer.py in the worktree is
+untouched.
+
+WHAT IT ADDS
+------------
+Three operator cards — Deconvolution, Background subtraction, Flat-field correction — each
+opening a PREVIEW-ONLY tab. Nothing else in the viewer changes: the projector selector and the
+CLI already read `available_projectors()`, so the three names appear there with no edit at all
+once `squidmip/__init__.py` imports the operator modules (that part is already committed).
+
+HUNK 1 — three entries in the `_OPERATIONS` tuple (currently ~line 554-565)
+--------------------------------------------------------------------------
+Append three `Operation(...)` records after the existing `minerva` entry, INSIDE the closing
+`)` of the tuple. Nothing else in that region moves.
+
+  * `Operation("decon", "Deconvolution (Richardson-Lucy)", <blurb>, "_build_decon_tab")`
+  * `Operation("bgsub", "Background subtraction", <blurb>, "_build_bgsub_tab")`
+  * `Operation("flatfield", "Flat-field correction", <blurb>, "_build_flatfield_tab")`
+
+The keys MUST be exactly `decon` / `bgsub` / `flatfield` — they are the registry names
+`add_projector` uses in `squidmip/_decon.py`, `_background.py` and `_flatfield.py`, and
+`run_operator` passes the key straight through to the engine. A typo here surfaces as a
+KeyError from `_resolve_projector` at run time, not at import.
+
+A comment above the three entries states WHY they get a different builder from mip/stitch:
+they are plane-ops (`consumes=frozenset()`), so their output keeps z at full depth, and
+`_output._validate_image` accepts Z == 1 only. Saving would fail loud. Loud is the right
+behaviour; offering a Save button that always fails is not.
+
+The console cards, the Process-well-plates menu and `_activate_operator`'s dispatch are all
+already generic over `_OPERATIONS`, so this hunk alone is what makes the three features appear
+in the UI. No dispatch edit anywhere.
+
+HUNK 2 — three thin builders plus one generic `_build_plane_op_tab`, inserted between
+`_build_stitch_tab` and `_build_run_tab` (currently ~line 3174)
+--------------------------------------------------------------------------------------
+Insert, in this order, immediately after `_build_stitch_tab`'s `return` line and immediately
+before `def _build_run_tab(self, op)`:
+
+  a. `_build_decon_tab`  -> `self._build_plane_op_tab(_OPERATIONS_BY_KEY["decon"])`
+  b. `_build_bgsub_tab`  -> `self._build_plane_op_tab(_OPERATIONS_BY_KEY["bgsub"])`
+  c. `_build_flatfield_tab` -> the same, with `profile_chooser=True`. Flat-field is the one
+     plane-op that cannot run without an argument: an illumination profile has no sane default
+     (an identity field would silently do nothing while the UI said "corrected"), so the
+     operator raises until one is loaded, and this flag is what loads it.
+  d. `_build_plane_op_tab(self, op, profile_chooser=False)` — the new generic builder.
+
+`_build_plane_op_tab` is deliberately `_build_run_tab` MINUS its top half. It reuses
+`_op_tab_shell`, `_hline`, `_BTN_QSS`, `_COMBO_QSS`, `QSpinBox`, `QHBoxLayout`,
+`QFileDialog` and `Path` — all already imported at the top of _viewer.py, so this hunk adds no
+import. It contains:
+
+  * (only when `profile_chooser`) a "Load illumination profile (.npy)…" button. It calls
+    `squidmip.FlatfieldProfile.from_npy(path)` — which reads the stitcher's own
+    `save_flatfield` format, so tilefusion profiles load directly — then
+    `squidmip._flatfield.set_profile(profile)`. Two guards, both reporting into the label
+    rather than raising into the event loop: a load failure prints the exception, and a
+    profile whose shape does not match `reader.metadata["frame_shape"]` is REFUSED by name
+    (loading a 2084x2084 profile onto a 3000px acquisition would otherwise raise mid-run, one
+    well at a time). The Preview button stays disabled until a profile is accepted.
+  * the same "First N wells" spinner as `_build_run_tab`, wired to
+    `run_operator(op.key, out_parent=None, regions=self._order[:n], save=False)`.
+  * NO destination picker, NO "Run on the whole plate", NO "Save previews to disk" checkbox —
+    because there is nothing to write yet.
+  * a note telling the user exactly that, plus "The raw acquisition is never modified" (the
+    IMA-224 layer contract, said where the user can see it).
+
+The preview path itself needs NO worker change. `_OperatorWorker`'s `save=False` branch already
+streams `project_plate`, and `_on_well` already does `image[0, :, 0]` — for a plane-op that
+indexes the FIRST z-plane, corrected, which is exactly what a preview should show. The
+`(T, C, Nz, Y, X)` shape flows through untouched.
+
+WHEN THE WRITER LEARNS Z > 1
+----------------------------
+`_build_plane_op_tab` deletes itself: point the three builders at `_build_run_tab` and drop it.
+That is the whole migration, and it is why the preview-only restriction lives in ONE method
+rather than being spread across three tabs.
+
+A TEST TO ADD (tests/test_viewer.py owns the `qapp`/`stub_detail` fixtures, so it belongs
+there, not in my files). This is the one I ran to verify the patch:
+
+    def test_the_three_plane_op_tabs_build(qapp, stub_detail, squid_dataset):
+        from squidmip import available_projectors
+        root, _ = squid_dataset
+        win = V.PlateWindow(None)
+        win.ingest(str(root))
+        for key in ("decon", "bgsub", "flatfield"):
+            assert key in available_projectors()
+            op = V._OPERATIONS_BY_KEY[key]
+            win._open_op_tab(op.key, op.label, getattr(win, op.build_tab))
+            assert key in win._op_tabs
+        win.close()
+
+=====================================================================================
+THE DIFF (against _viewer.py at 493045d; -U6 context)
+=====================================================================================
+--- a/squidmip/_viewer.py
++++ b/squidmip/_viewer.py
+@@ -559,12 +559,27 @@
+               "Register every FOV of a well against its neighbours and fuse one seamless mosaic "
+               "per well, instead of trusting the stage coordinates alone.",
+               "_build_stitch_tab"),
+     Operation("minerva", "Open in Minerva Author",
+               "Export the selected FOVs to Minerva-ingestable OME-TIFFs and open Minerva Author on them.",
+               "_build_minerva_tab"),
++    # IMA-223/224/225 -- the PLANE-OPS. Unlike mip/stitch these keep z at full depth, so they get
++    # _build_plane_op_tab (preview only) rather than _build_run_tab: write_plate's _validate_image
++    # accepts Z == 1 only and would fail LOUD on save. Loud is correct; offering the button is not.
++    Operation("decon", "Deconvolution (Richardson-Lucy)",
++              "Sharpen every plane against the microscope's Gaussian PSF -- iterative Richardson-Lucy, "
++              "no explicit kernel. Keeps the z-stack at full depth.",
++              "_build_decon_tab"),
++    Operation("bgsub", "Background subtraction",
++              "Remove the smooth out-of-focus haze from every plane with a rolling ball (ImageJ's "
++              "algorithm). A LAYER: the raw is untouched on disk and one toggle away.",
++              "_build_bgsub_tab"),
++    Operation("flatfield", "Flat-field correction",
++              "Divide out the objective's illumination profile so the corners match the centre. "
++              "Needs an illumination profile (.npy) from the stitcher or estimated from the plate.",
++              "_build_flatfield_tab"),
+ )
+ _OPERATIONS_BY_KEY = {op.key: op for op in _OPERATIONS}
+ 
+ # Roadmap cards shown under "TO BE ADDED", as (label, blurb). Empty: everything currently on the
+ # roadmap that we're willing to advertise has shipped as a real Operation above. Add an entry when
+ # a next operator (e.g. the Nautilus agent) is close enough to promise.
+@@ -3169,13 +3184,102 @@
+ 
+     def _build_stitch_tab(self) -> QWidget:
+         # IMA-222. Same generic run tab: a region operator differs in WHAT it computes, not in how
+         # the user aims it at a plate or a subset. (The "Save" half is a no-op until write_plate
+         # accepts a region operator -- see _OperatorWorker.run.)
+         return self._build_run_tab(_OPERATIONS_BY_KEY["stitch"])
++
++    def _build_decon_tab(self) -> QWidget:
++        return self._build_plane_op_tab(_OPERATIONS_BY_KEY["decon"])
++
++    def _build_bgsub_tab(self) -> QWidget:
++        return self._build_plane_op_tab(_OPERATIONS_BY_KEY["bgsub"])
++
++    def _build_flatfield_tab(self) -> QWidget:
++        # The one plane-op that cannot run without an argument: a flat-field with no illumination
++        # profile has no sane default (an identity field would silently do nothing while the UI
++        # said "corrected"), so the operator raises until one is loaded. The chooser is that load.
++        return self._build_plane_op_tab(_OPERATIONS_BY_KEY["flatfield"], profile_chooser=True)
++
++    def _build_plane_op_tab(self, op, profile_chooser: bool = False) -> QWidget:
++        """Generic PLANE-OP tab (IMA-223/224/225): preview on a subset, never save.
++
++        A plane-op maps plane -> plane and does NOT consume z (IMA-210), so its output keeps the
++        z-stack at full depth -- and write_plate's _validate_image accepts Z == 1 only. So this
++        builder deliberately omits the "Run on the whole plate" / destination half of
++        _build_run_tab: there is nothing to write yet. The moment the OME-Zarr writer learns
++        Z > 1, this method can simply forward to _build_run_tab and disappear.
++
++        The preview path itself is unchanged and needs no worker edit: _OperatorWorker's save=False
++        branch streams project_plate, and _on_well already indexes image[0, :, 0] -- for a plane-op
++        that is the FIRST z-plane, corrected, which is exactly what a preview should show.
++        """
++        w, v = self._op_tab_shell(op.label, op.blurb)
++        v.addWidget(_hline())
++
++        state = {"profile": None}
++        if profile_chooser:
++            prof_lbl = QLabel("(no illumination profile loaded)")
++            prof_lbl.setWordWrap(True)
++            prof_lbl.setStyleSheet("color:#8b98ad;font-size:12px;")
++
++            def load_profile():
++                path, _ = QFileDialog.getOpenFileName(
++                    self, "Load illumination profile", "", "Illumination profile (*.npy)")
++                if not path:
++                    return
++                from squidmip import FlatfieldProfile
++                from squidmip._flatfield import set_profile
++                try:
++                    profile = FlatfieldProfile.from_npy(path)
++                except Exception as exc:                     # bad file -> say so, keep the tab alive
++                    prof_lbl.setText(f"could not load {Path(path).name}: {exc}")
++                    return
++                frame = tuple(self._reader.metadata["frame_shape"]) if self._reader else None
++                if frame is not None and profile.shape != frame:
++                    prof_lbl.setText(f"profile is {profile.shape}, this acquisition's frames are "
++                                     f"{frame} -- wrong profile for this plate")
++                    return
++                set_profile(profile)
++                state["profile"] = path
++                prof_lbl.setText(f"{Path(path).name}  {profile.shape}")
++                prev.setEnabled(True)
+ 
++            pick_prof = QPushButton("Load illumination profile (.npy)…")
++            pick_prof.setStyleSheet(_BTN_QSS)
++            pick_prof.clicked.connect(load_profile)
++            v.addWidget(pick_prof)
++            v.addWidget(prof_lbl)
++            v.addWidget(_hline())
++
++        prev_lbl = QLabel("Preview (subset)")
++        prev_lbl.setStyleSheet("color:#57606a;font-size:10px;font-weight:800;letter-spacing:1.5px;padding-top:6px;")
++        v.addWidget(prev_lbl)
++        n_wells = max(1, len(self._order))
++        row = QHBoxLayout(); row.setSpacing(6)
++        row.addWidget(QLabel("First"))
++        spin = QSpinBox(); spin.setRange(1, n_wells); spin.setValue(min(4, n_wells))
++        spin.setStyleSheet(_COMBO_QSS)
++        row.addWidget(spin); row.addWidget(QLabel("wells")); row.addStretch(1)
++        v.addLayout(row)
++
++        prev = QPushButton("Preview"); prev.setStyleSheet(_BTN_QSS)
++        prev.setEnabled(not profile_chooser)          # flat-field waits for its profile
++        prev.clicked.connect(
++            lambda: self.run_operator(op.key, out_parent=None,
++                                      regions=self._order[:spin.value()], save=False))
++        v.addWidget(prev)
++
++        note = QLabel("Preview only: this operator keeps the z-stack at full depth, and the "
++                      "OME-Zarr writer accepts one z per field today, so there is nothing to "
++                      "save yet. The raw acquisition is never modified.")
++        note.setWordWrap(True); note.setStyleSheet("color:#8b98ad;font-size:11px;")
++        v.addWidget(note)
++        v.addStretch(1)
++        return w
++
+     def _build_run_tab(self, op) -> QWidget:
+         """Generic projector-operator tab (MIP, …): pick a destination, run over the whole plate → a
+         navigable OME-Zarr plate. ONE builder for every z-reduction operator — a new one needs no new
+         tab code. Per-tab state lives in a closure (no per-operator instance attrs)."""
+         w, v = self._op_tab_shell(op.label, op.blurb + " Pick a destination with room — output can be large.")
+         state = {"dir": None}
