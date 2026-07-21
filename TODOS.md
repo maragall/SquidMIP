@@ -50,3 +50,27 @@ so a future session doesn't rediscover it from zero.
 - **Cons:** Different repo, different owner; not on any SquidMIP critical path.
 - **Context:** SquidMIP does **not** carry this bug — IMA-189's `squidmip/_channels.py` already resolves `display_color` correctly (top-level v1.0+ *and* nested `camera_settings`, mapped by name, raises on unresolved), and IMA-184 consumes `metadata.channels[].display_color` rather than re-parsing the yaml. This TODO is purely a flag for whoever owns `~/CEPHLA/projects/explorer/squid2minerva`.
 - **Depends on / blocked by:** squid2minerva maintainer.
+
+## BaSiC flatfield estimation in-tool → future ticket
+- **What:** Estimate an illumination field from the plate's own tiles (BaSiC: low-rank + sparse decomposition), rather than requiring a `.npy` produced elsewhere.
+- **Why:** IMA-225 ships load-only. A user with no `.npy` currently has to go produce one in the stitcher first, which breaks the "open the acquisition and process it" flow the MIP tool is built around.
+- **Pros:** Works on any acquisition with no prerequisite artifact. BaSiC is the correct estimator — unlike a per-pixel median it does not mistake centred tissue for shading, so it stays accurate on sparse plates and from few tiles.
+- **Cons:** Pulls in scipy and an iterative augmented-Lagrangian solver; needs a tile-sampling policy, progress/cancel UI, and its own memory profile (the solver holds N resized tiles as one dense matrix). Runtime and RAM at 1536-well scale are unmeasured.
+- **Context:** A pure numpy/scipy port already exists at `tilefusion/flatfield.py:280` (`calculate_flatfield`, solver at `:55`) — no torch, no jax. The blocker is not the algorithm, it is that its scale profile needs its own review rather than being folded into a 2-point operator ticket. Note the standing decision NOT to import tilefusion (heavy package `__init__`), so this would be vendored too.
+- **Depends on / blocked by:** IMA-225 landing (the apply path and the field-preparation seam).
+
+## Write channel NAMES into the flatfield `.npy` format → external repo (stitcher)
+- **What:** Extend `tilefusion.save_flatfield` so the saved dict carries channel names, not just a channel count.
+- **Why:** IMA-225 has to make the user manually confirm which correction plane maps to which acquisition channel, because the file cannot answer it. `save_flatfield` (`tilefusion/flatfield.py:479`) writes `{"flatfield", "darkfield", "channels": <int>, "shape"}` — a bare count. A shape check therefore cannot detect a channel *reorder*: same count, same frame size, wrong field per channel, no error, plausible-looking output.
+- **Pros:** Makes the mapping auto-resolvable and verifiable by name, permanently. Removes a manual gate from every run and closes a silent wrong-pixels hole at the source rather than at each consumer.
+- **Cons:** Zero benefit for every `.npy` that already exists, so the manual path still has to be built and is what users hit today. Changing an interchange format is a cross-repo decision.
+- **Context:** This is the *right* permanent fix for IMA-225's decision 4; the manual mapping UI is the interim mitigation. One line at the save site, plus a name-matching path in every consumer with the positional path as fallback.
+- **Depends on / blocked by:** whoever owns `~/CEPHLA/projects/stitcher` (tilefusion).
+
+## Auto-detect a flatfield next to the acquisition → open question, not yet a ticket
+- **What:** Look for a flatfield `.npy` beside the acquisition folder and offer it pre-selected.
+- **Why:** IMA-225 assumes correction is the exception ("empty picker = today's behaviour"). If corrected output is actually what users want most of the time, that default is backwards and every corrected run costs an extra file-picker round trip.
+- **Pros:** Removes friction from the common case if correction is in fact the common case.
+- **Cons:** Building it before establishing the premise is guessing. An auto-selected correction is also exactly the kind of thing that should never happen silently in a quantitative tool — it would need to be visibly on, not quietly on.
+- **Context:** Surfaced by the /plan-eng-review outside voice on 2026-07-20 as an unexamined premise, not as a defect. Resolve by asking Nick whether he corrects most plates or a few, before writing any code.
+- **Depends on / blocked by:** a user-facing answer, not an engineering one.
