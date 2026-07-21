@@ -42,6 +42,13 @@ so a future session doesn't rediscover it from zero.
 - **Cons:** Can't be closed until IMA-193 is designed; until then the pyramid is written on faith.
 - **Context:** ndviewer_light discovers plates by directory walk and reads array `0` + `omero` only (`ndviewer_light/core.py:1149`, `:1070`). IMA-184's cross commit already proves the plate opens under strict `ome-zarr-py`, so the metadata is spec-valid regardless.
 - **Depends on / blocked by:** IMA-193 design.
+- **Cheaper partial answer available (added 2026-07-20, IMA-234):** the Odon benchmark
+  harness (`scripts/odon_bench.py`) buckets HTTP chunk requests by pyramid level parsed
+  from `{row}/{col}/{fov}/{level}/…`. Serving a plate to *any* OME-Zarr viewer over that
+  harness shows directly which levels get read. That doesn't settle IMA-193 (different
+  consumer), but it establishes whether a real viewport-tile engine uses the pyramid at
+  all — which is the load-bearing half of the question, obtainable without waiting for
+  IMA-193 to be designed.
 
 ## Fix upstream squid2minerva/colors.py display_color nesting → external repo
 - **What:** `squid2minerva/colors.py:load_yaml_colors` reads `channel["display_color"]`, but real `acquisition_channels.yaml` nests it under `channel.camera_settings.<cam>.display_color`. Its Minerva OME-TIFF exports only get right colors via the wavelength-fallback map — a custom yaml color is silently ignored.
