@@ -37,6 +37,11 @@ gui = [
     "ndviewer_light @ git+https://github.com/maragall/ndviewer_light@main",
 ]
 
+# decon: SciPy is the FAST path for the IMA-223 Richardson-Lucy deconvolution's Gaussian blur. It is
+# optional and imported lazily — without it squidmip falls back to a self-contained NumPy separable
+# convolution that is correct but materially slower on full-size frames.
+decon = ["scipy>=1.10"]
+
 [project.scripts]
 squidmip = "squidmip._cli:main"           # headless CLI (IMA-186): MIP a plate from the terminal
 squidmip-view = "squidmip._viewer:main"   # the MIP tool desktop app

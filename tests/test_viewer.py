@@ -190,6 +190,22 @@ def test_run_operator_persists_via_write_plate(qapp, stub_detail, squid_dataset,
     win._stop_worker(); win.close()
 
 
+def test_decon_operator_is_registered_and_builds_a_tab(qapp, stub_detail, squid_dataset):
+    # IMA-223: the decon card is one Operation entry + one _build_*_tab, and its key IS the engine's
+    # projector name — so activating the card must open a real tab and dispatch a known projector.
+    from squidmip import available_projectors
+
+    assert "decon" in V._OPERATIONS_BY_KEY
+    assert V._OPERATIONS_BY_KEY["decon"].key in available_projectors()
+
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win._activate_operator("decon")
+    assert "decon" in win._op_tabs                       # card -> tab, through the generic dispatch
+    win.close()
+
+
 def test_run_operator_fills_tiles_and_hue_status(qapp, stub_detail, squid_dataset, tmp_path):
     root, _ = squid_dataset
     win = V.PlateWindow(None)

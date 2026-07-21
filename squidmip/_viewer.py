@@ -411,6 +411,12 @@ _OPERATIONS = (
     Operation("mip", "Maximum Intensity Projection",
               "Collapse each well's z-stack to one max-intensity image; save a navigable OME-Zarr plate.",
               "_build_mip_tab"),
+    # IMA-223. The key IS the projector name ("decon" in the engine table), so the generic run tab
+    # and the operator worker carry it through untouched.
+    Operation("decon", "Deconvolution + MIP",
+              "Richardson-Lucy deconvolve every z-plane (Gaussian PSF) before max-projecting, so "
+              "out-of-focus haze leaks less into the plate. Slower than plain MIP.",
+              "_build_decon_tab"),
 )
 _OPERATIONS_BY_KEY = {op.key: op for op in _OPERATIONS}
 
@@ -1270,6 +1276,11 @@ class PlateWindow(QMainWindow):
 
     def _build_mip_tab(self) -> QWidget:
         return self._build_run_tab(_OPERATIONS_BY_KEY["mip"])
+
+    def _build_decon_tab(self) -> QWidget:
+        # Same generic run/preview tab as MIP — decon is a projector, so it needs no bespoke UI. PSF
+        # width and iteration count use _decon.py's documented defaults (tune them via add_projector).
+        return self._build_run_tab(_OPERATIONS_BY_KEY["decon"])
 
     def _build_run_tab(self, op) -> QWidget:
         """Generic projector-operator tab (MIP, …): pick a destination, run over the whole plate → a

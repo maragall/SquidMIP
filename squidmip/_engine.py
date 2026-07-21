@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
 import numpy as np
 
+from squidmip._decon import project_decon
 from squidmip.projection import project, project_reference, project_well, select_fovs
 
 if TYPE_CHECKING:  # avoid import cost / cycle at runtime
@@ -56,7 +57,13 @@ if TYPE_CHECKING:  # avoid import cost / cycle at runtime
 Projector = Callable[[Iterable[np.ndarray]], np.ndarray]
 
 # name -> z-reduction callable. Selected by name in project_plate; extended via add_projector.
-_PROJECTORS: dict[str, Projector] = {"mip": project, "reference": project_reference}
+# "decon" (IMA-223) is decon-then-reduce composed INTO the same one-callable seam — it deconvolves
+# each plane on the way past and then MIPs, so it needs no engine change and stays streamed.
+_PROJECTORS: dict[str, Projector] = {
+    "mip": project,
+    "reference": project_reference,
+    "decon": project_decon,
+}
 
 
 def _default_workers() -> int:
