@@ -3,6 +3,30 @@
 Deferred work captured during plan-eng-reviews. Each item records the reasoning
 so a future session doesn't rediscover it from zero.
 
+## Writer cannot express "pixel size unknown" → future ticket
+- **What:** `_output.py:173` does `p = float(pixel_size_um) if pixel_size_um else 1.0`, so a written plate records 1.0 for both "unknown" and "genuinely 1.0 µm/px". Give the writer a way to mark unknown (omit the scale, or record a sentinel/attribute), and teach readers to distinguish.
+- **Why:** IMA-208's loupe draws a µm scale bar. On the computed-plate path the only pixel-size source is the multiscales `scale`, so the loupe cannot tell an unknown from a real 1.0 and must suppress the bar for BOTH. That is the honest behaviour but it silently degrades a legitimately-1.0µm acquisition.
+- **Pros:** The loupe (and any future measurement UI) can show microns whenever they are actually known.
+- **Cons:** Touches the writer, so already-written plates in the field stay ambiguous forever regardless; needs a migration story or a "legacy plates are ambiguous" acceptance.
+- **Context:** Surfaced by both outside-voice passes during the IMA-208 eng review (2026-07-20) and verified. `_open_computed` (`_viewer.py:1683`) also builds `_meta` with no pixel size at all — IMA-208 adds the parse, but it can only read what the writer wrote.
+- **Depends on / blocked by:** Nothing; independent of IMA-208, which works around it.
+
+## `_open_computed` reuses well 0's FOV path for every well → future ticket
+- **What:** `_viewer.py:1665` reads `fov0` from `wells_meta[0]` and `:1692` applies that same path to every well in `worker_wells`. A plate whose wells carry differing image ids silently renders the wrong image for those wells.
+- **Why:** Latent silent-wrong-image bug in the computed-plate open path, independent of the loupe. IMA-208's D5 FOV helper covers the loupe's use of it, but the tile-loading path underneath stays wrong.
+- **Pros:** Removes a whole class of silently-wrong renders; needed before multi-FOV plates are opened from disk.
+- **Cons:** Requires per-well FOV resolution in `_open_computed` and a fixture with heterogeneous well image ids to test it.
+- **Context:** Found by outside voice during the IMA-208 eng review (2026-07-20), verified by reading `_open_computed`. No current dataset triggers it — every well is written with the same fov id today — so it is latent rather than active.
+- **Depends on / blocked by:** Overlaps viewer-side multi-FOV (IMA-187); worth doing together.
+
+## Loupe neighbour prefetch on well crossing → fast-follow after IMA-208
+- **What:** Prefetch the adjacent well's crop level while the loupe is held, so crossing a well boundary mid-hold is seamless.
+- **Why:** IMA-208 deliberately scoped this out: a hold gesture usually stays within one well, and crop reads are already only a few MB, so the latency may never be noticeable.
+- **Pros:** Removes the one visible hitch in the loupe's interaction.
+- **Cons:** Speculative I/O and more cache surface for a case that may not matter; adds eviction pressure to a cache IMA-208 deliberately kept small.
+- **Context:** IMA-208 D10 chose windowed crop reads (`_CHUNK_YX = 1024`, `_zarr_store.py:25`) over a whole-well cache. Revisit only if real use shows a hitch at well boundaries.
+- **Depends on / blocked by:** IMA-208 landing and being used on a real plate.
+
 ## Scale-test fixture generator → IMA-188
 - **What:** A generator that fans the 48 real hongquan FOVs across a 1536-well plate via **symlinks** (Squid layout), synthesizing 20 z (cycling the real 3) × 4 channels. On-disk ≈ source (~19 GB); logical read ≈ 1536×20×4×33 MB ≈ **4 TB** (served from OS cache — proves scale/parse/decode/memory, NOT raw disk bandwidth; that needs Nick's real storage).
 - **Why:** It's the harness for the IMA-188 high-throughput scale test, not ingest. Building it in 189 bloats the keystone and risks CI breakage.
