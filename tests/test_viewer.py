@@ -524,6 +524,118 @@ def test_selection_clears_on_second_ingest(qapp, stub_detail, squid_dataset):
     win._stop_worker(); win.close()
 
 
+# --- tab detach / float / re-dock (IMA-209; offscreen drives the _detach_tab seam, not the drag) --
+
+class _StubTab(QWidget):
+    """A registry-registered tab standing in for a live terminal: records shutdown() calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.shutdowns = 0
+
+    def shutdown(self):
+        self.shutdowns += 1
+
+
+def _open_stub_tab(win, key="stub", title="Stub"):
+    w = _StubTab()
+    win._open_op_tab(key, title, lambda: w)
+    return w
+
+
+def test_detach_moves_widget_to_float_and_registry(qapp, stub_detail):
+    win = V.PlateWindow(None)
+    w = _open_stub_tab(win)
+    fl = win._detach_tab(win._left_tabs.indexOf(w))
+    assert fl is not None
+    assert win._left_tabs.indexOf(w) == -1                   # gone from the bar...
+    assert "stub" not in win._op_tabs and win._floating["stub"] is fl
+    assert w.window() is fl                                  # ...and the SAME live widget floats
+    win.close()
+
+
+def test_detach_home_tab_refused(qapp, stub_detail):
+    win = V.PlateWindow(None)
+    assert win._detach_tab(0) is None                        # 'Process wells' never detaches
+    assert win._left_tabs.count() >= 1 and win._left_tabs.widget(0) is not None
+    win.close()
+
+
+def test_open_op_tab_focuses_float_not_duplicate(qapp, stub_detail):
+    # REGRESSION (eng review D4): with the key moved to _floating, an unpatched _open_op_tab
+    # would rebuild the UI — for the CLI, a SECOND live shell. The opener must focus the float.
+    win = V.PlateWindow(None)
+    w = _open_stub_tab(win)
+    win._detach_tab(win._left_tabs.indexOf(w))
+    built = []
+    win._open_op_tab("stub", "Stub", lambda: built.append(1) or _StubTab())
+    assert not built                                         # builder NOT re-called
+    assert win._floating["stub"].isVisible()                 # float raised, not replaced
+    win.close()
+
+
+def test_close_float_disposes_widget(qapp, stub_detail):
+    win = V.PlateWindow(None)
+    w = _open_stub_tab(win)
+    fl = win._detach_tab(win._left_tabs.indexOf(w))
+    fl.close()                                               # user closes the floating window
+    assert w.shutdowns == 1                                  # shell dead, via the ONE cleanup path
+    assert "stub" not in win._floating and "stub" not in win._op_tabs
+    w2 = _StubTab()
+    win._open_op_tab("stub", "Stub", lambda: w2)             # reopening builds fresh
+    assert win._op_tabs["stub"] is w2
+    win.close()
+
+
+def test_redock_returns_same_widget(qapp, stub_detail):
+    win = V.PlateWindow(None)
+    w = _open_stub_tab(win)
+    win._detach_tab(win._left_tabs.indexOf(w))
+    win._redock("stub")
+    assert win._op_tabs["stub"] is w                         # SAME object — a live shell survives
+    assert win._left_tabs.currentWidget() is w
+    assert not win._floating
+    assert w.shutdowns == 0                                  # re-dock never kills the shell
+    win.close()
+
+
+def test_main_close_with_float_open_shuts_down(qapp, stub_detail):
+    win = V.PlateWindow(None)
+    w = _open_stub_tab(win)
+    win._detach_tab(win._left_tabs.indexOf(w))
+    win.close()                                              # app exit with a float open
+    assert w.shutdowns == 1                                  # drained: no leaked shell...
+    assert not win._floating                                 # ...no orphan window blocking exit
+
+
+def test_detached_layers_keeps_refreshing_until_dispose(qapp, stub_detail):
+    win = V.PlateWindow(None)
+    win._open_op_tab("layers", "Layers", win._build_layers_tab)
+    lw = win._op_tabs["layers"]
+    fl = win._detach_tab(win._left_tabs.indexOf(lw))
+    assert win._layers_tab is lw                             # refs NOT cleared on detach...
+    win._refresh_layers_tab()                                # ...so refresh still writes the float
+    assert win._layers_box.count() >= 2                      # rebuilt (title + stretch at minimum)
+    fl.close()
+    assert win._layers_tab is None and win._layers_box is None   # cleared on dispose ONLY
+    win.close()
+
+
+def test_float_survives_second_ingest(qapp, stub_detail, squid_dataset):
+    # Floats follow docked-tab semantics across a plate swap: they persist (staleness of op tabs
+    # on re-ingest is a pre-existing, tab-wide behavior — tracked in TODOS.md, not 209's scope).
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    w = _open_stub_tab(win)
+    win._detach_tab(win._left_tabs.indexOf(w))
+    win.ingest(str(root))                                    # plate swap with a float open
+    qapp.processEvents()
+    assert win._floating["stub"].isVisible()                 # still floating, registry intact
+    assert "stub" not in win._op_tabs
+    win.close()
+
+
 def test_second_ingest_resets_state(qapp, stub_detail, squid_dataset, tmp_path):
     root, _ = squid_dataset
     win = V.PlateWindow(None)
