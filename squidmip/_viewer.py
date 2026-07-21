@@ -453,6 +453,24 @@ def _fit_cell(a: np.ndarray) -> np.ndarray:
     return a[yi][:, xi].astype(np.float32)
 
 
+def _fit_box(a: np.ndarray, h: int, w: int) -> np.ndarray:
+    """Resize a 2D plane to EXACTLY (h, w) — the arbitrary-target sibling of :func:`_fit_cell`.
+
+    Used to place one FOV into its box inside a multi-FOV mosaic cell (IMA-187), where each box
+    is a fraction of _CELL and generally not square. Same policy as _fit_cell: area-downsample
+    when shrinking (the normal case — a 2084px frame into a ~15px box), nearest-sample when
+    upscaling, so a tiny synthetic frame in a test can never crash the render path.
+    """
+    h, w = max(1, int(h)), max(1, int(w))
+    if a.shape == (h, w):
+        return a
+    if a.shape[0] >= h and a.shape[1] >= w:
+        return _area_downsample(a, h, w)
+    yi = (np.arange(h) * a.shape[0]) // h
+    xi = (np.arange(w) * a.shape[1]) // w
+    return a[yi][:, xi].astype(np.float32)
+
+
 # The Squid well-plate formats we fit a plate to (well count -> (rows, cols)). An acquisition whose
 # format isn't one of these falls back to a present-only grid (see _plate_grid).
 _PLATE_DIMS = {4: (2, 2), 6: (2, 3), 12: (3, 4), 24: (4, 6), 96: (8, 12),
@@ -549,6 +567,7 @@ class PlateOverview(QWidget):
         self._press = None            # (x, y, ox, oy) at left-press, for drag-to-pan
         self._panning = False
         self._user_view = False       # True once the user wheel-zooms/pans (stop auto-fitting)
+        self._boxes: dict = {}        # (region, fov) -> (top, left, h, w) in cell px; {} = single-FOV
         self.setMouseTracking(True)
         self.setMinimumSize(240, 200)
 
@@ -676,10 +695,36 @@ class PlateOverview(QWidget):
         self.hovered.emit("")
         self.update()
 
+    def set_mosaic_boxes(self, boxes: dict):
+        """Adopt the per-FOV cell boxes so a double-click can resolve WHICH FOV was hit."""
+        self._boxes = dict(boxes or {})
+
+    def _fov_at(self, c: dict, e) -> int:
+        """FOV index under the cursor within cell *c*, or 0 when there is no mosaic to resolve.
+
+        Inverts the placement transform: find where the click landed inside the cell (in _CELL
+        units), then pick the FOV whose box contains it. Boxes overlap by ~9% at the seams, so
+        the LAST match wins — matching the draw order in ``_OperatorWorker._on_well``, where
+        later FOVs paint over earlier ones. Without that agreement a click in a seam would open
+        a different FOV than the one visibly on top.
+        """
+        region = c["well_id"]
+        if not region or not self._boxes:
+            return 0
+        ax, ay = self._ox + _HDR, self._oy + _COLH
+        # position within the cell, normalised to the _CELL-px space the boxes live in
+        fx = (e.x() - ax - c["col_index"] * self._cd) / self._cd * _CELL
+        fy = (e.y() - ay - c["row_index"] * self._cd) / self._cd * _CELL
+        hit = 0
+        for (r, fov), (top, left, h, w) in self._boxes.items():
+            if r == region and top <= fy < top + h and left <= fx < left + w:
+                hit = fov
+        return hit
+
     def mouseDoubleClickEvent(self, e):
         c = self._cell(e.x(), e.y())
         if c and c["well_id"]:
-            self.wellActivated.emit(c["well_id"], 0)   # 1 FOV/well (IMA-183); IMA-187 will pick the FOV
+            self.wellActivated.emit(c["well_id"], self._fov_at(c, e))
 
     # -- paint --
     def paintEvent(self, _):
@@ -727,7 +772,7 @@ class PlateOverview(QWidget):
                 # else: has an image on the active layer -> no dot
         p.setBrush(Qt.NoBrush)
 
-        p.setPen(QPen(_GRID, 3))       # black grid lines between wells (room for multi-FOV, IMA-187)
+        p.setPen(QPen(_GRID, 3))       # black grid lines between wells (multi-FOV mosaics sit INSIDE a cell)
         for c in range(nc + 1):
             p.drawLine(int(ax + c * cd), int(ay), int(ax + c * cd), int(ay + H))
         for r in range(nr + 1):
@@ -768,6 +813,39 @@ class PlateOverview(QWidget):
         p.end()
 
 
+def _mosaic_boxes(meta: dict) -> dict:
+    """``{(region, fov): (top, left, h, w)}`` — every FOV's box inside its _CELL thumbnail.
+
+    Pure geometry, delegated to :mod:`squidmip._placement` (which is Qt-free and unit-tested
+    against exact pixel offsets). Returns ``{}`` when the acquisition has no stage positions or
+    no pixel size, which is the signal for the caller to keep the historical single-tile path —
+    a mosaic is simply not derivable without both, and guessing would draw a wrong picture.
+
+    Placement failures for ONE region are contained: that region falls back to single-tile
+    rendering rather than aborting a whole-plate run. The reader has already fail-loud checked
+    the CSV/filename agreement, so anything reaching here is a genuine per-region oddity
+    (e.g. a region with images but no coordinate rows).
+    """
+    from squidmip._placement import cell_boxes, fov_offsets_px
+
+    positions = meta.get("fov_positions") or {}
+    if not positions or meta.get("pixel_size_um") in (None, 0):
+        return {}
+    frame_shape = meta["frame_shape"]
+    out: dict = {}
+    for region in meta["regions"]:
+        fovs = meta["fovs_per_region"][region]
+        if len(fovs) < 2:
+            continue                     # a single-FOV well fills its cell; no mosaic needed
+        try:
+            offsets = fov_offsets_px(positions, region, fovs, meta.get("pixel_size_um"))
+            for fov, box in cell_boxes(offsets, frame_shape, _CELL).items():
+                out[(region, fov)] = box
+        except (KeyError, ValueError):
+            continue                     # this region renders single-tile; the rest still mosaic
+    return out
+
+
 # --- operator worker: stream a projection over the plate, fill row-major -------------------
 
 class _OperatorWorker(QThread):
@@ -791,7 +869,7 @@ class _OperatorWorker(QThread):
     finished_ok = pyqtSignal()
 
     def __init__(self, operator: str, reader, meta, fov_index: dict, nr: int, nc: int, out_dir: str,
-                 regions=None, save: bool = True):
+                 regions=None, save: bool = True, n_fovs=1):
         super().__init__()
         self._operator = operator
         self._reader, self._meta = reader, meta
@@ -799,6 +877,11 @@ class _OperatorWorker(QThread):
         self._out_dir = out_dir
         self._regions = regions          # None = whole plate; a list = subset preview (those wells only)
         self._save = save                # False = PREVIEW: compute + push to the viewer, write NOTHING
+        self._n_fovs = n_fovs            # None = every FOV per well -> coordinate-placed mosaic tiles
+        # Per-region FOV boxes inside the _CELL thumbnail (IMA-187). Computed ONCE up front from
+        # the reader's stage positions, because every arriving FOV needs its box and the geometry
+        # never changes mid-run. Empty dict => no positions => the historical single-tile path.
+        self._boxes = _mosaic_boxes(meta) if n_fovs != 1 else {}
         self._total = len(regions) if regions is not None else len(meta["regions"])
         self._channels = [c["name"] for c in meta["channels"]]
         self._colors = np.stack([_hex_to_rgb01(c["display_color"]) for c in meta["channels"]])
@@ -807,6 +890,7 @@ class _OperatorWorker(QThread):
         self._raw: dict[tuple, np.ndarray] = {}   # (ri,ci) -> (C, _CELL, _CELL) tiles, for the final montage
         self._lock = threading.Lock()             # guards _contrast/_raw/_done (on_well runs on writer threads)
         self._done = 0
+        self._seen_fovs: dict[tuple, set] = {}    # (ri,ci) -> FOVs composited so far, for progress
         self._stop = threading.Event()            # set by the window to end the run cleanly
 
     def stop(self):
@@ -814,21 +898,51 @@ class _OperatorWorker(QThread):
         self._stop.set()
 
     def _on_well(self, region, fov, image):
-        """Called per written well (on a write_plate WRITER THREAD): render the plate thumbnail."""
+        """Called per written FIELD (on a write_plate WRITER THREAD): composite the plate thumbnail.
+
+        Single-FOV (the historical path) fills the whole _CELL tile. Multi-FOV composites this
+        FOV into its coordinate-derived box inside the SAME cell, accumulating across the calls
+        for that region — so a 36-FOV well is built from 36 arrivals rather than 36 overwrites.
+        Compositing is at THUMBNAIL scale throughout: the cell is _CELL x _CELL no matter how
+        many FOVs land in it, so a mosaic well costs the same memory as a single-FOV well.
+        """
         info = self._fov_index[region]
         ri, ci, well_id = *info["rc"], info["well_id"]
         well = image[0, :, 0]  # (C, Y, X)
-        tiles = [_fit_cell(well[c_i]) for c_i in range(len(self._channels))]  # downsample OUTSIDE lock
-        raw = np.empty((len(tiles), _CELL, _CELL), self._dtype)              # native dtype (half the RAM)
+        box = self._boxes.get((region, fov))
+        n_c = len(self._channels)
+
+        # Downsample OUTSIDE the lock (the expensive part stays parallel).
+        if box is None:
+            tiles = [_fit_cell(well[c_i]) for c_i in range(n_c)]
+        else:
+            top, left, bh, bw = box
+            tiles = [_fit_box(well[c_i], bh, bw) for c_i in range(n_c)]
+
         rgb = np.zeros((_CELL, _CELL, 3), np.float32)
         with self._lock:                          # shared contrast/raw/counter -> serialize (cheap part)
+            raw = self._raw.get((ri, ci))
+            if raw is None:
+                # Zero-filled: un-covered cell area (mosaic margins, gaps between FOVs) stays
+                # background rather than showing whatever the previous well left behind.
+                raw = np.zeros((n_c, _CELL, _CELL), self._dtype)
+                self._raw[(ri, ci)] = raw
             for c_i, ds in enumerate(tiles):
-                raw[c_i] = ds
+                if box is None:
+                    raw[c_i] = ds
+                else:
+                    # Later FOVs win in the ~9% overlap seam. Deterministic because
+                    # write order is per-(region, fov) and each box is fixed up front.
+                    raw[c_i][top:top + bh, left:left + bw] = ds
                 self._contrast.add(c_i, ds)
+            for c_i in range(n_c):
                 lo, hi = self._contrast.window(c_i)
-                rgb += _window(ds, lo, hi)[:, :, None] * self._colors[c_i][None, None, :]
-            self._raw[(ri, ci)] = raw
-            self._done += 1
+                rgb += _window(raw[c_i], lo, hi)[:, :, None] * self._colors[c_i][None, None, :]
+            seen = self._seen_fovs.setdefault((ri, ci), set())
+            was_empty = not seen
+            seen.add(fov)
+            if was_empty:                          # count WELLS, not fields, so the bar still
+                self._done += 1                    # reads "n of n wells" on a 36-FOV plate
             done = self._done
         self.tileReady.emit(ri, ci, well_id, (np.clip(rgb, 0, 1) * 255).astype(np.uint8))
         self.progress.emit(done, self._total)
@@ -850,7 +964,7 @@ class _OperatorWorker(QThread):
             if self._save:
                 from squidmip import write_plate  # persist + project in one bounded, streaming pass
 
-                write_plate(self._reader, self._out_dir, n_fovs=1, workers=_VIEWER_WORKERS,
+                write_plate(self._reader, self._out_dir, n_fovs=self._n_fovs, workers=_VIEWER_WORKERS,
                             projector=self._operator, tiff=False, on_well=self._on_well,
                             stop=self._stop.is_set, on_error=self._on_error, regions=self._regions)
                 if self._stop.is_set():
@@ -864,7 +978,8 @@ class _OperatorWorker(QThread):
                 from squidmip import project_plate
 
                 stream = project_plate(self._reader, workers=_VIEWER_WORKERS, projector=self._operator,
-                                       on_error=self._on_error, regions=self._regions)
+                                       n_fovs=self._n_fovs, on_error=self._on_error,
+                                       regions=self._regions)
                 try:
                     for region, fov, image in stream:
                         if self._stop.is_set():

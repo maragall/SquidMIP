@@ -10,9 +10,9 @@ be dead code carrying a permanent second-format test burden. One format, require
 absence. (If a genuinely pre-yaml dataset ever resurfaces, convert it to ``acquisition.yaml``
 up front rather than adding a second read path here.)
 
-``coordinates.csv`` is intentionally NOT read: for one-FOV-per-well (IMA-183) the plate layout
-comes from the well ID + ``wellplate_format``; per-FOV stage positions are a stitching/mosaic
-concern, deferred to the ticket that needs them.
+``coordinates.csv`` is not read *here* — this module owns the scalar/physical metadata only.
+Per-FOV stage positions moved into ``reader.load_fov_positions`` (IMA-187), which needs the
+filename-derived FOV index to key rows against and so belongs beside the reader.
 """
 
 from __future__ import annotations

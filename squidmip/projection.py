@@ -1,4 +1,4 @@
-"""One-FOV-per-well maximum-intensity projection (IMA-183, folds IMA-187).
+"""Per-FOV maximum-intensity projection (IMA-183; multi-FOV selection IMA-187).
 
 Consumes the IMA-189 reader (``open_reader``) and produces one projected image per
 selected FOV. The projection reduces the **z-axis only**; timepoint (t) and channel (c)
@@ -9,7 +9,8 @@ writer needs no special-casing.
 
 Data flow::
 
-    open_reader(path).metadata ──► select_fovs(meta, n_fovs=1) ──► {well: [fov, ...]}
+    open_reader(path).metadata ──► select_fovs(meta, n_fovs) ──► {well: [fov, ...]}
+                                   (n_fovs=None ──► ALL FOVs per well, ragged ok)
                                                                           │
                                               for each (well, fov):       ▼
         project_well(reader, well, fov)
@@ -33,7 +34,7 @@ Design contracts:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 import numpy as np
 
@@ -163,44 +164,67 @@ def project_well(
     return out
 
 
-def select_fovs(metadata: dict, n_fovs: int = 1) -> dict[str, list[int]]:
+def select_fovs(metadata: dict, n_fovs: Optional[int] = 1) -> dict[str, list[int]]:
     """Pick the FOV(s) to project for each well.
 
-    Folds IMA-187: the FOV *count* is a data-model parameter and the return is a list per
-    well, so up-to-4-FOV support needs no data-model change. v1 uses ``n_fovs=1`` (one FOV
-    per well). Selection is positional — the first ``n_fovs`` FOVs of each well, in the
-    reader's sorted ``fovs_per_region`` order (so it never depends on a literal, possibly
-    1-based, filename FOV label).
+    Selection is positional — the first ``n_fovs`` FOVs of each well, in the reader's sorted
+    ``fovs_per_region`` order (so it never depends on a literal, possibly 1-based, filename
+    FOV label).
+
+    ``n_fovs=None`` means **all FOVs in each well** (IMA-187's mosaic path). That is a
+    distinct request from any specific count, and it changes the ragged-plate behaviour on
+    purpose: with an explicit count, a well holding fewer FOVs than asked for is bad input and
+    raises; with ``None``, each well simply contributes what it has, so one short well (a
+    skipped position, an interrupted acquisition) cannot abort a multi-hour plate run.
 
     Parameters
     ----------
     metadata:
         ``reader.metadata`` from IMA-189.
     n_fovs:
-        FOVs to select per well (default 1).
+        FOVs per well. ``None`` = all. Default 1.
 
     Returns
     -------
     dict[str, list[int]]
-        ``{region: [fov, ...]}`` for every region, each list of length ``n_fovs``.
+        ``{region: [fov, ...]}`` for every region. Every list has length ``n_fovs`` unless
+        ``n_fovs`` is ``None``, in which case lengths may differ between wells.
 
     Raises
     ------
     ValueError
-        If ``n_fovs < 1``, or a well has fewer than ``n_fovs`` FOVs (named loud, never a
-        silent short slice).
+        If ``n_fovs`` is an int < 1, or (explicit counts only) a well has fewer than
+        ``n_fovs`` FOVs — named loud, never a silent short slice.
     """
-    if n_fovs < 1:
-        raise ValueError(f"n_fovs must be >= 1, got {n_fovs}")
+    if n_fovs is not None and n_fovs < 1:
+        raise ValueError(f"n_fovs must be >= 1 or None (= all), got {n_fovs}")
 
     fovs_per_region = metadata["fovs_per_region"]
     selected: dict[str, list[int]] = {}
     for region in metadata["regions"]:
         available = fovs_per_region[region]
+        if n_fovs is None:
+            selected[region] = list(available)      # every FOV; ragged wells are fine
+            continue
         if n_fovs > len(available):
             raise ValueError(
                 f"n_fovs={n_fovs} requested but region {region!r} has only "
-                f"{len(available)} FOV(s): {available}"
+                f"{len(available)} FOV(s): {available}. Pass n_fovs=None to take whatever "
+                "each well has instead of requiring a uniform count."
             )
         selected[region] = list(available[:n_fovs])
     return selected
+
+
+def resolve_n_fovs(metadata: dict, n_fovs: Optional[int]) -> int:
+    """Concrete FOV-per-well count for callers that need an int, resolving ``None`` to the max.
+
+    OME-NGFF's ``field_count`` is a single plate-level scalar, so a plate whose wells hold
+    different FOV counts has to report one number; the max is the only value that does not
+    under-describe some well. Exists so ``None`` never reaches an ``int()`` call (it would
+    raise TypeError deep inside the writer, far from the caller that passed it).
+    """
+    if n_fovs is not None:
+        return int(n_fovs)
+    per_region = metadata["fovs_per_region"]
+    return max((len(per_region[r]) for r in metadata["regions"]), default=0)
