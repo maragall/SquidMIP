@@ -11,6 +11,29 @@ so a future session doesn't rediscover it from zero.
 - **Context:** The IMA-189 `SquidReader` reads one plane per call, so a symlink fan-out exercises the exact read path at scale. Keep 189's own tests on small real-shaped fixtures.
 - **Depends on / blocked by:** IMA-189 reader (landed); belongs to **IMA-188 (this slot)**.
 
+## Input eviction: delete source z-stacks per region to finish on a full disk → new ticket
+- **What:** An opt-in mode that unlinks a region's input z-stacks once that region's projection is
+  durably written, trading input bytes for output bytes in place.
+- **Why:** This is the capability IMA-230's original one-liner ("process large tissue on a full
+  disk") actually described. IMA-230 as shipped **aborts cleanly**; it does not let an
+  under-provisioned disk complete a run. Without this note the Why-rewrite in `.spec/open/ima-230.md`
+  looks like scope was quietly dropped.
+- **Pros:** The only way to MIP a plate whose input + output exceed the disk. Real for large tissue.
+- **Cons:** Irreversibly destroys raw acquisition data — hours of microscope time, unrecreatable.
+  Needs an explicit opt-in flag (never a default), a durability guarantee before unlinking, and
+  operator-visible confirmation.
+- **Context:** Three hard constraints inherited from the IMA-230 eng review (2026-07-20):
+  (1) **`st_dev` check** — `--output-folder` can point at a different filesystem than the input
+  (`_cli.py:41-44` encourages exactly this), and deleting inputs then frees zero bytes where they're
+  needed. (2) **Durability** — nothing in the write path `fsync`s today; tensorstore writes and the
+  metadata `write_text` both land in page cache, so "written" is not "safe to delete the source."
+  This must be solved first. (3) **Completion granularity** — the stream is per *field*
+  `(region, fov)`, not per region, and `select_fovs` can yield several FOVs per region, so a region
+  is only evictable once all its fields are done. IMA-230's `pending: dict[Future,(region,fov)]`
+  change gives you that bookkeeping.
+- **Depends on / blocked by:** IMA-230 (storage guard) landing first — it establishes the completion
+  tracking and the honest-partial-output contract this builds on.
+
 ## Resume / checkpoint for long plate runs → fast-follow after IMA-184
 - **What:** Skip wells whose complete output already exists; clean partial output files on rerun.
 - **Why:** A full 1536wp run takes minutes-to-hours; a crash mid-run currently restarts from 0, and partial outputs can silently corrupt the plate.
