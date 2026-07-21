@@ -33,7 +33,7 @@ if "PySide6" in sys.modules or "PySide2" in sys.modules:
 from PyQt5.QtCore import QEvent, QPointF, Qt  # noqa: E402
 from PyQt5.QtGui import QMouseEvent  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
-    QApplication, QPushButton, QSlider, QSpinBox, QWidget,
+    QApplication, QCheckBox, QPushButton, QSlider, QSpinBox, QWidget,
 )
 
 from squidmip import _viewer as V  # noqa: E402
@@ -3109,4 +3109,52 @@ def test_the_redock_BUTTON_works_not_just_the_method(qapp, stub_detail):
     assert win._op_tabs.get("stub") is w, "the Re-dock button did nothing"
     assert win._left_tabs.indexOf(w) >= 0
     assert not win._floating
+    win.close()
+
+
+# --- IMA-223/224/225: the three plane-op cards -------------------------------------------------
+
+def test_the_three_plane_op_cards_build_and_are_preview_only(qapp, stub_detail, squid_dataset):
+    """DRIVEN, not read: open each plane-op tab through the real _open_op_tab path and inspect
+    the widgets it actually produced. A plane-op keeps z at full depth and _validate_image accepts
+    Z == 1 only, so the card must offer Preview and NO Save/destination half."""
+    from squidmip import available_projectors
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    for key in ("decon", "bgsub", "flatfield"):
+        assert key in available_projectors(), f"{key} is not registered in the engine"
+        op = V._OPERATIONS_BY_KEY[key]
+        win._open_op_tab(op.key, op.label, getattr(win, op.build_tab))
+        qapp.processEvents()
+        tab = win._op_tabs[key]
+        texts = [b.text() for b in tab.findChildren(QPushButton)]
+        assert "Preview" in texts, f"{key} card has no Preview button: {texts}"
+        # the run-tab half must be ABSENT: no destination picker, no whole-plate run
+        assert not [t for t in texts if "Choose" in t or "whole plate" in t.lower()], texts
+        assert not [c for c in tab.findChildren(QCheckBox)], f"{key} exposed a Save checkbox"
+        assert tab.findChildren(QSpinBox), f"{key} card has no 'first N wells' spinner"
+    win.close()
+
+
+def test_flatfield_card_gates_preview_on_a_profile(qapp, stub_detail, squid_dataset):
+    """Flat-field is the one plane-op with no sane default: an identity field would silently do
+    nothing while the UI said 'corrected'. So its Preview stays disabled until a profile loads,
+    and decon/bgsub - which need no argument - are enabled from the start."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    prev = {}
+    for key in ("decon", "bgsub", "flatfield"):
+        op = V._OPERATIONS_BY_KEY[key]
+        win._open_op_tab(op.key, op.label, getattr(win, op.build_tab))
+        tab = win._op_tabs[key]
+        prev[key] = next(b for b in tab.findChildren(QPushButton) if b.text() == "Preview")
+    assert prev["decon"].isEnabled() and prev["bgsub"].isEnabled()
+    assert not prev["flatfield"].isEnabled(), "flat-field ran without an illumination profile"
+    ff = win._op_tabs["flatfield"]
+    assert [b for b in ff.findChildren(QPushButton) if "illumination profile" in b.text()], \
+        "flat-field card has no profile chooser"
+    assert not [b for b in win._op_tabs["decon"].findChildren(QPushButton)
+                if "illumination profile" in b.text()], "decon grew a profile chooser"
     win.close()

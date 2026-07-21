@@ -568,6 +568,21 @@ _OPERATIONS = (
     Operation("minerva", "Open in Minerva Author",
               "Export the selected FOVs to Minerva-ingestable OME-TIFFs and open Minerva Author on them.",
               "_build_minerva_tab"),
+    # IMA-223/224/225 -- the PLANE-OPS. Unlike mip/stitch these keep z at full depth, so they get
+    # _build_plane_op_tab (preview only) rather than _build_run_tab: write_plate's _validate_image
+    # accepts Z == 1 only and would fail LOUD on save. Loud is correct; offering the button is not.
+    Operation("decon", "Deconvolution (Richardson-Lucy)",
+              "Sharpen every plane against the microscope's Gaussian PSF -- iterative Richardson-Lucy, "
+              "no explicit kernel. Keeps the z-stack at full depth.",
+              "_build_decon_tab"),
+    Operation("bgsub", "Background subtraction",
+              "Remove the smooth out-of-focus haze from every plane with a rolling ball (ImageJ's "
+              "algorithm). A LAYER: the raw is untouched on disk and one toggle away.",
+              "_build_bgsub_tab"),
+    Operation("flatfield", "Flat-field correction",
+              "Divide out the objective's illumination profile so the corners match the centre. "
+              "Needs an illumination profile (.npy) from the stitcher or estimated from the plate.",
+              "_build_flatfield_tab"),
 )
 _OPERATIONS_BY_KEY = {op.key: op for op in _OPERATIONS}
 
@@ -3439,6 +3454,95 @@ class PlateWindow(QMainWindow):
         # the user aims it at a plate or a subset. (The "Save" half is a no-op until write_plate
         # accepts a region operator -- see _OperatorWorker.run.)
         return self._build_run_tab(_OPERATIONS_BY_KEY["stitch"])
+
+    def _build_decon_tab(self) -> QWidget:
+        return self._build_plane_op_tab(_OPERATIONS_BY_KEY["decon"])
+
+    def _build_bgsub_tab(self) -> QWidget:
+        return self._build_plane_op_tab(_OPERATIONS_BY_KEY["bgsub"])
+
+    def _build_flatfield_tab(self) -> QWidget:
+        # The one plane-op that cannot run without an argument: a flat-field with no illumination
+        # profile has no sane default (an identity field would silently do nothing while the UI
+        # said "corrected"), so the operator raises until one is loaded. The chooser is that load.
+        return self._build_plane_op_tab(_OPERATIONS_BY_KEY["flatfield"], profile_chooser=True)
+
+    def _build_plane_op_tab(self, op, profile_chooser: bool = False) -> QWidget:
+        """Generic PLANE-OP tab (IMA-223/224/225): preview on a subset, never save.
+
+        A plane-op maps plane -> plane and does NOT consume z (IMA-210), so its output keeps the
+        z-stack at full depth -- and write_plate's _validate_image accepts Z == 1 only. So this
+        builder deliberately omits the "Run on the whole plate" / destination half of
+        _build_run_tab: there is nothing to write yet. The moment the OME-Zarr writer learns
+        Z > 1, this method can simply forward to _build_run_tab and disappear.
+
+        The preview path itself is unchanged and needs no worker edit: _OperatorWorker's save=False
+        branch streams project_plate, and _on_well already indexes image[0, :, 0] -- for a plane-op
+        that is the FIRST z-plane, corrected, which is exactly what a preview should show.
+        """
+        w, v = self._op_tab_shell(op.label, op.blurb)
+        v.addWidget(_hline())
+
+        state = {"profile": None}
+        if profile_chooser:
+            prof_lbl = QLabel("(no illumination profile loaded)")
+            prof_lbl.setWordWrap(True)
+            prof_lbl.setStyleSheet("color:#8b98ad;font-size:12px;")
+
+            def load_profile():
+                path, _ = QFileDialog.getOpenFileName(
+                    self, "Load illumination profile", "", "Illumination profile (*.npy)")
+                if not path:
+                    return
+                from squidmip import FlatfieldProfile
+                from squidmip._flatfield import set_profile
+                try:
+                    profile = FlatfieldProfile.from_npy(path)
+                except Exception as exc:                     # bad file -> say so, keep the tab alive
+                    prof_lbl.setText(f"could not load {Path(path).name}: {exc}")
+                    return
+                frame = tuple(self._reader.metadata["frame_shape"]) if self._reader else None
+                if frame is not None and profile.shape != frame:
+                    prof_lbl.setText(f"profile is {profile.shape}, this acquisition's frames are "
+                                     f"{frame} -- wrong profile for this plate")
+                    return
+                set_profile(profile)
+                state["profile"] = path
+                prof_lbl.setText(f"{Path(path).name}  {profile.shape}")
+                prev.setEnabled(True)
+
+            pick_prof = QPushButton("Load illumination profile (.npy)…")
+            pick_prof.setStyleSheet(_BTN_QSS)
+            pick_prof.clicked.connect(load_profile)
+            v.addWidget(pick_prof)
+            v.addWidget(prof_lbl)
+            v.addWidget(_hline())
+
+        prev_lbl = QLabel("Preview (subset)")
+        prev_lbl.setStyleSheet("color:#57606a;font-size:10px;font-weight:800;letter-spacing:1.5px;padding-top:6px;")
+        v.addWidget(prev_lbl)
+        n_wells = max(1, len(self._order))
+        row = QHBoxLayout(); row.setSpacing(6)
+        row.addWidget(QLabel("First"))
+        spin = QSpinBox(); spin.setRange(1, n_wells); spin.setValue(min(4, n_wells))
+        spin.setStyleSheet(_COMBO_QSS)
+        row.addWidget(spin); row.addWidget(QLabel("wells")); row.addStretch(1)
+        v.addLayout(row)
+
+        prev = QPushButton("Preview"); prev.setStyleSheet(_BTN_QSS)
+        prev.setEnabled(not profile_chooser)          # flat-field waits for its profile
+        prev.clicked.connect(
+            lambda: self.run_operator(op.key, out_parent=None,
+                                      regions=self._order[:spin.value()], save=False))
+        v.addWidget(prev)
+
+        note = QLabel("Preview only: this operator keeps the z-stack at full depth, and the "
+                      "OME-Zarr writer accepts one z per field today, so there is nothing to "
+                      "save yet. The raw acquisition is never modified.")
+        note.setWordWrap(True); note.setStyleSheet("color:#8b98ad;font-size:11px;")
+        v.addWidget(note)
+        v.addStretch(1)
+        return w
 
     def _build_run_tab(self, op) -> QWidget:
         """Generic projector-operator tab (MIP, …): pick a destination, run over the whole plate → a
