@@ -54,14 +54,19 @@ class _StubDetail(QWidget):
         self._fov_labels = []
         self._fov_slider = QSlider(Qt.Horizontal, self)
         self.registered = []
-        self.arrays = []          # (t, idx, z, ch) of every register_array push (IMA-205)
+        # (t, idx, z, ch, (h, w)) of every register_array push. The SHAPE is recorded because
+        # IMA-245 is a shape defect: the handler was called with the right index and the wrong
+        # rectangle, and a recorder that keeps only the index cannot tell those two apart.
+        self.arrays = []
         self.nav = []
         self.acquisitions = []    # one entry per start_acquisition — the slider's label list
+        self.canvases = []        # (h, w) declared by each start_acquisition
 
     def start_acquisition(self, channels, nz, h, w, labels):
         self._fov_labels = list(labels)
         self._fov_slider.setMaximum(max(0, len(labels) - 1))
         self.acquisitions.append(list(labels))
+        self.canvases.append((h, w))
 
     def register_image(self, t, idx, z, ch, path, page_idx=0):
         self.registered.append((t, idx, z, ch, path))
@@ -69,8 +74,16 @@ class _StubDetail(QWidget):
     def register_array(self, t, idx, z, ch, plane):
         """Record computed-well pushes. The real ndviewer indexes its slider by ``idx``, so a push
         whose idx exceeds the current label list would land out of range — recording it here is what
-        makes the global->subset remap assertable at all (the push path was previously unobserved)."""
-        self.arrays.append((t, idx, z, ch))
+        makes the global->subset remap assertable at all (the push path was previously unobserved).
+
+        IMA-245: a real ndviewer canvas is fixed by ``start_acquisition``, so a plane of the wrong
+        SHAPE is as undisplayable as a push that never arrives. Refuse it here for the same reason
+        the real viewer would, so a test cannot pass on a push the GUI would show as black."""
+        shape = tuple(np.asarray(plane).shape)
+        want = self.canvases[-1] if self.canvases else None
+        if want is not None and shape != want:
+            raise ValueError(f"plane {shape} does not fit the declared canvas {want}")
+        self.arrays.append((t, idx, z, ch, shape))
 
     def go_to_well_fov(self, well_id, fov):
         self.nav.append((well_id, fov))
@@ -1888,6 +1901,10 @@ class _BlockingWorker(V.QThread):
         super().__init__()
         import threading
         self.mosaic_boxes = {}
+        # IMA-245: the window declares the array viewer's canvas from the worker's push geometry,
+        # so a worker double has to carry it too — the frame square is what a per-FOV run reports.
+        self.push_shape = (V._PUSH_PX, V._PUSH_PX)
+        self.push_shape_estimated = False
         self._go = threading.Event()
 
     def run(self):
@@ -3462,3 +3479,235 @@ def test_dropping_a_layer_frees_its_store_and_composite(qapp, stub_detail, squid
     assert ov._active == "raw", "dropping the shown layer left the plate on it"
     assert "raw" in ov._store, "dropping a layer took the raw with it"
     win.close()
+
+
+# --- IMA-245: a region operator's result must reach the CENTRAL array viewer -------------------
+
+_NONSQUARE_YAML = """\
+version: 1
+objective: 20x
+channels:
+- name: Fluorescence 638 nm - Penta
+  camera_settings:
+    '1':
+      display_color: '#FF0000'
+      exposure_time_ms: 50.0
+"""
+
+_NONSQUARE_ACQ_YAML = """\
+objective:
+  pixel_size_um: 0.325
+  magnification: 20.0
+  sensor_pixel_size_um: 3.76
+sample:
+  wellplate_format: 1536 well plate
+z_stack:
+  nz: 1
+  delta_z_mm: 0.0015
+time_series:
+  nt: 1
+"""
+
+
+@pytest.fixture
+def nonsquare_mosaic_dataset(tmp_path):
+    """A real, stitchable Squid acquisition whose mosaic is deliberately NOT square.
+
+    Six 256x256 fields on a 3-wide x 2-tall grid with a real 56 px (22%) overlap, cropped out of
+    ONE noise image so registration has genuine, matchable content — this is a real acquisition
+    that the real stitcher really fuses, not a stub.
+
+    Non-square is the entire point. The frame is square and the mosaic is 456x656, so a viewer
+    sized as a FRAME and a viewer sized as the MOSAIC produce different numbers, and a test can
+    tell which one the array viewer actually got. On a square 6x6 plate well (the synthetic 2x2
+    wellplate) both answers are 512x512 and the defect is invisible.
+
+    Returns (root, region, frame_px, mosaic_extent_px).
+    """
+    import json
+
+    import tifffile
+
+    frame, step, cols, rows = 256, 200, 3, 2
+    region, ch = "B2", CH_IN_YAML
+    mh, mw = step * (rows - 1) + frame, step * (cols - 1) + frame     # 456 x 656
+    rng = np.random.default_rng(245)
+    source = rng.integers(0, 4000, size=(mh, mw), dtype=np.uint16)
+
+    folder = tmp_path / "acq_nonsquare" / "0"
+    folder.mkdir(parents=True)
+    px_um, lines = 0.325, ["region,x (mm),y (mm),z (mm)"]
+    for r in range(rows):
+        for c in range(cols):
+            fov = r * cols + c
+            top, left = r * step, c * step
+            tifffile.imwrite(folder / f"{region}_{fov}_0_{ch}.tiff",
+                             source[top:top + frame, left:left + frame])
+            # stage mm: px -> um -> mm. The reader turns these back into fov_positions_um, which
+            # is what _placement (and therefore the push geometry) lays the mosaic out from.
+            lines.append(f"{region},{left * px_um / 1000.0},{top * px_um / 1000.0},")
+    root = tmp_path / "acq_nonsquare"
+    (root / "acquisition_channels.yaml").write_text(_NONSQUARE_YAML)
+    (root / "acquisition.yaml").write_text(_NONSQUARE_ACQ_YAML)
+    (root / "acquisition parameters.json").write_text(
+        json.dumps({"Nz": 1, "Nt": 1, "dz(um)": 1.5,
+                    "objective": {"magnification": 20.0}, "sensor_pixel_size_um": 3.76}))
+    (root / "coordinates.csv").write_text("\n".join(lines) + "\n")
+    return root, region, frame, (mh, mw)
+
+
+def _stitch_into_central_viewer(qapp, win, region):
+    """Run the REAL stitch operator on ``region`` and return (fused mosaic shape, pushes).
+
+    ``_on_well`` is wrapped rather than mocked: it is the one place the fused mosaic exists as an
+    array, and the test needs its true extent to compare against what the viewer was handed.
+    """
+    fused = []
+    original = V._OperatorWorker._on_well
+
+    def spy(worker, r, f, image):
+        fused.append(np.asarray(image).shape)
+        return original(worker, r, f, image)
+
+    V._OperatorWorker._on_well = spy
+    try:
+        win._stop_preview()
+        _drain_until(qapp, lambda: not win._busy(), timeout=120)
+        win._detail.arrays.clear()
+        win.run_operator("stitch", regions=[region], save=False)
+        assert win._worker is not None, win._readout.text()
+        t0 = time.time()
+        while win._worker is not None and win._worker.isRunning() and time.time() - t0 < 300:
+            qapp.processEvents(); time.sleep(0.02)
+        for _ in range(25):
+            qapp.processEvents(); time.sleep(0.02)
+    finally:
+        V._OperatorWorker._on_well = original
+    assert fused, f"the stitch produced no fused mosaic: {win._readout.text()!r}"
+    return fused[0][-2:], list(win._detail.arrays)
+
+
+def test_ima245_region_operator_reaches_the_central_viewer_as_a_mosaic(
+        qapp, stub_detail, nonsquare_mosaic_dataset):
+    """A stitch's FUSED MOSAIC must arrive in the central array viewer, sized as the mosaic.
+
+    Reported from the live GUI: "after I see the stitch, I cannot see it in my central array
+    viewer — it is black". The plate showed the mosaic; the viewer beside it did not.
+
+    This asserts on the RECTANGLE, not on the handler being called. A region operator yields one
+    fused mosaic per region, and the viewer's canvas was declared as a FRAME (_PUSH_PX square) —
+    so the mosaic was squashed into a shape it does not have, or refused for not fitting. Both
+    fail here, and the aspect is checked against the real fused array rather than a constant.
+    """
+    root, region, frame_px, predicted = nonsquare_mosaic_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    assert win._meta["frame_shape"] == (frame_px, frame_px)
+    # the coordinate-derived extent the viewer is sized from, and it is NOT the frame
+    assert V.region_mosaic_extent_px(win._meta, [region]) == predicted
+
+    mosaic_hw, pushes = _stitch_into_central_viewer(qapp, win, region)
+    assert mosaic_hw != (frame_px, frame_px), \
+        f"the stitch yielded a frame, not a mosaic ({mosaic_hw}) — the fixture is not stitching"
+    assert pushes, f"NOTHING reached the central array viewer: {win._readout.text()!r}"
+
+    got = pushes[0][4]
+    canvas = win._detail.canvases[-1]
+    assert got == canvas, f"the viewer was declared {canvas} and handed {got}"
+    # the shape is the MOSAIC's, bounded by the push budget — not the frame's, and not a square
+    assert max(got) == V._PUSH_PX and got[0] != got[1], f"push {got} is not a bounded mosaic"
+    scale = V._PUSH_PX / max(mosaic_hw)
+    assert abs(got[0] / got[1] - mosaic_hw[0] / mosaic_hw[1]) < 0.02, \
+        f"push {got} does not have the fused mosaic's aspect {mosaic_hw}"
+    assert abs(got[0] - mosaic_hw[0] * scale) <= 2 and abs(got[1] - mosaic_hw[1] * scale) <= 2, \
+        f"push {got} is not the fused mosaic {mosaic_hw} scaled to fit {V._PUSH_PX}"
+    # ...and nothing was thrown away getting there
+    assert win._dropped_pushes == 0, \
+        f"{win._dropped_pushes} push(es) dropped: {win._readout.text()!r}"
+    assert win._readout.text().startswith("✓") and "⚠" not in win._readout.text()
+    win._stop_worker(); win.close()
+
+
+def test_ima245_every_region_operator_is_sized_as_a_region_not_a_frame(
+        qapp, stub_detail, nonsquare_mosaic_dataset):
+    """The category, not the name. Every operator in ``available_region_operators()`` yields a
+    region mosaic, so every one of them sizes the viewer from the mosaic extent — and every
+    per-FOV projector still sizes it from the frame. An `if operator == "stitch"` branch would
+    pass the test above and fail this one."""
+    from squidmip import available_projectors, available_region_operators
+
+    root, region, frame_px, (mh, mw) = nonsquare_mosaic_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    mosaic = V.push_shape_for(win._meta, True, [region])
+    frame = V.push_shape_for(win._meta, False, [region])
+    assert mosaic != frame, "the region and per-FOV surfaces are the same rectangle"
+    assert abs(mosaic[0] / mosaic[1] - mh / mw) < 0.01
+
+    for op in available_region_operators():
+        w = V._OperatorWorker(op, win._reader, win._meta, win._fov_index, "",
+                              regions=[region], save=False, n_fovs=None)
+        assert w.push_shape == mosaic, f"region operator {op!r} is sized {w.push_shape}, not {mosaic}"
+    for op in available_projectors():
+        w = V._OperatorWorker(op, win._reader, win._meta, win._fov_index, "",
+                              regions=[region], save=False, n_fovs=None)
+        assert w.push_shape == frame, f"projector {op!r} is sized {w.push_shape}, not {frame}"
+    win.close()
+
+
+def test_ima245_an_unshowable_push_is_counted_and_said_out_loud(
+        qapp, stub_detail, nonsquare_mosaic_dataset):
+    """A push that cannot be shown must never be silent. An ndviewer build with no
+    ``register_array`` (the installed 0.1.0 has none) discarded every computed result at a
+    ``hasattr`` guard: no counter, no message, a black viewer, and a human to find it."""
+    root, region, _frame, _extent = nonsquare_mosaic_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win._push_shape = (16, 16)
+    win._push_index = None
+    win._push_problem = None
+    win._dropped_pushes = 0
+
+    class _NoArrays:                       # an older ndviewer: no register_array at all
+        pass
+
+    detail, win._detail = win._detail, _NoArrays()
+    win._on_push(0, [np.zeros((16, 16), np.uint16)])
+    assert win._dropped_pushes == 1
+    assert "register_array" in win._readout.text() and "⚠" in win._readout.text()
+
+    win._detail, win._push_problem, win._dropped_pushes = detail, None, 0
+    win._push_index = {}                   # an index this run's viewer has no slot for
+    win._on_push(7, [np.zeros((16, 16), np.uint16)])
+    assert win._dropped_pushes == 1 and "no slot" in win._readout.text()
+
+    win._push_problem, win._dropped_pushes = None, 0
+    win._push_index = None
+    win._on_push(0, [np.zeros((99, 3), np.uint16)])      # not the declared canvas
+    assert win._dropped_pushes == 1 and "99x3" in win._readout.text()
+    # a success line must not be able to bury the warning
+    win._run_readout("✓ done")
+    assert win._readout.text().startswith("✓ done") and "99x3" in win._readout.text()
+    win.close()
+
+
+def test_ima245_real_tissue_stitch_reaches_the_central_viewer(qapp, stub_detail, real_dataset):
+    """The honest case, on the acquisition the product is demoed on.
+
+    ``manual0`` is 27 freeform 10x FOVs at ~10% overlap; the fused mosaic is 11535x9635 and the
+    frame is 2084x2084, so nothing here can be mistaken for the other. This is the exact run the
+    defect was reported from, and it costs ~13 s, so it runs by default (it skips only where the
+    acquisition is absent). Measured on the fix: the array viewer was declared and handed
+    (512, 428) — the fused 11535x9635 mosaic's aspect to within a pixel — with 0 dropped pushes."""
+    win = V.PlateWindow(None)
+    win.ingest(str(real_dataset))
+    mosaic_hw, pushes = _stitch_into_central_viewer(qapp, win, "manual0")
+    assert pushes, f"NOTHING reached the central array viewer: {win._readout.text()!r}"
+    got = pushes[0][4]
+    assert got == win._detail.canvases[-1]
+    assert got != tuple(win._meta["frame_shape"]) and max(got) == V._PUSH_PX
+    scale = V._PUSH_PX / max(mosaic_hw)
+    assert abs(got[0] - mosaic_hw[0] * scale) <= 2 and abs(got[1] - mosaic_hw[1] * scale) <= 2, \
+        f"push {got} is not the fused mosaic {mosaic_hw} scaled to fit {V._PUSH_PX}"
+    assert win._dropped_pushes == 0, win._readout.text()
+    win._stop_worker(); win.close()

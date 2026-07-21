@@ -2362,6 +2362,79 @@ def _mosaic_boxes(meta: dict) -> dict:
     return out
 
 
+def region_mosaic_extent_px(meta: dict, regions: Optional[list] = None) -> Optional[tuple]:
+    """Full-resolution ``(height, width)`` bounding box of the mosaics a REGION operator will fuse.
+
+    IMA-245. A region operator (``available_region_operators()``) yields ONE fused mosaic per
+    region, whose extent is the bounding box of the region's coordinate-placed frames — NOT the
+    frame shape. Anything that has to size a surface for that result (the array viewer's canvas,
+    the push planes fed into it) must ask this, or it sizes a mosaic as a frame.
+
+    Returns the max extent over *regions* (``None`` = every region in the acquisition), because
+    one array viewer serves the whole run and its canvas is declared once. Returns ``None`` when
+    the acquisition carries no stage positions / no pixel size — the same "not derivable, do not
+    guess" signal :func:`_mosaic_boxes` returns ``{}`` for.
+    """
+    from squidmip._placement import fov_offsets_px, mosaic_extent_px
+
+    positions = meta.get("fov_positions_um") or {}
+    if not positions or meta.get("pixel_size_um") in (None, 0):
+        return None
+    frame_shape = meta["frame_shape"]
+    scoped = list(meta["regions"]) if regions is None else list(regions)
+    best = None
+    for region in scoped:
+        fovs = meta["fovs_per_region"].get(region) or []
+        if not fovs:
+            continue
+        try:
+            offsets = fov_offsets_px(positions, region, fovs, meta.get("pixel_size_um"))
+            h, w = mosaic_extent_px(offsets, frame_shape)
+        except (KeyError, ValueError):
+            continue                     # this region contributes nothing; the rest still size it
+        best = (h, w) if best is None else (max(best[0], h), max(best[1], w))
+    return best
+
+
+def push_shape_for(meta: dict, region_op: bool, regions: Optional[list] = None) -> tuple:
+    """The ``(height, width)`` of every plane pushed into the array viewer for this run.
+
+    A per-FOV operator pushes a FRAME, so the surface is the frame shape. A REGION operator pushes
+    a whole-region MOSAIC, so the surface is the mosaic EXTENT. Either is scaled into a ``_PUSH_PX``
+    box PRESERVING ASPECT — a freeform 27-FOV strip is not a square, and squashing it into one
+    (which is what a fixed ``(_PUSH_PX, _PUSH_PX)`` surface did) is how it arrives unrecognisable.
+
+    Aspect is preserved the same way :func:`squidmip._placement.cell_boxes` preserves it for the
+    plate thumbnail, so the plate and the array viewer describe one geometry rather than two.
+    Falls back to the square when the extent is not derivable (no stage positions / pixel size);
+    the caller reports that fallback rather than showing a silently squashed mosaic.
+    """
+    extent = region_mosaic_extent_px(meta, regions) if region_op else None
+    if extent is None:                              # per-FOV op, or a region op with no geometry
+        extent = tuple(meta["frame_shape"])
+    mh, mw = int(extent[0]), int(extent[1])
+    s = min(_PUSH_PX / mh, _PUSH_PX / mw, 1.0)     # never UPSCALE: a push is a bounded thumbnail
+    return (max(1, int(round(mh * s))), max(1, int(round(mw * s))))
+
+
+def _fit_letterboxed(a: np.ndarray, h: int, w: int, dtype) -> np.ndarray:
+    """Scale a 2D plane into an exactly ``(h, w)`` canvas, aspect preserved and centred.
+
+    The array viewer's canvas is declared ONCE per run (``start_acquisition``), so every push has
+    to be that exact shape — while two regions of one acquisition can have differently shaped
+    mosaics. Letterboxing is the only way to satisfy both without stretching one of them, and it
+    is the policy the plate cell already uses (``cell_boxes`` centres a mosaic in its cell).
+    """
+    h, w = max(1, int(h)), max(1, int(w))
+    s = min(h / a.shape[0], w / a.shape[1])
+    ih = max(1, min(h, int(round(a.shape[0] * s))))
+    iw = max(1, min(w, int(round(a.shape[1] * s))))
+    out = np.zeros((h, w), dtype)
+    out[(h - ih) // 2:(h - ih) // 2 + ih,
+        (w - iw) // 2:(w - iw) // 2 + iw] = _fit_box(a, ih, iw)
+    return out
+
+
 # --- channel bar: one row per channel, under the plate overview -----------------------------
 
 class _ChannelBar(QWidget):
@@ -2484,6 +2557,17 @@ class _OperatorWorker(QThread):
 
         self._region_op = self._operator in available_region_operators()
         self._boxes = {} if (self._region_op or n_fovs == 1) else _mosaic_boxes(meta)
+        # IMA-245: the shape of what this run PUSHES to the array viewer. A region operator pushes
+        # a whole-region mosaic, so the surface is the mosaic extent (aspect preserved), not the
+        # frame. Computed here, once, and read back by the window through `push_shape` — the window
+        # declares the viewer's canvas from the SAME number the worker fills, so the producer and
+        # the consumer cannot describe two different rectangles.
+        self._push_shape = push_shape_for(meta, self._region_op, regions)
+        # True when a region run wanted the mosaic extent and could not derive it (no stage
+        # positions / no pixel size), so the push falls back to the square frame surface. The
+        # window turns this into a readout line: a squashed mosaic must not look like a correct one.
+        self._push_shape_estimated = bool(self._region_op
+                                          and region_mosaic_extent_px(meta, regions) is None)
         self._total = len(regions) if regions is not None else len(meta["regions"])
         self._channels = [c["name"] for c in meta["channels"]]
         self._dtype = np.dtype(meta["dtype"])
@@ -2502,6 +2586,22 @@ class _OperatorWorker(QThread):
         second chance to disagree, and a disagreement opens a different FOV than the one clicked.
         """
         return self._boxes
+
+    @property
+    def push_shape(self) -> tuple:
+        """``(h, w)`` of every plane this run pushes to the array viewer (IMA-245).
+
+        Read by the window to size ``start_acquisition``. Same reasoning as ``mosaic_boxes``:
+        recomputing it there would be a second chance to disagree, and a disagreement here is a
+        black viewer — the push is rejected for the wrong shape and the rejection is invisible.
+        """
+        return self._push_shape
+
+    @property
+    def push_shape_estimated(self) -> bool:
+        """True when a REGION run could not derive its mosaic extent and fell back to the square
+        frame surface. The window reports it; a squashed mosaic must not pass for a correct one."""
+        return self._push_shape_estimated
 
     @property
     def landed(self) -> int:
@@ -2561,7 +2661,11 @@ class _OperatorWorker(QThread):
         self.progress.emit(done, self._total)
         # feed the ndviewer growing slider: one ~512px plane per channel, in memory (register_array),
         # so scrubbing the processed wells is instant and z-collapsed (nz=1). Downsampled -> bounded.
-        push = [_area_downsample(well[c_i], _PUSH_PX, _PUSH_PX).astype(self._dtype)
+        # ...at `push_shape`: the frame square for a per-FOV operator, the aspect-preserved mosaic
+        # extent for a REGION operator (IMA-245). Squashing a region mosaic into the frame square
+        # is what put a whole-well stitch into the array viewer as an unreadable rectangle.
+        ph, pw = self._push_shape
+        push = [_fit_letterboxed(well[c_i], ph, pw, self._dtype)
                 for c_i in range(len(self._channels))]
         self.pushReady.emit(info["idx"], push)
 
@@ -2786,7 +2890,9 @@ class _ComputedPlateWorker(QThread):
                 tile = np.stack([_fit_cell(plane.astype(np.float32)) for plane in coarse])
                 self.tileReady.emit(ri, ci, wid, tile.astype(self._dtype))
                 push_src = self._read(wpath, fov, self._push)             # detail-slider source (C,Y,X)
-                push = [_area_downsample(push_src[c], _PUSH_PX, _PUSH_PX).astype(self._dtype)
+                # ...at the declared push canvas exactly (IMA-245): a pyramid level smaller than
+                # _PUSH_PX used to be pushed at its own size, which the viewer silently refused.
+                push = [_fit_letterboxed(push_src[c], _PUSH_PX, _PUSH_PX, self._dtype)
                         for c in range(push_src.shape[0])]
                 self.pushReady.emit(idx, push)
                 self.progress.emit(i, n)
@@ -2889,6 +2995,13 @@ class PlateWindow(QMainWindow):
         self._floating = {}           # key -> _FloatWindow holding that operator's UI detached
                                       # (a key lives in exactly ONE of the two dicts, never both)
         self._push_index = None       # global plate idx -> current run's slider position (None = identity)
+        # IMA-245: the (h, w) canvas the array viewer was last declared with, and the sticky reason
+        # a push could not be shown. None = no array canvas declared (the raw path registers file
+        # paths, not arrays), which is the signal for _on_push to skip the shape check.
+        self._push_shape = None
+        self._push_problem = None
+        self._readout_base = ""
+        self._dropped_pushes = 0
         self._active_exploration = None   # the exploration tab currently in front, if any
         self._tabs_muted = False      # suppress _on_tab_changed during bulk teardown (ingest)
         self._run_out_dir = None      # output dir of the in-flight SAVE run (for partial cleanup)
@@ -4274,6 +4387,8 @@ class PlateWindow(QMainWindow):
         h, w = meta["frame_shape"]
         channels = [c["name"] for c in meta["channels"]]
         self._detail.start_acquisition(channels, meta["n_z"], h, w, [f"{r}:0" for r in order])
+        self._push_shape = None       # raw mode registers PATHS, not arrays — no array canvas here
+        self._push_problem = None
         # Re-scope the RAW preview to the same wells the slider now lists. Without this the
         # producer (a full-plate _PreviewWorker) and the consumer (_push_index, built from
         # `order`) describe different well lists, and every push outside the subset is discarded.
@@ -4471,6 +4586,10 @@ class PlateWindow(QMainWindow):
         if self._detail is not None:
             self._detail.start_acquisition([c["name"] for c in channels], 1, _PUSH_PX, _PUSH_PX,
                                            [f"{w}:0" for w in self._order])
+        # A written plate is read back per FOV, so its pushes are frames at the push square.
+        self._push_shape = (_PUSH_PX, _PUSH_PX)
+        self._push_problem = None
+        self._dropped_pushes = 0
         # Every well came from disk, so the loupe is available across the whole plate here.
         try:
             import tensorstore as _ts
@@ -4622,19 +4741,33 @@ class PlateWindow(QMainWindow):
         # without this every push on a subset run lands at the wrong slot or out of range.
         self._push_index = (None if regions is None
                             else {self._fov_index[r]["idx"]: pos for pos, r in enumerate(run_order)})
-        if self._detail is not None:
-            self._detail.start_acquisition([c["name"] for c in self._meta["channels"]], 1,
-                                           _PUSH_PX, _PUSH_PX, [f"{r}:0" for r in run_order])
-        self._run_out_dir = str(out_dir) if (save and out_dir) else None   # for partial-output cleanup
-        self._run_tab_key = tab_key
         # n_fovs=None = EVERY FOV in each well (IMA-187). Anything else (the historical 1) makes
         # `_boxes` empty in the worker and the plate falls back to one thumbnail per well, which is
         # the whole feature not rendering. The overview then adopts the worker's boxes so a
         # double-click on a mosaic cell resolves the FOV under the cursor instead of always 0.
+        # Built BEFORE start_acquisition (IMA-245): the worker owns this run's push geometry and the
+        # viewer's canvas is declared from it, so there is one rectangle, not two that agree by luck.
         self._worker = _OperatorWorker(key, self._reader, self._meta, self._fov_index,
                                        str(out_dir) if out_dir else "", regions=regions, save=save,
                                        n_fovs=None)
         self._overview.set_mosaic_boxes(self._worker.mosaic_boxes)
+        # IMA-245: size the array viewer to what this run actually pushes. A REGION operator
+        # (stitch, coordinate) pushes one FUSED MOSAIC per region, so the canvas is the mosaic
+        # extent — declaring the frame square here handed the viewer a rectangle the mosaic does
+        # not have, and the reported symptom was a black central viewer with no error anywhere.
+        self._push_shape = self._worker.push_shape
+        self._push_problem = None                            # sticky readout warning (see _on_push)
+        self._dropped_pushes = 0                             # per RUN: this run's unrouted pushes
+        if self._worker.push_shape_estimated:
+            self._note_push_problem(
+                "no stage positions / pixel size — the array viewer is sized as a frame, so the "
+                "fused mosaic is shown squashed to that shape")
+        if self._detail is not None:
+            ph, pw = self._push_shape
+            self._detail.start_acquisition([c["name"] for c in self._meta["channels"]], 1,
+                                           ph, pw, [f"{r}:0" for r in run_order])
+        self._run_out_dir = str(out_dir) if (save and out_dir) else None   # for partial-output cleanup
+        self._run_tab_key = tab_key
         # A re-run must not composite on top of the LAST run's pixels: with a mosaic, a run that
         # lands fewer FOVs would otherwise leave the previous run's fields standing in the same
         # cell, blended into the new ones. Drop this layer's store before the first tile arrives.
@@ -4646,7 +4779,7 @@ class PlateWindow(QMainWindow):
         self._worker.tileReady.connect(self._on_tile)
         self._worker.pushReady.connect(self._on_push)
         self._worker.progress.connect(
-            lambda d, t: self._readout.setText(f"● {label} · {d}/{t} wells{dest}"))
+            lambda d, t: self._run_readout(f"● {label} · {d}/{t} wells{dest}"))
         self._worker.streamEnded.connect(lambda k=layer_key: self._recomposite(k))
         self._worker.writtenReady.connect(self._on_written)
         self._worker.wellFailed.connect(                     # a skipped well -> red x, run continues
@@ -4658,15 +4791,15 @@ class PlateWindow(QMainWindow):
         # empty plate. Landed==0 is a failure however politely the engine returned.
         def _done_msg(w=self._worker):
             if w.landed == 0:
-                self._readout.setText(
+                self._run_readout(
                     f"⚠ {label} · {scope} produced nothing — all {w.skipped or self._worker._total} "
                     f"well(s) were skipped (see the red markers)")
             elif w.skipped:
-                self._readout.setText(
+                self._run_readout(
                     f"✓ {label} · {scope}{dest} — {w.skipped} well(s) skipped"
                     + ("  (re-openable OME-Zarr)" if save else ""))
             else:
-                self._readout.setText(
+                self._run_readout(
                     f"✓ {label} · {scope}{dest}" + ("  (re-openable OME-Zarr)" if save else ""))
 
         self._worker.finished_ok.connect(_done_msg)
@@ -4677,7 +4810,7 @@ class PlateWindow(QMainWindow):
         # switch deferred during any of those still has to be delivered. _retire only disconnects
         # the worker's own signals, so this survives a stop.
         self._worker.finished.connect(self._on_run_drained)
-        self._readout.setText(f"● {label} · {scope}{dest} …")
+        self._run_readout(f"● {label} · {scope}{dest} …")
         self._worker.start()
 
     def _check_disk(self, out_dir, regions: Optional[list] = None) -> tuple[bool, float, str]:
@@ -4734,28 +4867,72 @@ class PlateWindow(QMainWindow):
             src.mark_written(well_id)
 
     def _on_push(self, fov_idx, planes):
-        """A computed well's ~512px channels -> the ndviewer growing slider (in-memory register_array,
-        LRU bounded). z collapsed (nz=1). No-op if the detail has no register_array (older ndv / stub).
+        """A computed result's bounded planes -> the array viewer (in-memory register_array, LRU
+        bounded). z collapsed (nz=1). One push per FOV for a per-FOV operator, one per REGION —
+        the fused mosaic — for a region operator (IMA-245).
 
         ``fov_idx`` is the GLOBAL plate index. The slider is built from the CURRENT RUN's regions,
         so for a subset run it is only len(regions) long and the global index has to be translated
         (``_push_index``). Dropping an untranslatable push is deliberate: a push whose position we
         cannot resolve belongs to a run whose slider is gone, and guessing would paint one well's
-        image onto another well's slot — silently, since register_array errors are swallowed below."""
-        if self._detail is None or not hasattr(self._detail, "register_array"):
+        image onto another well's slot.
+
+        NOTHING here is dropped silently (IMA-245). Every way a push can fail to land — no viewer,
+        a viewer with no ``register_array``, an index this run's slider has no slot for, a plane
+        whose shape is not the canvas we declared, or a rejection from the viewer itself — counts
+        into ``_dropped_pushes`` AND says so in the readout. A black viewer with no error is what
+        made the reported defect take a human to find; the swallowed ``except Exception: pass``
+        below it was the last place that could have spoken and did not."""
+        if self._detail is None:
+            self._drop_push("there is no array viewer in this window to show the result in")
+            return
+        if not hasattr(self._detail, "register_array"):
+            # The routine cause: an ndviewer_light build without the register_array push API. Every
+            # computed result is then unshowable, which looks exactly like a viewer that is black.
+            self._drop_push("this ndviewer_light build has no register_array — computed results "
+                            "cannot reach the array viewer (upgrade ndviewer_light)")
             return
         pos = fov_idx if self._push_index is None else self._push_index.get(fov_idx)
         if pos is None:
-            # Deliberate drop, but COUNT it: a silent discard here is what made a broken FOV
-            # slider look like a viewer that "only shows the plane you clicked".
-            self._dropped_pushes = getattr(self, "_dropped_pushes", 0) + 1
+            self._drop_push(f"a result for plate index {fov_idx} has no slot in this run's "
+                            f"viewer — it belongs to a run whose slider is gone")
             return
+        want = getattr(self, "_push_shape", None)
         channels = [c["name"] for c in self._meta["channels"]]
         for c_i, plane in enumerate(planes):
+            got = tuple(np.asarray(plane).shape)
+            if want is not None and got != tuple(want):
+                # The producer and the declared canvas disagree — the defect class this whole file
+                # keeps meeting. Say which two numbers disagree; do not push a plane the viewer
+                # will reject without telling anyone.
+                self._drop_push(f"the result is {got[0]}x{got[1]} but the array viewer was "
+                                f"declared {want[0]}x{want[1]}")
+                return
             try:
                 self._detail.register_array(0, pos, 0, channels[c_i], plane)
-            except Exception:
-                pass   # one bad push must not break the run
+            except Exception as e:      # one bad push must not break the run — but it must be said
+                self._drop_push(f"the array viewer rejected the result: {type(e).__name__}: {e}")
+                return
+
+    def _drop_push(self, why: str):
+        """Count an unrouted push and put the reason in the readout (IMA-245)."""
+        self._dropped_pushes = getattr(self, "_dropped_pushes", 0) + 1
+        self._note_push_problem(why)
+
+    def _note_push_problem(self, why: str):
+        """Make ``why`` a STICKY suffix on this run's readout, so a later progress/success line
+        cannot overwrite it. A run that finished computing but could not display its result is not
+        a success, and the '✓' must not be the last word on it."""
+        if getattr(self, "_push_problem", None) == why:
+            return
+        self._push_problem = why
+        self._run_readout(getattr(self, "_readout_base", self._readout.text()))
+
+    def _run_readout(self, text: str):
+        """Set the run's status line, re-appending any push problem this run has hit."""
+        self._readout_base = text
+        why = getattr(self, "_push_problem", None)
+        self._readout.setText(text + (f"   ·   ⚠ {why}" if why else ""))
 
     def _on_failed(self, msg):
         if self._overview is not None:
