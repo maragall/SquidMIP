@@ -83,9 +83,19 @@ import numpy as np
 from squidmip._engine import add_projector
 from squidmip.projection import plane_op
 
-# RL iterations. Biggs-Andrews acceleration converges faster than plain RL, but 10 is still the
-# widefield working point: RL amplifies noise monotonically past roughly 20-30 iterations.
-DEFAULT_ITERATIONS: int = 10
+# RL iterations. Julio's working point on this instrument, not a textbook default.
+#
+# Richardson-Lucy is SEMI-CONVERGENT: error against the truth falls, reaches a minimum, then
+# rises again as the algorithm starts fitting noise. Ringing re-grows and point-like structures
+# develop a bright core with an expanding halo. So more iterations is not more deconvolved, it
+# is eventually less, and there is no universally correct count - it depends on SNR and on the
+# PSF, which is why IMA-252 puts a turbo XZ/YZ view in front of a human to judge the turn.
+#
+# 3 is the default and 2 is where the QC loop starts. The previous value here was 10, justified
+# as "the widefield working point"; that was a generic number, and this instrument (NA 0.3,
+# 0.752 um/px, Nz=10) is not the generic case.
+DEFAULT_ITERATIONS: int = 3
+QC_START_ITERATIONS: int = 2
 
 # PINNED, never inherited from petakit's default. petakit's default is "omw", which returns an
 # all-zero volume on this instrument's data (see the module docstring, trap 1).
