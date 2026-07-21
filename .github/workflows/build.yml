@@ -56,12 +56,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install "git+https://github.com/maragall/ndviewer_light"
           pip install ".[gui]" pyinstaller
+      # IMA-232: the spec file, not a flag soup. The old one-liner passed --windowed AND
+      # -c; -c wins, so on macOS it built a console executable and never produced a .app
+      # at all. The spec also carries the ml_dtypes hidden import (without it the bundle
+      # dies on first run) and the excludes that took the macOS bundle 517 -> 352 MB.
       - name: Freeze hcs-viewer
-        run: >
-          pyinstaller --noconfirm --windowed --name hcs-viewer
-          --collect-all ndviewer_light --collect-all ndv --collect-all tensorstore
-          --collect-all imageio_ffmpeg --collect-submodules squidmip
-          -c scripts/hcs_viewer_entry.py
+        run: pyinstaller --noconfirm --clean scripts/hcs-viewer.spec
       - name: Package Linux AppImage
         if: runner.os == 'Linux'
         run: |
