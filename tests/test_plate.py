@@ -26,8 +26,11 @@ from squidmip._plate import (
     build_plate,
     carrier_art,
     format_from_pitch_um,
+    freeform_grid,
+    freeform_layout,
     load_sample_formats,
     measure_region_pitch_um,
+    region_stage_boxes_um,
     squid_images_dir,
 )
 
@@ -411,3 +414,154 @@ def test_real_synthetic_dataset_resolves_to_96_not_the_declared_384():
         p = build_plate(md)
     assert p.format_name == "96 well plate"                  # what the stage says
     assert p.pitch_x_um == pytest.approx(9000.0, abs=1.0)
+
+
+# ------------------------------------------------- freeform layout by GEOMETRY (IMA-253)
+#
+# The defect these pin: a freeform region id carries NO position, so a carrier that assigns
+# cells "left to right, in the order the acquisition reports them" is inventing the layout.
+# On the real 10x tissue that put two regions -- which are separated in Y and overlapping in
+# X -- side by side in columns 0 and 1. Every assertion below is therefore about geometry
+# beating enumeration, and the shuffle test is the mutation-check for exactly that.
+
+def _freeform_meta(boxes, pixel_size_um=1.0, frame=(100, 100)):
+    """An acquisition of freeform regions, each a grid of FOVs covering ``(x0, y0, w, h)`` um."""
+    regions = list(boxes)
+    positions, fovs = {}, {}
+    for region, (x0, y0, w, h) in boxes.items():
+        pts = [(x0, y0), (x0 + w, y0), (x0, y0 + h), (x0 + w, y0 + h)]
+        fovs[region] = list(range(len(pts)))
+        for f, xy in enumerate(pts):
+            positions[(region, f)] = xy
+    return {"regions": regions, "fovs_per_region": fovs, "fov_positions_um": positions,
+            "wellplate_format": None, "pixel_size_um": pixel_size_um, "frame_shape": frame}
+
+
+def test_region_stage_boxes_um_is_the_mosaic_extent_not_the_first_fov():
+    meta = _freeform_meta({"manual0": (1000.0, 2000.0, 600.0, 400.0)},
+                          pixel_size_um=2.0, frame=(50, 30))
+    (x, y, w, h) = region_stage_boxes_um(meta)["manual0"]
+    assert (x, y) == (1000.0, 2000.0)
+    # a position marks a frame CORNER, so the region spans one more frame past the last one
+    assert w == pytest.approx(600.0 + 30 * 2.0)
+    assert h == pytest.approx(400.0 + 50 * 2.0)
+
+
+def test_freeform_regions_separated_in_y_get_stacked_cells_not_side_by_side():
+    # The real 10x tissue shape: overlapping in x, cleanly separated in y.
+    meta = _freeform_meta({"manual0": (96814.0, 10185.0, 5642.0, 7052.0),
+                           "manual1": (97937.0, 21113.0, 5642.0, 7052.0)})
+    p = build_plate(meta)
+    assert (p.rows, p.cols) == (2, 1), "two regions separated in y are two ROWS, not two columns"
+    assert p.cell_index("manual0") == (0, 0)
+    assert p.cell_index("manual1") == (1, 0)
+    lay = p.cell_layout()
+    assert lay["manual1"][1] > lay["manual0"][1], "manual1 is below manual0 on the stage"
+    assert lay["manual1"][0] > lay["manual0"][0], "...and offset in x, as the stage records"
+
+
+def test_freeform_layout_does_not_depend_on_the_ORDER_OR_NAMES_of_the_regions():
+    """The mutation-check: placement must follow geometry, never enumeration.
+
+    Renaming the regions so that alphabetical order REVERSES the stage order, and reporting them
+    in the opposite order, must produce the identical picture. A layout driven by enumeration
+    fails both halves; one driven by ``fov_positions_um`` cannot notice either change.
+    """
+    boxes = {"manual0": (96814.0, 10185.0, 5642.0, 7052.0),
+             "manual1": (97937.0, 21113.0, 5642.0, 7052.0)}
+    base = build_plate(_freeform_meta(boxes))
+    ref = {cid: base.cell_layout()[cid] for cid in boxes}
+    ref_idx = {cid: base.cell_index(cid) for cid in boxes}
+
+    shuffled = build_plate(_freeform_meta(dict(reversed(list(boxes.items())))))
+    assert {c: shuffled.cell_layout()[c] for c in boxes} == ref
+    assert {c: shuffled.cell_index(c) for c in boxes} == ref_idx
+
+    renamed = {"zebra": boxes["manual0"], "alpha": boxes["manual1"]}   # alphabetical == reversed
+    r = build_plate(_freeform_meta(renamed))
+    assert r.cell_index("zebra") == (0, 0) and r.cell_index("alpha") == (1, 0)
+    assert r.cell_layout()["zebra"] == pytest.approx(ref["manual0"])
+    assert r.cell_layout()["alpha"] == pytest.approx(ref["manual1"])
+
+
+def test_regions_with_different_extents_get_differently_sized_cells():
+    """Julio: "regions have different sizes and different geometries when it comes to tissues".
+
+    A uniform grid would stretch the small one and crop the large one. The cell IS the region's
+    own mosaic box, so the ratio of cell areas has to equal the ratio of stage areas.
+    """
+    meta = _freeform_meta({"small": (0.0, 0.0, 2000.0, 1000.0),
+                           "big": (0.0, 20000.0, 8000.0, 6000.0)}, frame=(0, 0))
+    lay = build_plate(meta).cell_layout()
+    sw, sh = lay["small"][2], lay["small"][3]
+    bw, bh = lay["big"][2], lay["big"][3]
+    assert bw > sw and bh > sh
+    assert bw / sw == pytest.approx(8000.0 / 2000.0)      # relative SCALE is preserved,
+    assert bh / sh == pytest.approx(6000.0 / 1000.0)      # independently per axis
+    assert sw / sh == pytest.approx(2.0)                  # ...and so is each region's own aspect
+
+
+def test_freeform_layout_preserves_relative_offset_not_just_order():
+    """Two regions 3x further apart than they are wide must RENDER 3x further apart."""
+    meta = _freeform_meta({"a": (0.0, 0.0, 1000.0, 1000.0),
+                           "b": (0.0, 4000.0, 1000.0, 1000.0)}, frame=(0, 0))
+    lay = build_plate(meta).cell_layout()
+    gap = lay["b"][1] - (lay["a"][1] + lay["a"][3])
+    assert gap / lay["a"][3] == pytest.approx(3.0)
+
+
+def test_well_plates_keep_the_uniform_grid_and_have_no_layout():
+    """A well id DOES encode position, so nothing above may touch a plate. IMA-253's whole rule."""
+    p = build_plate(_meta(wellplate_format="96 well plate"))
+    assert p.cell_layout() is None
+    assert (p.rows, p.cols) == (8, 12)
+    assert p.cell_index("B2") == (1, 1)
+
+
+def test_freeform_without_stage_coordinates_still_falls_back_to_positional():
+    """No coordinates -> nothing to place BY, so the old left-to-right rule is the honest answer."""
+    regions = ["manual0", "manual1"]
+    p = build_plate(_meta(regions=regions, fovs_per_region={r: [0] for r in regions},
+                          fov_positions_um={}, wellplate_format=None))
+    assert p.cell_layout() is None
+    assert p.cell_index("manual0") == (0, 0)
+    assert p.cell_index("manual1") == (0, 1)
+
+
+def test_freeform_grid_does_not_fuse_two_regions_over_a_sliver_of_y_overlap():
+    rows, cols, place = freeform_grid({"a": (0.0, 0.0, 100.0, 1000.0),
+                                       "b": (0.0, 950.0, 100.0, 1000.0)})
+    assert (rows, cols) == (2, 1), "a 5% y overlap is two stacked regions, not one row"
+
+
+def test_freeform_grid_puts_side_by_side_regions_in_one_row():
+    rows, cols, place = freeform_grid({"left": (0.0, 0.0, 100.0, 1000.0),
+                                       "right": (5000.0, 10.0, 100.0, 1000.0)})
+    assert (rows, cols) == (1, 2)
+    assert place["left"] == (0, 0) and place["right"] == (0, 1)
+
+
+def test_cell_layout_rectangles_stay_inside_the_grid():
+    meta = _freeform_meta({"a": (0.0, 0.0, 1000.0, 500.0), "b": (9000.0, 3000.0, 400.0, 4000.0)})
+    p = build_plate(meta)
+    for x, y, w, h in p.cell_layout().values():
+        assert -1e-9 <= x and x + w <= p.cols + 1e-9
+        assert -1e-9 <= y and y + h <= p.rows + 1e-9
+
+
+@pytest.mark.skipif(not (Path.home() / "Downloads" /
+                         "test_10x_laser_af_z_stack_2025-10-28_13-40-43.939945 yy").is_dir(),
+                    reason="real tissue acquisition not present")
+def test_real_tissue_regions_are_stacked_in_y_and_overlap_in_x():
+    """The acquisition this ticket was opened about, measured rather than eyeballed."""
+    from squidmip.reader import open_reader
+
+    md = open_reader(Path.home() / "Downloads" /
+                     "test_10x_laser_af_z_stack_2025-10-28_13-40-43.939945 yy").metadata
+    boxes = region_stage_boxes_um(md)
+    m0, m1 = boxes["manual0"], boxes["manual1"]
+    assert m1[1] > m0[1] + m0[3] * 0.9, "manual1 sits below manual0 on the stage"
+    assert m1[0] < m0[0] + m0[2], "...while still overlapping it in x"
+    p = build_plate(md)
+    assert (p.rows, p.cols) == (2, 1)
+    assert p.cell_index("manual0") == (0, 0) and p.cell_index("manual1") == (1, 0)

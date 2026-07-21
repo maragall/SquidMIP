@@ -31,7 +31,7 @@ if "PySide6" in sys.modules or "PySide2" in sys.modules:
         allow_module_level=True,
     )
 from PyQt5.QtCore import QEvent, QPointF, Qt  # noqa: E402
-from PyQt5.QtGui import QMouseEvent  # noqa: E402
+from PyQt5.QtGui import QImage, QMouseEvent  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QPushButton, QSlider, QSpinBox, QWidget,
 )
@@ -3726,3 +3726,171 @@ def test_ima245_real_tissue_stitch_reaches_the_central_viewer(qapp, stub_detail,
         f"push {got} is not the fused mosaic {mosaic_hw} scaled to fit {V._PUSH_PX}"
     assert win._dropped_pushes == 0, win._readout.text()
     win._stop_worker(); win.close()
+
+
+# ============================================================================ IMA-253 / IMA-249
+# A REGION IS A MOSAIC CONTAINING AN ARRAY OF FOVs, and it must look like one the moment the
+# acquisition opens. Julio, on the real 10x tissue:
+#
+#   "I still don't see the mosaics in the plate at all. It doesn't look like a slide. It looks
+#    like a bunch of squares overlapped with each other under different regions ... They look
+#    like overlapping FOVs when they should actually be independent mosaics that have different
+#    slots in the slide carrier."
+#
+# Two causes, one change: the layout came from ENUMERATION ORDER (a freeform id carries no
+# position), and the raw preview read ONE representative FOV per region while `set_mosaic_boxes`
+# was only ever called from `run_operator` -- so the mosaic was invisible until something ran.
+# Everything here is measured on the montage, never on a whole-widget grab: labels, grid and
+# status dots keep whole-frame variance high, so a widget-level check passes against a BLANK
+# montage. That trap has been hit once already.
+
+def _region_crop(ov, region):
+    """The rendered pixels of ONE region's cell -- its own rectangle, not a grid square."""
+    rc = next(k for k, v in ov._by_rc.items() if v == region)
+    x, y, w, h = ov._cell_rect(*rc)
+    img = ov.grab().toImage().convertToFormat(QImage.Format_RGB32)
+    a = np.frombuffer(img.constBits().asstring(img.byteCount()), np.uint8)
+    a = a.reshape(img.height(), img.bytesPerLine() // 4, 4)[:, :img.width(), :3]
+    return a[max(0, int(y)):int(y + h), max(0, int(x)):int(x + w)]
+
+
+def test_ima253_real_tissue_previews_both_regions_as_mosaics_before_any_operator_runs(
+        qapp, stub_detail, real_dataset):
+    """The acceptance number: 55 boxes and two composited mosaics, with nothing run.
+
+    27 + 28 FOVs. Before the fix ``boxes on ov`` was 0 and each region showed ONE frame stretched
+    over its cell, because ``set_mosaic_boxes`` was reachable only from ``run_operator``.
+    """
+    win = V.PlateWindow(None)
+    win.ingest(str(real_dataset))
+    ov = win._overview
+    assert len(ov._boxes) == 55, (
+        f"the mosaic geometry is pure arithmetic on coordinates.csv and is known at ingest, but "
+        f"only {len(ov._boxes)} boxes reached the plate. This is IMA-249: the boxes existed and "
+        f"were never handed to the widget until an operator ran.")
+    per_region: dict = {}
+    for region, _fov in ov._boxes:
+        per_region[region] = per_region.get(region, 0) + 1
+    assert per_region == {"manual0": 27, "manual1": 28}, per_region
+
+    # ...and the preview really composites all of them, rather than one frame per region.
+    assert _drain_until(qapp, lambda: win._preview is None or not win._preview.isRunning(), 180)
+    assert win._worker is None, "no operator ran; the mosaic must be there without one"
+    for region in ("manual0", "manual1"):
+        crop = _region_crop(ov, region)
+        assert crop.size and crop.std() > 3, f"{region} renders blank/uniform (std {crop.std():.2f})"
+    win.close()
+
+
+def test_ima253_preview_plan_reads_every_fov_of_a_region_but_only_one_of_a_single_fov_well(
+        qapp, stub_detail, real_dataset, squid_dataset):
+    """Cost is driven by the REAL FOV COUNT PER REGION -- the reason 1536x1 cannot get slower."""
+    from squidmip import open_reader
+
+    meta = open_reader(str(real_dataset)).metadata
+    idx = {r: {"rc": (i, 0), "idx": i} for i, r in enumerate(meta["regions"])}
+    plan = V._PreviewWorker(None, meta, idx, list(meta["regions"]))._plan()
+    assert len(plan) == 55, f"the preview reads {len(plan)} planes/channel, not 55"
+    assert all(box is not None for _r, _f, box in plan)
+
+    root, _ = squid_dataset                       # 2 FOVs/region, but specks apart on this fixture
+    m2 = open_reader(str(root)).metadata
+    idx2 = {r: {"rc": (i, 0), "idx": i} for i, r in enumerate(m2["regions"])}
+    plan2 = V._PreviewWorker(None, m2, idx2, list(m2["regions"]))._plan()
+    assert all(box is None for _r, _f, box in plan2), \
+        "sub-_MIN_PREVIEW_BOX_PX fields are specks: reading one plane each is cost with no picture"
+
+
+def test_ima253_real_tissue_regions_are_stacked_in_y_and_offset_in_x(
+        qapp, stub_detail, real_dataset):
+    """The layout defect itself: two regions that are separated in Y rendered SIDE BY SIDE.
+
+    manual0 spans stage y 10186..17238, manual1 21113..28165 -- no overlap at all -- while their
+    x ranges (96814..102456 / 97937..103578) overlap heavily. The old carrier put them in columns
+    0 and 1 of a "4 slide carrier" by enumeration order, which is why the plate did not look like
+    a slide.
+    """
+    win = V.PlateWindow(None)
+    win.ingest(str(real_dataset))
+    ov = win._overview
+    assert ov._layout is not None, "a freeform holder must be placed by geometry"
+    r0 = ov._cell_rect(*next(k for k, v in ov._by_rc.items() if v == "manual0"))
+    r1 = ov._cell_rect(*next(k for k, v in ov._by_rc.items() if v == "manual1"))
+    assert r1[1] >= r0[1] + r0[3], f"manual1 must render BELOW manual0, got {r0} / {r1}"
+    assert r1[0] < r0[0] + r0[2] and r0[0] < r1[0] + r1[2], "...and still overlap it in x"
+    assert r1[0] > r0[0], "manual1 is further +x than manual0, as the stage records"
+    # relative scale: the two mosaics have the same extent on this dataset, so must the cells
+    assert r0[2] == pytest.approx(r1[2], rel=0.02)
+    assert r0[3] == pytest.approx(r1[3], rel=0.02)
+    win.close()
+
+
+def test_ima253_shuffling_the_region_names_does_not_move_anything(qapp, stub_detail, real_dataset):
+    """MUTATION-CHECK. This is the assertion that proves placement follows GEOMETRY.
+
+    Reverse the order the acquisition reports its regions in. A layout driven by enumeration
+    order flips; one driven by ``fov_positions_um`` cannot notice.
+    """
+    from squidmip import open_reader
+    from squidmip._plate import build_plate
+
+    meta = open_reader(str(real_dataset)).metadata
+    ref = build_plate(meta)
+    flipped = build_plate({**meta, "regions": list(reversed(meta["regions"]))})
+    assert flipped.cell_layout() == ref.cell_layout()
+    assert flipped.occupied_map == ref.occupied_map
+
+
+def test_ima253_the_default_paint_path_loads_no_carrier_png(qapp, stub_detail, squid_dataset,
+                                                            monkeypatch):
+    """Art available or not, the plate renders IDENTICALLY -- because art is never consulted.
+
+    The PNG needed three calibration constants (``a1_x_pixel``, ``a1_x_mm``, ``mm_per_pixel``) to
+    agree with the geometry the cells are laid out from; when they did not, nothing raised and the
+    wells were simply drawn in the wrong place. The registry is kept in ``_plate`` as an optional
+    skin, so this asserts it is OFF the path, not that it is gone.
+    """
+    import squidmip._plate as P
+
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    _drain_until(qapp, lambda: len(win._overview._tiles) >= 2)
+    before = _montage_px(qapp, win._overview)
+    shot = win._overview.grab().toImage()
+
+    calls = []
+    monkeypatch.setattr(P, "carrier_art", lambda *a, **k: calls.append(a) or None)
+    win2 = V.PlateWindow(None)
+    win2.ingest(str(root))
+    _drain_until(qapp, lambda: len(win2._overview._tiles) >= 2)
+    assert np.array_equal(_montage_px(qapp, win2._overview), before)
+    assert win2._overview.grab().toImage() == shot, \
+        "the render changed when the art registry was disabled -- art is still on the paint path"
+    assert not calls, f"carrier_art() was called {len(calls)}x during a default open"
+    assert not hasattr(win2._overview, "_art_img")
+    win.close(); win2.close()
+
+
+def test_ima253_empty_slots_are_visibly_distinct_from_occupied_ones(qapp, stub_detail):
+    """Julio said the photograph was poor at exactly this, so it is now drawn and measured."""
+    from squidmip._plate import SlideCarrier
+
+    plate = SlideCarrier.from_format("4 slide carrier", occupancy={"manual0": [0]},
+                                     cell_ids=["manual0"])
+    ov = V.PlateOverview(plate.row_labels, plate.col_labels, plate.occupied_map)
+    ov.set_carrier(plate)
+    ov.resize(600, 240)
+    img = ov.grab().toImage().convertToFormat(QImage.Format_RGB32)
+    a = np.frombuffer(img.constBits().asstring(img.byteCount()), np.uint8)
+    a = a.reshape(img.height(), img.bytesPerLine() // 4, 4)[:, :img.width(), :3]
+
+    def _cell_px(ci):
+        x, y, w, h = ov._cell_rect(0, ci)
+        return a[int(y) + 2:int(y + h) - 2, int(x) + 2:int(x + w) - 2]
+
+    occupied, empty = _cell_px(0), _cell_px(1)
+    assert occupied.size and empty.size
+    assert abs(float(occupied.mean()) - float(empty.mean())) > 1.5, \
+        "an empty slot must not look like an occupied one"
+    ov.deleteLater()
