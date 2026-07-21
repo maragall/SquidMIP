@@ -31,6 +31,13 @@ from squidmip._engine import (
 )
 from squidmip._montage import build_montage
 from squidmip._output import write_plate
+from squidmip._stitch import (
+    add_region_operator,
+    available_region_operators,
+    solve_offsets_px,
+    stitch_plate,
+    stitch_region,
+)
 from squidmip._tiling import Geometry, TileCache, TileDescriptor, select_tiles
 from squidmip._tilesource import InMemoryMultiscale, PlateLadder, ZarrPyramidSource, plate_ladder
 from squidmip.projection import (
@@ -60,6 +67,12 @@ __all__ = [
     "Z_REDUCER",
     "write_plate",
     "build_montage",
+    # IMA-222 region operators (inter-FOV; the parallel table to the projectors)
+    "stitch_region",
+    "stitch_plate",
+    "solve_offsets_px",
+    "add_region_operator",
+    "available_region_operators",
     # IMA-216 tiler + IMA-217 sources
     "select_tiles",
     "Geometry",
