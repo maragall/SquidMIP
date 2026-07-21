@@ -1102,6 +1102,16 @@ class _OperatorWorker(QThread):
         self._seen_fovs: dict[tuple, set] = {}    # (ri,ci) -> FOVs composited so far, for progress
         self._stop = threading.Event()            # set by the window to end the run cleanly
 
+    @property
+    def mosaic_boxes(self) -> dict:
+        """``{(region, fov): (top, left, h, w)}`` this run composites into ({} = single-tile path).
+
+        The plate view must hit-test against the SAME boxes the worker paints into, so it reads
+        them from here rather than recomputing — a second `_mosaic_boxes(meta)` call would be a
+        second chance to disagree, and a disagreement opens a different FOV than the one clicked.
+        """
+        return self._boxes
+
     def stop(self):
         """Ask the run to stop; write_plate polls this and abandons after in-flight wells drain."""
         self._stop.set()
@@ -1986,11 +1996,11 @@ class PlateWindow(QMainWindow):
         self._preview.tileReady.connect(self._on_preview_tile)
         self._preview.start()   # (the detail already landed on order[0] via _setup_raw_detail)
         # top-left = LIVE STATUS (what's happening / what's shown); the plate name is the pane title
-        # Multi-FOV policy (IMA-191): current scope is one FOV per well (a well = a condition, exactly
-        # Nick's "n=1 per condition"). When wells hold >1 FOV we SAMPLE the first and say so — honest
-        # interim until high-throughput stitching (stitch -> MIP -> one composite/well) lands.
+        # Multi-FOV policy (IMA-187): an operator run processes EVERY FOV and composites them into
+        # the well's cell by stage coordinate. The raw preview above is still one FOV per well (it
+        # reads a single plane per well precisely to stay fast), so say which one you're looking at.
         multi = sum(1 for r in order if len(meta["fovs_per_region"][r]) > 1)
-        note = (f" · {multi} multi-FOV well(s): sampling 1 FOV/well (stitching TBD)" if multi else "")
+        note = (f" · {multi} multi-FOV well(s): preview shows 1 FOV/well, MIP mosaics all" if multi else "")
         self._readout.setText(f"live · {len(self._fov_index)} wells · double-click to open{note}")
 
     def _setup_raw_detail(self):
@@ -2033,6 +2043,7 @@ class PlateWindow(QMainWindow):
         self._plate_mode = "raw"
         self._plate_title.setText(f"{self._acq_name}   ·   raw")
         self._overview.set_active_layer("raw")
+        self._overview.set_mosaic_boxes({})   # raw preview is one thumbnail/well -> no mosaic to hit-test
         for rc in list(self._overview._status):
             self._overview.set_status(*rc, "empty")
         self._refresh_layers_tab()
@@ -2190,9 +2201,15 @@ class PlateWindow(QMainWindow):
         if self._detail is not None:
             self._detail.start_acquisition([c["name"] for c in self._meta["channels"]], 1,
                                            _PUSH_PX, _PUSH_PX, [f"{r}:0" for r in self._order])
+        # n_fovs=None = EVERY FOV in each well (IMA-187). Anything else (the historical 1) makes
+        # `_boxes` empty in the worker and the plate falls back to one thumbnail per well, which is
+        # the whole feature not rendering. The overview then adopts the worker's boxes so a
+        # double-click on a mosaic cell resolves the FOV under the cursor instead of always 0.
         self._worker = _OperatorWorker(key, self._reader, self._meta, self._fov_index,
                                        self._overview._nr, self._overview._nc,
-                                       str(out_dir) if out_dir else "", regions=regions, save=save)
+                                       str(out_dir) if out_dir else "", regions=regions, save=save,
+                                       n_fovs=None)
+        self._overview.set_mosaic_boxes(self._worker.mosaic_boxes)
         dest = f" → {out_dir.name}" if save else " (preview — not saved)"
         self._worker.tileReady.connect(self._on_tile)
         self._worker.pushReady.connect(self._on_push)
@@ -2220,7 +2237,11 @@ class PlateWindow(QMainWindow):
         import shutil
         m = self._meta
         ny, nx = m["frame_shape"]
-        est = int(len(self._fov_index) * m.get("n_t", 1) * len(m["channels"]) * ny * nx
+        # Count FIELDS, not wells: the run projects every FOV (n_fovs=None), so a 36-FOV plate
+        # writes 36x what a per-well count predicts. Under-counting here is how a multi-hour run
+        # fills the disk mid-write with the guard reporting "plenty of room".
+        n_fields = sum(len(m["fovs_per_region"][r]) for r in self._fov_index)
+        est = int(n_fields * m.get("n_t", 1) * len(m["channels"]) * ny * nx
                   * np.dtype(m["dtype"]).itemsize * 1.34)
         gb = 1024 ** 3
         try:

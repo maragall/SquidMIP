@@ -651,3 +651,58 @@ def test_second_ingest_resets_state(qapp, stub_detail, squid_dataset, tmp_path):
     assert set(win._overview._status.values()) == {"empty"}     # fresh grey plate
     win._stop_worker()
     win.close()
+
+
+# --- IMA-187 wiring guard -------------------------------------------------------------
+# The mosaic half of IMA-187 shipped DEAD: `_OperatorWorker` was constructed without
+# `n_fovs`, so it defaulted to 1 and `_boxes` was always {}; and `set_mosaic_boxes` had
+# zero callers in the repo. Every inherited viewer test still passed, because they only
+# exercise the single-tile path. These fail on that dead wiring, so the 227 -> 206 -> 187
+# rebase cannot silently drop the feature again.
+
+def test_operator_worker_is_constructed_for_multi_fov_not_defaulted_to_one(
+        qapp, stub_detail, squid_dataset, tmp_path, monkeypatch):
+    """run_operator must hand the worker a multi-FOV n_fovs, or the mosaic is unreachable."""
+    seen = {}
+    real_init = V._OperatorWorker.__init__
+
+    def spy(self, *a, **kw):
+        seen["n_fovs"] = kw.get("n_fovs", "NOT-PASSED")
+        return real_init(self, *a, **kw)
+
+    monkeypatch.setattr(V._OperatorWorker, "__init__", spy)
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("mip", out_parent=str(tmp_path))
+    _drain_until(qapp, lambda: "n_fovs" in seen)
+
+    try:
+        assert seen.get("n_fovs") != "NOT-PASSED", (
+            "run_operator constructed _OperatorWorker without n_fovs, so it defaults to 1, "
+            "_boxes is always {}, and the coordinate-placed mosaic can never render.")
+        assert seen["n_fovs"] != 1, (
+            f"n_fovs={seen['n_fovs']!r}; the mosaic path requires n_fovs != 1 "
+            "(_OperatorWorker: `_boxes = _mosaic_boxes(meta) if n_fovs != 1 else {}`).")
+    finally:
+        win._stop_worker(); win.close()
+
+
+def test_set_mosaic_boxes_is_actually_called_by_the_viewer(
+        qapp, stub_detail, squid_dataset, tmp_path, monkeypatch):
+    """PlateOverview.set_mosaic_boxes exists but nothing calls it -- boxes never reach paint."""
+    calls = []
+    monkeypatch.setattr(V.PlateOverview, "set_mosaic_boxes",
+                        lambda self, boxes: calls.append(boxes))
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("mip", out_parent=str(tmp_path))
+    _drain_until(qapp, lambda: bool(calls))
+
+    try:
+        assert calls, (
+            "set_mosaic_boxes was never called. PlateOverview._boxes stays empty, so _fov_at() "
+            "always returns FOV 0 and the mosaic is invisible to hit-testing and paint.")
+    finally:
+        win._stop_worker(); win.close()
