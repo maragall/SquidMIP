@@ -3241,12 +3241,14 @@ class PlateWindow(QMainWindow):
         The requirement is "open minerva-author with selected FOV(s)", so this reads the
         selection instead of inventing one. Sources, most specific first:
 
-        1. ``PlateOverview.selected_region_fovs()`` — IMA-221's per-FOV plate selection. That
-           branch is NOT merged here, so it is duck-typed (``getattr``), never imported, and
-           both plausible shapes are accepted: ``{region: [fov, ...]}`` and an iterable of
-           ``(region, fov)`` pairs.
+        1. ``selected_region_fovs()`` — IMA-221's per-FOV plate selection payload. It landed on
+           **PlateWindow** (the overview is display-only; the metadata needed to expand wells to
+           FOVs lives here), so we probe ``self`` FIRST and the overview second — a future move
+           of the method onto the widget keeps working. Still duck-typed (``getattr``) and both
+           plausible shapes are accepted: ``{region: [fov, ...]}`` and ``[(region, fov), ...]``.
         2. ``PlateOverview.selected_wells()`` — whole wells selected on the plate: EVERY FOV
-           of each, because a selected well means the well, not its first tile.
+           of each, because a selected well means the well, not its first tile. This is the
+           fallback for a plate whose selection API is well-granular only.
         3. The well open in the detail viewer (``_current_well``): every FOV of it.
 
         Nothing selected returns ``[]`` — the caller says so rather than exporting fov 0 of 36
@@ -3281,8 +3283,10 @@ class PlateWindow(QMainWindow):
             return keep
 
         ov = self._overview
-        for attr, to_pairs in (("selected_region_fovs", normalise), ("selected_wells", expand)):
-            getter = getattr(ov, attr, None)
+        for owner, attr, to_pairs in ((self, "selected_region_fovs", normalise),
+                                      (ov, "selected_region_fovs", normalise),
+                                      (ov, "selected_wells", expand)):
+            getter = getattr(owner, attr, None)
             if not callable(getter):
                 continue
             try:

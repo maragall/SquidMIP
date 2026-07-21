@@ -33,7 +33,7 @@ if "PySide6" in sys.modules or "PySide2" in sys.modules:
 from PyQt5.QtCore import QEvent, QPointF, Qt  # noqa: E402
 from PyQt5.QtGui import QMouseEvent  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
-    QApplication, QPushButton, QSlider, QSpinBox, QWidget,
+    QApplication, QPushButton, QSlider, QSpinBox, QTabWidget, QWidget,
 )
 
 from squidmip import _viewer as V  # noqa: E402
@@ -97,6 +97,20 @@ def _drain_until(app, pred, timeout=60):
         time.sleep(0.02)
     app.processEvents()
     return pred()
+
+
+def _leave_exploration_tabs(win):
+    """Bring every tab bar in the window off its exploration tab, whichever pane owns them.
+
+    An exploration tab scopes the detail slider to its subset (IMA-205), so a test that wants a
+    whole-plate detail again has to leave it — via the REAL currentChanged path, not by poking
+    _push_index. Layout-independent on purpose: IMA-237 moved these tabs into their own pane."""
+    for bar in win.findChildren(QTabWidget):
+        for i in range(bar.count()):
+            if not isinstance(bar.widget(i), V._ExplorationTab):
+                if isinstance(bar.widget(bar.currentIndex()), V._ExplorationTab):
+                    bar.setCurrentIndex(i)
+                break
 
 
 def _press(x, y, button=Qt.LeftButton):
@@ -2409,8 +2423,9 @@ def test_run_minerva_export_with_nothing_selected_says_so(qapp, stub_detail, squ
 
 
 def test_minerva_selection_prefers_the_plates_selected_fovs(qapp, stub_detail, squid_dataset):
-    """IMA-221's plate selection is duck-typed (that branch is not merged): whichever of its two
-    APIs the overview grows, the export follows it in preference to the detail viewer's well."""
+    """IMA-221's plate selection is duck-typed: whichever of its two APIs the overview grows, the
+    export follows it in preference to the detail viewer's well. (The real per-FOV payload lives
+    on PlateWindow — see the shift-drag test below; this one pins the overview-side shapes.)"""
     root, _ = squid_dataset
     win = V.PlateWindow(None)
     win.ingest(str(root))
@@ -2429,6 +2444,64 @@ def test_minerva_selection_prefers_the_plates_selected_fovs(qapp, stub_detail, s
 
     win._overview.selected_region_fovs = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
     assert win.minerva_selection() == [("B3", 0), ("B3", 1)]      # a broken API is not a crash
+    win.close()
+
+
+def test_real_shift_drag_selection_is_what_minerva_exports(qapp, stub_detail, squid_dataset):
+    """IMA-221 <-> IMA-228, end to end through the ACTUAL gesture — no stubbed selection API.
+
+    Both halves shipped on separate branches and nothing joined them: IMA-221's per-FOV payload
+    landed as ``PlateWindow.selected_region_fovs`` (the overview is display-only), so a
+    ``minerva_selection`` that probed only the overview would silently skip the real API and
+    reach the same answer by accident via ``selected_wells``. This drives a genuine Shift-drag
+    marquee and pins that the export scope IS the dragged wells — not the detail well.
+    """
+    from PyQt5.QtCore import QEvent, QPoint
+    from PyQt5.QtGui import QMouseEvent
+
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    ov = win._overview
+    ov.resize(600, 480)
+    ov.show()
+    qapp.processEvents()
+
+    target = ov._by_rc[sorted(ov._by_rc)[0]]                  # first acquired well only: a subset
+    assert len(ov._by_rc) > 1, "fixture must have >1 well or 'subset' means nothing"
+    (r, c), = [rc for rc, w in ov._by_rc.items() if w == target]
+    ax, ay = ov._ox + V._HDR, ov._oy + V._COLH
+    cx, cy = ax + (c + 0.5) * ov._cd, ay + (r + 0.5) * ov._cd
+    box = ov._cd * 0.3
+
+    def send(kind, x, y, buttons):
+        qapp.sendEvent(ov, QMouseEvent(kind, QPoint(int(x), int(y)), Qt.LeftButton,
+                                       buttons, Qt.ShiftModifier))
+
+    send(QEvent.MouseButtonPress, cx - box, cy - box, Qt.LeftButton)
+    send(QEvent.MouseMove, cx, cy, Qt.LeftButton)
+    send(QEvent.MouseButtonRelease, cx + box, cy + box, Qt.NoButton)
+    qapp.processEvents()
+
+    assert ov.selected_wells() == [target], "the Shift-drag itself did not select the well"
+    expected = [(target, f) for f in win._meta["fovs_per_region"][target]]
+    assert win.selected_region_fovs() == expected             # IMA-221's payload
+    assert win.minerva_selection() == expected                # ...is what IMA-228 exports
+
+    # The same Shift-drag also opens IMA-205's exploration tab, which SCOPES the detail slider to
+    # the subset — so leave that tab before opening a well outside it, or activate_well correctly
+    # refuses and the precedence assertion below would pass vacuously.
+    _leave_exploration_tabs(win)
+    qapp.processEvents()
+    other = ov._by_rc[sorted(ov._by_rc)[-1]]
+    win.activate_well(other, 0)                               # a DIFFERENT well open in detail
+    assert win._current_well == other, "the detail well never actually changed"
+    assert win.minerva_selection() == expected, (
+        "minerva_selection fell through to the detail well and ignored the plate selection")
+
+    ov.clear_selection()
+    qapp.processEvents()
+    assert win.minerva_selection() == [(other, f) for f in win._meta["fovs_per_region"][other]]
     win.close()
 
 
@@ -2515,7 +2588,7 @@ def test_signal_names_discovers_every_worker_signal():
     assert {"progress", "exported", "launched", "failed", "finished_ok"} <= names
     assert "finished" not in names and "started" not in names   # QThread's own — never torn down
     # the pre-existing worker keeps full coverage too
-    assert {"tileReady", "pushReady", "finalReady", "writtenReady", "wellFailed"} <= set(
+    assert {"tileReady", "pushReady", "streamEnded", "writtenReady", "wellFailed"} <= set(
         V._signal_names(V._OperatorWorker))
 
 
