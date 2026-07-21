@@ -50,3 +50,19 @@ so a future session doesn't rediscover it from zero.
 - **Cons:** Different repo, different owner; not on any SquidMIP critical path.
 - **Context:** SquidMIP does **not** carry this bug — IMA-189's `squidmip/_channels.py` already resolves `display_color` correctly (top-level v1.0+ *and* nested `camera_settings`, mapped by name, raises on unresolved), and IMA-184 consumes `metadata.channels[].display_color` rather than re-parsing the yaml. This TODO is purely a flag for whoever owns `~/CEPHLA/projects/explorer/squid2minerva`.
 - **Depends on / blocked by:** squid2minerva maintainer.
+
+## Universal2 (Intel Mac) build → revisit if any demoer is on Intel
+- **What:** Build a universal2 (`x86_64` + `arm64`) `.app`, or a second Intel-only artifact.
+- **Why:** IMA-232 ships arm64-only. An Intel-Mac demoer gets a binary that cannot run — not under Rosetta, not under anything. The ticket's premise is "demoers download one binary," so "every demo machine is Apple Silicon" is a load-bearing, previously-unstated assumption.
+- **Pros:** Removes a hard failure for a whole class of user; one link works for everyone.
+- **Cons:** Roughly doubles freeze + notarize CI time; requires universal2 wheels for `tensorstore`, `imagecodecs`, and PyQt5, which may not all exist — likely forcing a second x86_64 runner instead of a true universal binary.
+- **Context:** Surfaced by the /plan-eng-review outside voice (2026-07-20) as an unstated assumption, not a bug. Cheap to defer, expensive to discover during a demo. Check who the actual demoers are before building.
+- **Depends on / blocked by:** IMA-232 landing first (the signing + release pipeline is the thing that would get duplicated).
+
+## Windows / Linux signing → future ticket
+- **What:** Authenticode signing for the Windows artifact; GPG signature or AppImage signing for Linux.
+- **Why:** IMA-232 notarizes macOS only. The freeze matrix still produces Windows and Linux artifacts, and those download with SmartScreen warnings (Windows) or no provenance at all (Linux).
+- **Pros:** Makes the non-macOS artifacts distributable to people outside the team rather than internal-only.
+- **Cons:** Authenticode needs a paid code-signing certificate (EV certs are hardware-token-bound, which is painful in CI); the Linux AppImage step in `build.yml:65-69` is still a stub echo, so there is nothing signed yet.
+- **Context:** `build.yml` already has a Linux AppImage placeholder that was never wired to linuxdeploy. Deferred from IMA-232 because macOS is the demo target. Surfaced during /plan-eng-review 2026-07-20.
+- **Depends on / blocked by:** IMA-232's release job (the publish path both would reuse).
