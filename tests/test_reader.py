@@ -33,6 +33,7 @@ def test_metadata_no_dead_attributes(squid_dataset):
     assert set(meta) == {
         "regions",
         "fovs_per_region",
+        "fov_positions",   # IMA-187: {(region, fov): (x_mm, y_mm)}; {} when no coordinates.csv
         "channels",
         "n_z",
         "z_levels",

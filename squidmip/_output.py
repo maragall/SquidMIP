@@ -50,7 +50,7 @@ import tifffile
 
 from squidmip._engine import _default_workers, project_plate
 from squidmip._zarr_store import create_array, write_array, write_group
-from squidmip.projection import select_fovs
+from squidmip.projection import resolve_n_fovs, select_fovs
 
 _NGFF_VERSION = "0.5"
 _WAVELENGTH_RE = re.compile(r"(?<!\d)(\d{3,4})(?!\d)")  # a standalone 3-4 digit nm in a channel name
@@ -271,7 +271,7 @@ def write_from_stream(
     stream: Iterator[tuple[str, int, np.ndarray]],
     out_dir,
     *,
-    n_fovs: int = 1,
+    n_fovs: Optional[int] = 1,
     tiff: bool = False,
     on_well=None,
     write_workers: int = _WRITE_WORKERS,
@@ -302,12 +302,17 @@ def write_from_stream(
     tiff_root = out_dir / "tiff"
 
     wells = select_fovs(metadata, n_fovs=n_fovs)  # {region: [fov, ...]}, deterministic
+    # NGFF field_count is a single plate-level scalar and is int()-ed below, so n_fovs=None
+    # (= all FOVs) MUST be resolved to a concrete number here or the write raises TypeError
+    # deep in plate_metadata. A ragged plate reports the max, the only value that does not
+    # under-describe some well.
+    field_count = resolve_n_fovs(metadata, n_fovs)
     if regions is not None:   # subset: write only these wells (keep the requested order), for previews
         keep = list(dict.fromkeys(regions))
         wells = {r: wells[r] for r in keep if r in wells}
 
     # Full plate/row/well group metadata written UP FRONT (layout is fully known from metadata).
-    write_group(plate_dir, plate_metadata(wells.keys(), field_count=n_fovs))
+    write_group(plate_dir, plate_metadata(wells.keys(), field_count=field_count))
     for region, fovs in wells.items():
         row, col = parse_well_id(region)
         write_group(plate_dir / row)  # bare row group
@@ -371,7 +376,7 @@ def write_plate(
     reader,
     out_dir,
     *,
-    n_fovs: int = 1,
+    n_fovs: Optional[int] = 1,
     workers: Optional[int] = None,
     projector: str = "mip",
     tiff: bool = False,

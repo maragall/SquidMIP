@@ -78,6 +78,24 @@ def _write_timepoint(folder: Path, arrays: dict, tag: int = 0):
                     arrays[(region, fov, z, ch)] = arr
 
 
+# Real Squid coordinates.csv schema (verified against synthetic_2x2_wellplate): region + x/y in
+# mm, a z column that is present but EMPTY, and NO fov column. FOV identity is row order within
+# a region. Rows are repeated once per z-level here (NZ=2) because that is what a multi-z
+# acquisition writes — the reader must de-duplicate on (region, x, y) before counting, or every
+# real z-stack would trip the row-count cross-check.
+_FOV_MM = {0: (10.0, 20.0), 1: (10.5, 20.0)}   # fov 1 is +0.5 mm in x => same row, next column
+
+
+def _coordinates_csv() -> str:
+    lines = ["region,x (mm),y (mm),z (mm)"]
+    for region in REGIONS:
+        for _z in range(NZ):                    # one row per z-level, same stage position
+            for fov in FOVS:
+                x, y = _FOV_MM[fov]
+                lines.append(f"{region},{x},{y},")
+    return "\n".join(lines) + "\n"
+
+
 @pytest.fixture
 def squid_dataset(tmp_path):
     root = tmp_path / "acq"
@@ -86,6 +104,7 @@ def squid_dataset(tmp_path):
     (root / "acquisition_channels.yaml").write_text(_YAML)
     (root / "acquisition.yaml").write_text(_ACQ_YAML)
     (root / "acquisition parameters.json").write_text(json.dumps(_PARAMS))
+    (root / "coordinates.csv").write_text(_coordinates_csv())
     return root, arrays
 
 

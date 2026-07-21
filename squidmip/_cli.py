@@ -51,12 +51,26 @@ class ProcessParameters(BaseModel, use_attribute_docstrings=True):
     """Also write the individual per-plane TIFF export (Squid filename convention). This is a SECOND,
     uncompressed copy — roughly doubles on-disk size — so it's off by default."""
 
+    n_fovs: Optional[int] = 1
+    """FOVs to project per well. 1 (default) keeps the historical one-FOV-per-well behaviour.
+    Pass 0 for EVERY FOV in every well (the multi-FOV mosaic, IMA-187) — note this multiplies
+    both compute and output size by the FOV count, so a 36-FOV plate is ~36x the work."""
+
     limit: Optional[int] = None
     """Process only the first N wells — a quick SLICE of the plate (subset preview) so you can test
     the operator without committing the whole plate's compute + disk. Default: every well."""
 
     verbose: bool = False
     """Show debug-level logging."""
+
+    @field_validator("n_fovs")
+    @classmethod
+    def _n_fovs(cls, v):
+        # 0 is the CLI spelling of "all". pydantic-settings maps flags to scalars, so a
+        # sentinel int is cleaner here than accepting the literal string "all" or None.
+        if v is not None and v < 0:
+            raise ValueError(f"n_fovs must be >= 0 (0 = every FOV), got {v}")
+        return v
 
     @field_validator("limit")
     @classmethod
@@ -96,12 +110,17 @@ def run(params: ProcessParameters) -> dict:
     fmt = str(reader.metadata.get("wellplate_format", ""))
     if not any(s in fmt for s in ("384", "1536")):
         raise SystemExit(f"squidmip currently supports 384- and 1536-well plates (got {fmt or 'unknown'!r}).")
-    # Multi-FOV policy (IMA-191): current scope is one FOV per well; sample the first and warn.
+    # Multi-FOV policy (IMA-187): n_fovs=0 on the CLI means "every FOV"; anything else is an
+    # explicit count. Only warn about discarding FOVs when we are actually discarding them.
     fpr = reader.metadata["fovs_per_region"]
+    n_fovs = None if params.n_fovs == 0 else params.n_fovs
     multi = sum(1 for r in fpr if len(fpr[r]) > 1)
-    if multi:
-        logger.warning("%d well(s) have >1 FOV — sampling one FOV per well (high-throughput "
-                       "stitching not yet implemented).", multi)
+    if multi and n_fovs is not None:
+        logger.warning("%d well(s) have >1 FOV — projecting %d per well; pass --n-fovs 0 to "
+                       "project every FOV.", multi, n_fovs)
+    elif n_fovs is None:
+        total = sum(len(v) for v in fpr.values())
+        logger.info("projecting ALL %d FOV(s) across %d well(s)", total, len(fpr))
     name = Path(params.input_folder).name
     out_parent = (Path(params.output_folder).expanduser() if params.output_folder
                   else Path(params.input_folder).parent)
@@ -126,7 +145,7 @@ def run(params: ProcessParameters) -> dict:
 
     manifest = write_plate(
         reader, out_dir, projector=params.projector, workers=params.workers,
-        tiff=params.tiff, on_error=on_error, regions=regions,
+        tiff=params.tiff, on_error=on_error, regions=regions, n_fovs=n_fovs,
     )
     logger.info(
         "done: %s (%d/%d wells written, %d pyramid level(s))%s",

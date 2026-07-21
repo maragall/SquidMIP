@@ -21,14 +21,25 @@ Discovery flow::
         glob timepoint folders (0/,1/…) ──┤─► n_t
         glob *.tiff in t0, parse stems ───┤─► regions, fovs_per_region, channels, z-levels
         read ONE frame ──────────────────┤─► frame_shape, dtype   (NOT hardcoded)
+        coordinates.csv (dedup by x,y) ───┤─► fov_positions {(region,fov): (x_mm, y_mm)}
         acquisition.yaml (or JSON) ───────┴─► dz_um, pixel_size_um, wellplate_format, Nz/Nt cross-check
 
 The (region, fov, z, channel) index is parsed from FILENAMES — the ground truth. Scalar
 metadata comes from acquisition.yaml (authoritative pixel size etc.), the flat JSON as a
-legacy fallback. coordinates.csv is not read: for one-FOV-per-well the plate layout comes
-from the well ID + wellplate_format; per-FOV stage positions are a deferred stitching concern.
-read() constructs the path directly and returns exactly what tifffile decodes (native dtype),
-refusing non-2D planes and dtypes outside {uint8, uint16}.
+legacy fallback. read() constructs the path directly and returns exactly what tifffile
+decodes (native dtype), refusing non-2D planes and dtypes outside {uint8, uint16}.
+
+``coordinates.csv`` IS read (IMA-187), into ``metadata["fov_positions"]``, so multiple FOVs
+per region can be placed at their true stage offsets. Its real schema is::
+
+    region,x (mm),y (mm),z (mm)
+
+There is NO ``fov`` column — the only link from a row to an image is position within the
+region's rows, so the Nth row of a region maps to that region's Nth sorted FOV. Rows are
+de-duplicated on (region, x, y) FIRST, because a multi-z / multi-timepoint acquisition can
+repeat a stage position once per z-level; comparing raw row counts against FOV counts would
+then fail on every genuine z-stack. The de-duplicated count IS cross-checked and fails loud
+on a mismatch: a wrong mapping does not crash, it silently draws a scrambled mosaic.
 """
 
 from __future__ import annotations
@@ -69,6 +80,97 @@ def _validate_plane(arr, path: Path):
             "is not a raw Squid capture; refused rather than silently projected."
         )
     return arr
+
+
+_COORDS_NAME = "coordinates.csv"
+# Header tolerance: Squid writes "x (mm)"/"y (mm)", but whitespace and case drift across
+# generations. Match on the leading axis letter of a column that mentions mm.
+_X_COL_RE = re.compile(r"^\s*x\b.*\(\s*mm\s*\)", re.I)
+_Y_COL_RE = re.compile(r"^\s*y\b.*\(\s*mm\s*\)", re.I)
+
+
+def _coord_columns(fieldnames) -> tuple[str, str]:
+    """Locate the x/y millimetre columns in a coordinates.csv header, failing loud if absent."""
+    names = list(fieldnames or [])
+    x = next((n for n in names if n and _X_COL_RE.match(n)), None)
+    y = next((n for n in names if n and _Y_COL_RE.match(n)), None)
+    if x is None or y is None:
+        raise ValueError(
+            f"{_COORDS_NAME} has no recognisable x/y millimetre columns (header: {names}). "
+            "Expected something like 'x (mm)' and 'y (mm)'; without them FOVs cannot be placed."
+        )
+    return x, y
+
+
+def load_fov_positions(root, fovs_per_region: dict) -> dict:
+    """Parse ``coordinates.csv`` into ``{(region, fov): (x_mm, y_mm)}``.
+
+    Returns ``{}`` (present but empty — never a missing key) when the file is absent, so a
+    consumer can degrade to single-FOV rendering instead of hitting a KeyError.
+
+    The mapping is **row order within a region**: coordinates.csv carries no ``fov`` column, so
+    the Nth distinct position recorded for a region is that region's Nth sorted FOV. Two
+    safeguards keep that honest:
+
+    1. **De-duplicate on (region, x, y) before counting.** A multi-z or multi-timepoint
+       acquisition can write one row per z-level at the same stage position; raw row counts
+       would then be a multiple of the FOV count and every z-stack would fail the check below.
+       De-duplicating first makes the count mean "distinct stage positions", which is the thing
+       that should equal the FOV count. First occurrence wins, preserving file order.
+    2. **Cross-check the de-duplicated count against the filename-derived FOV count** and raise
+       on a mismatch. This is the load-bearing guard: an off-by-one or a truncated CSV produces
+       a mosaic that looks entirely reasonable while every tile sits in the wrong place, and
+       nothing downstream can detect it.
+
+    Rows whose region is not in *fovs_per_region* are ignored (a CSV may describe regions whose
+    images were never written); a region with images but no rows is simply absent from the
+    result, and placement for it raises later with a clear message.
+    """
+    import csv
+
+    path = Path(root) / _COORDS_NAME
+    if not path.exists():
+        return {}
+
+    with path.open(newline="") as fh:
+        reader = csv.DictReader(fh)
+        x_col, y_col = _coord_columns(reader.fieldnames)
+        ordered: dict[str, list] = {}
+        seen: dict[str, set] = {}
+        for line_no, row in enumerate(reader, start=2):
+            region = (row.get("region") or "").strip()
+            if not region or region not in fovs_per_region:
+                continue
+            raw_x, raw_y = (row.get(x_col) or "").strip(), (row.get(y_col) or "").strip()
+            if not raw_x or not raw_y:
+                continue                    # a blank position row carries no placement info
+            try:
+                x, y = float(raw_x), float(raw_y)
+            except ValueError:
+                raise ValueError(
+                    f"{_COORDS_NAME} line {line_no}: region {region!r} has non-numeric "
+                    f"coordinates ({raw_x!r}, {raw_y!r}); refusing to guess a stage position."
+                ) from None
+            key = (round(x, 6), round(y, 6))   # tolerate float-repr drift when de-duplicating
+            if key in seen.setdefault(region, set()):
+                continue                    # same position repeated (one row per z / per t)
+            seen[region].add(key)
+            ordered.setdefault(region, []).append((x, y))
+
+    positions: dict = {}
+    for region, coords in ordered.items():
+        fovs = list(fovs_per_region[region])
+        if len(coords) != len(fovs):
+            raise ValueError(
+                f"{_COORDS_NAME}: region {region!r} lists {len(coords)} distinct stage "
+                f"position(s) but {len(fovs)} FOV(s) were found in the filenames. "
+                "Without a 'fov' column the Nth position must be the Nth FOV, so a count "
+                "mismatch means the mapping is unknowable — refusing to place FOVs at "
+                "positions that would look plausible but be wrong."
+            )
+        for fov, xy in zip(fovs, coords):
+            positions[(region, fov)] = xy
+    return positions
 
 
 def _plate_key(region: str):
@@ -192,9 +294,13 @@ class SquidReader:
         sample_path = self._resolve_file(time_folders[0], sample_key, index[sample_key])
         sample = _validate_plane(tifffile.imread(sample_path), sample_path)
 
+        fovs_per_region = {r: sorted(fovs[r]) for r in regions}
         self._meta = {
             "regions": regions,
-            "fovs_per_region": {r: sorted(fovs[r]) for r in regions},
+            "fovs_per_region": fovs_per_region,
+            # {(region, fov): (x_mm, y_mm)} — {} when coordinates.csv is absent. Present on BOTH
+            # reader classes so consumers never have to ask which reader they hold (IMA-187).
+            "fov_positions": load_fov_positions(self._path, fovs_per_region),
             "channels": resolve_channels(sorted(channels), load_channel_yaml(self._path)),
             "n_z": n_z,
             "z_levels": z_sorted,
@@ -334,9 +440,16 @@ class SquidOMEReader:
         acq = load_acquisition_metadata(self._path)
         if acq["n_z_declared"] is not None and acq["n_z_declared"] != n_z:
             warnings.warn(f"Recorded Nz ({acq['n_z_declared']}) != OME Z ({n_z}); using {n_z}.")
+        fovs_per_region = {r: sorted(fovs[r]) for r in regions}
         self._meta = {
             "regions": regions,
-            "fovs_per_region": {r: sorted(fovs[r]) for r in regions},
+            "fovs_per_region": fovs_per_region,
+            # Same key, same meaning as SquidReader — the shared-interface promise in this
+            # class's docstring. An OME acquisition with a sibling coordinates.csv gets real
+            # placement; without one this is {} and the mosaic degrades to a single field.
+            # (Positions inside the OME-XML are not read: different parsing path, no dataset
+            # on hand to validate it against. See .spec NOT-in-scope.)
+            "fov_positions": load_fov_positions(self._path, fovs_per_region),
             "channels": channels,
             "n_z": n_z,
             "z_levels": list(range(n_z)),

@@ -14,12 +14,13 @@ well crossing the boundary, for nothing.
 
 Data flow::
 
-    project_plate(reader, n_fovs=1, workers=N, projector="mip")
+    project_plate(reader, n_fovs=1, workers=N, projector="mip")   # n_fovs=None -> ALL FOVs
         │
         ▼  reader.metadata            (warm ONCE, single-threaded → populates the reader's
         │                              lazy index/time-folders/meta so concurrent read() only
         │                              touches immutable state; no locks needed downstream)
         ▼  select_fovs(meta, n_fovs)  → {region: [fov, ...]}  → flat [(region, fov), ...]
+        │                              (n_fovs=None → every FOV; a 36-FOV well emits 36 tasks)
         ▼  _PROJECTORS[projector]     → the z-reduce callable passed as project_well(reduce=)
         │
         ▼  ThreadPoolExecutor(max_workers=N)          bounded window: ≤ N wells in flight
@@ -42,7 +43,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Optional
 
 import numpy as np
 
@@ -131,7 +132,7 @@ def _resolve_projector(name: str) -> Projector:
 def project_plate(
     reader: "SquidReader",
     *,
-    n_fovs: int = 1,
+    n_fovs: Optional[int] = 1,
     workers: int | None = None,
     projector: str = "mip",
     on_error=None,
@@ -152,7 +153,8 @@ def project_plate(
         up front (single-threaded) so the reader's lazy state is populated before any worker
         calls ``read()`` — concurrent reads then touch only immutable state.
     n_fovs:
-        FOVs per well to project (default 1). Passed to :func:`squidmip.select_fovs`.
+        FOVs per well to project (default 1). ``None`` = every FOV in every well (the
+        IMA-187 mosaic path). Passed straight to :func:`squidmip.select_fovs`.
     workers:
         Thread-pool size. ``None`` (default) → :func:`_default_workers` (CPUs usable by this
         process — affinity/cgroup aware, not a hardcoded constant). Peak RSS scales with this,
