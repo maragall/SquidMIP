@@ -446,3 +446,129 @@ class _DummyReader:
 
     def __getattr__(self, name):  # pragma: no cover - must not be reached
         raise AssertionError(f"reader touched ({name}) before the plane-op guard refused")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# Defect 2: registration must run on the registration channel, ALWAYS.
+#
+# `reg_c = channels.index(reg_c_global) if reg_c_global in channels else 0` silently
+# registered on whichever channel happened to be FIRST in the selected subset, while the
+# docstring promised "Registration always runs on registration_channel, whatever this
+# selects." The same region stitched with different channel selections therefore got
+# DIFFERENT SOLVED OFFSETS, with no warning — non-reproducible scientific output.
+#
+# The module's existing _FakeReader cannot catch this: its channel 1 is `tile // 2 + 500`,
+# i.e. the same geometry, so registering on either channel gives the same answer and any
+# comparison of offsets passes whether or not the bug is present. A test needs a channel
+# that registers to a DIFFERENT answer, which is what _SplitChannelReader provides.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+
+class _SplitChannelReader(_FakeReader):
+    """Channel 0 is registrable texture; channel 1 is FLAT and carries no alignment signal.
+
+    That asymmetry is the whole point. Registering on channel 0 recovers the injected stage
+    error; registering on channel 1 cannot recover anything and degrades to the stage
+    positions (all-zero offsets). So "which channel solved this" becomes a NUMBER, and the
+    silent substitution stops being invisible.
+    """
+
+    def read(self, region, fov, channel, z=0, t=0):
+        self.reads += 1
+        if channel == CHANNELS[1]:
+            return np.full((TILE, TILE), 1000, dtype=np.uint16)   # flat: unregistrable
+        y, x = self._true[fov]
+        return self._master[y : y + TILE, x : x + TILE]
+
+
+_ERR = {3: (6.0, -4.0)}       # a known stage error only the textured channel can recover
+
+
+def _offsets(reader, **kw):
+    g: dict = {}
+    stitch_region(reader, "A1", list(range(4)), blend_px=24, block_px=512, max_workers=2,
+                  geometry=g, **kw)
+    return g["offsets_px"]
+
+
+def test_the_fixture_can_actually_tell_the_two_channels_apart(master):
+    """Guard the guard: if both channels solved the same, every test below would be vacuous.
+
+    This repo has already shipped a test that was dead its whole life. A fixture that cannot
+    distinguish the two outcomes is the same failure mode, so prove the distinction FIRST.
+    """
+    textured = _offsets(_SplitChannelReader(master, error_px=_ERR),
+                        registration_channel=CHANNELS[0])
+    flat = _offsets(_SplitChannelReader(master, error_px=_ERR),
+                    registration_channel=CHANNELS[1])
+    assert np.abs(textured[3]).max() > 2.0, "channel 0 should recover the 6px injected error"
+    assert np.abs(flat).max() < 0.5, "flat channel 1 should recover nothing"
+
+
+def test_registration_channel_outside_the_selection_still_drives_the_solve(master):
+    """THE BUG. Selecting only channel 1 must not move registration onto channel 1.
+
+    Before the fix `reg_c` fell back to 0 — index 0 OF THE SUBSET, i.e. global channel 1, the
+    flat one — so the solve silently returned zeros and the mosaic was placed on raw stage
+    coordinates while the caller believed it had registered on channel 0.
+    """
+    got = _offsets(_SplitChannelReader(master, error_px=_ERR),
+                   registration_channel=CHANNELS[0], channels=[1])
+    assert np.abs(got[3]).max() > 2.0, (
+        f"registration did not run on {CHANNELS[0]!r}: offsets {got[3]} look like the flat "
+        "channel's (all-zero) solve, i.e. the channel was silently substituted."
+    )
+
+
+def test_the_solved_geometry_does_not_depend_on_which_channels_were_selected(master):
+    """The reproducibility property, stated directly: same region + same registration channel
+    => same offsets, whatever subset is being fused. This is the promise at _stitch.py:332."""
+    kw = dict(registration_channel=CHANNELS[0])
+    both = _offsets(_SplitChannelReader(master, error_px=_ERR), **kw)
+    only_0 = _offsets(_SplitChannelReader(master, error_px=_ERR), channels=[0], **kw)
+    only_1 = _offsets(_SplitChannelReader(master, error_px=_ERR), channels=[1], **kw)
+    np.testing.assert_allclose(both, only_0, atol=1e-9)
+    np.testing.assert_allclose(both, only_1, atol=1e-9)
+
+
+def test_the_registration_only_channel_is_not_leaked_into_the_output(master):
+    """Reading the registration channel to solve on it must not add it to the fused result —
+    the caller asked for one channel and must get exactly one, in the order requested."""
+    reader = _SplitChannelReader(master, error_px=_ERR)
+    out = stitch_region(reader, "A1", list(range(4)), channels=[1], blend_px=24, block_px=512,
+                        max_workers=2, registration_channel=CHANNELS[0])
+    assert out.shape[1] == 1
+    # channel 1 is the FLAT one; if the textured registration channel leaked into the output
+    # this plane would have structure instead of being (feathered) constant.
+    plane = out[0, 0, 0].astype(np.float64)
+    interior = plane[60:-60, 60:-60]
+    assert interior.std() < 1.0, f"output plane is not the flat channel (std={interior.std():.1f})"
+
+
+def test_honouring_the_registration_channel_costs_no_extra_reads(master):
+    """The fix reads a channel the caller did not select — but not one extra byte off disk.
+
+    project_well already decodes EVERY channel of the FOV; the old code just discarded the
+    unselected ones at `[:, channels, 0]`. So including the registration channel is free in
+    I/O, and that is worth pinning: if this ever regresses into a second read pass, a 27-FOV
+    well pays for it on every stitch.
+    """
+    def reads(**kw):
+        r = _SplitChannelReader(master, error_px=_ERR)
+        stitch_region(r, "A1", list(range(4)), blend_px=24, block_px=512, max_workers=2, **kw)
+        return r.reads
+
+    all_channels = reads(registration_channel=CHANNELS[0])
+    reg_outside_selection = reads(channels=[1], registration_channel=CHANNELS[0])
+    no_registration = reads(channels=[1], register=False, registration_channel=CHANNELS[0])
+    assert reg_outside_selection == all_channels == no_registration, (
+        f"read counts diverged: all={all_channels}, reg-outside-selection="
+        f"{reg_outside_selection}, register=False {no_registration}"
+    )
+
+
+def test_an_unknown_registration_channel_is_still_refused_by_name(master):
+    # Unchanged behaviour, pinned so the fix does not accidentally make this permissive.
+    with pytest.raises(ValueError, match="not a channel of this acquisition"):
+        stitch_region(_SplitChannelReader(master), "A1", [0, 1],
+                      registration_channel="Fluorescence_638_nm_Ex")

@@ -329,7 +329,10 @@ def stitch_region(
     channels:
         Channel indices to fuse (``None`` = all). A mosaic costs ``C x H x W x 2`` bytes, so
         a one-channel request is the difference between ~0.2 GB and ~0.9 GB on a 27-FOV 10x
-        well. Registration always runs on *registration_channel*, whatever this selects.
+        well. Registration always runs on *registration_channel*, whatever this selects — if
+        the selection excludes it, it is read anyway, solved on, and then dropped before
+        fusion, so the solved geometry is IDENTICAL for every channel selection of the same
+        region. (It did not always do this; see the note at the ``reg_c`` assignment.)
     blend_px:
         Hann feather ramp width. Must fit inside the real overlap; see :data:`_BLEND_PX`.
     geometry:
@@ -398,10 +401,29 @@ def stitch_region(
     _op = _resolve_projector(projector)
 
     reg_c_global = _resolve_registration_channel(meta, registration_channel)
-    # Index of the registration channel WITHIN the selected subset. If the operator selected
-    # channels that exclude it, register on the first selected channel instead of indexing
-    # out of bounds (a silent wrong-channel registration is worse than an explicit fallback).
-    reg_c = channels.index(reg_c_global) if reg_c_global in channels else 0
+    # The registration channel is READ WHETHER OR NOT IT WAS SELECTED, so the solve always runs
+    # on it — the promise this function's docstring makes ("Registration always runs on
+    # *registration_channel*, whatever this selects").
+    #
+    # This used to be:
+    #     reg_c = channels.index(reg_c_global) if reg_c_global in channels else 0
+    # which, when the selection excluded the registration channel, silently registered on
+    # whichever channel happened to be FIRST in the subset. The old comment called that "an
+    # explicit fallback", but nothing was explicit about it: no warning, no record in the
+    # geometry, nothing in the output to say which channel had actually solved the transform.
+    # The consequence is the one a scientific tool cannot have — the SAME region stitched with
+    # different channel selections got DIFFERENT SOLVED OFFSETS, i.e. the placement of the
+    # pixels depended on which channels you happened to ask to see.
+    #
+    # Reading the extra channel is FREE in I/O: project_well already decodes every channel of
+    # the FOV and the old code simply threw the others away at `[:, channels, 0]`. The only
+    # cost is one extra channel held in `tiles` between the solve and the drop below, and only
+    # when register=True and the registration channel was not selected. Refusing the operation
+    # (the other honest option) would have been a worse trade for the same guarantee.
+    proj_channels = list(channels)
+    if register and reg_c_global not in proj_channels:
+        proj_channels.append(reg_c_global)
+    reg_c = proj_channels.index(reg_c_global) if register else 0
 
     # (guard for plane-ops lives just after _resolve_projector, so nothing is read first)
     # This whole pipeline is z=1 BY CONSTRUCTION: `out` below is allocated with a z extent of 1,
@@ -424,10 +446,10 @@ def stitch_region(
     with timer.stage("project"):
         # (n_tiles, T, C, Y, X) native dtype. Guarded above: only z-reducers reach here, so
         # project_well's output is (T, C, 1, Y, X) and index 0 is the whole reduced plane.
-        tiles = np.empty((len(fovs), n_t, len(channels), *tile_shape), dtype=dtype)
+        tiles = np.empty((len(fovs), n_t, len(proj_channels), *tile_shape), dtype=dtype)
         for i, fov in enumerate(fovs):
             tiles[i] = project_well(reader, region, fov, reduce=_op.fn,
-                                    consumes=_op.consumes)[:, channels, 0]
+                                    consumes=_op.consumes)[:, proj_channels, 0]
 
     offsets = np.zeros((len(fovs), 2), dtype=np.float64)
     if register:
@@ -462,7 +484,15 @@ def stitch_region(
         def read_tile(idx: int, z_level: int, time_idx: int) -> np.ndarray:
             # float32 because the numba blend kernels accumulate in float32; converting the
             # ONE tile the block is currently consuming keeps this at ~C x tile bytes.
-            return tiles[idx][time_idx].astype(np.float32, copy=False)
+            #
+            # `[:len(channels)]` drops a registration-only channel. `proj_channels` is
+            # `channels` with the registration channel APPENDED (never inserted), so the
+            # requested channels are exactly the leading entries, in the order asked for.
+            # This is the ONE place the extra channel is excluded: fuse_plane is also told
+            # `channels=len(channels)` below and would ignore the tail anyway, so an earlier
+            # draft that ALSO re-sliced `tiles` was a second mechanism for the same guarantee
+            # that no test could distinguish -- and, being a view, it never freed anything.
+            return tiles[idx][time_idx][: len(channels)].astype(np.float32, copy=False)
 
         for t in range(n_t):
 
