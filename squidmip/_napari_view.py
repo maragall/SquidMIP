@@ -485,6 +485,14 @@ class MosaicLayers:
                 lead = (float(z_scale_um) if (extra and z_scale_um) else 1.0,) * extra
                 layer.scale = lead + tuple(scale)
                 layer.translate = (0.0,) * extra + tuple(translate)
+                # Micrometres on every axis (x/y from pixel size, z from the µm step above), so the
+                # scale bar reads the LAYER's units — the path napari >=0.7 uses now that
+                # viewer.scale_bar.unit is deprecated (IMA-265). Guarded: an older napari has no
+                # .units, and mislabelling is never worth crashing a mosaic over.
+                try:
+                    layer.units = ("um",) * int(getattr(layer, "ndim", len(scale)))
+                except Exception:            # noqa: BLE001 - cosmetic; the scale is already right
+                    pass
 
             self._register_channel(key.channel, layer)
             # Point the camera at the data. add_image does NOT move the camera, so the first
@@ -803,7 +811,37 @@ def build_pane(parent: Any = None) -> tuple[Any, MosaicLayers, Any]:
     import napari
 
     viewer = napari.Viewer(show=False)
+    enable_scale_bar(viewer)
     qt_viewer = getattr(viewer.window, "_qt_viewer", None)
     if parent is not None and qt_viewer is not None:
         qt_viewer.setParent(parent)
     return qt_viewer, MosaicLayers(viewer), viewer
+
+
+def enable_scale_bar(viewer: Any, unit: str = "um") -> None:
+    """Turn on napari's built-in scale bar, in micrometres, for the mosaic view (IMA-265).
+
+    "Part of zooming into our mosaic is having a scale bar." napari already HAS one, and our layers
+    already carry ``layer.scale`` in micrometres (set from ``pixel_size_um`` / ``dz_um`` in
+    :meth:`MosaicLayers.add_mosaic`), so the bar's length is derived from real world coordinates by
+    napari itself -- there is nothing to construct and nothing to keep in sync. This only makes it
+    visible and names the unit; a bar that lied would be worse than none, and the number is napari's
+    own, computed from the same scale the pixels are placed by.
+
+    The unit is set two ways on purpose: ``layer.units`` (each mosaic, in add_mosaic) is the source
+    napari >=0.7 reads, and ``viewer.scale_bar.unit`` is what <0.7 reads. Both are guarded so a
+    binding that lacks either still yields a visible bar rather than a crash.
+    """
+    sb = getattr(viewer, "scale_bar", None)
+    if sb is None:
+        return
+    sb.visible = True
+    sb.colored = False          # follow the theme foreground, like the rest of napari's chrome
+    try:
+        sb.position = "bottom_right"
+    except Exception:           # noqa: BLE001 - position is cosmetic
+        pass
+    try:
+        sb.unit = unit          # deprecated in napari >=0.7 (layer.units wins there); harmless now
+    except Exception:           # noqa: BLE001 - unit label is cosmetic; the bar still shows
+        pass

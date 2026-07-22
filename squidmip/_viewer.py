@@ -1536,6 +1536,9 @@ class PlateOverview(QWidget):
         # -- carrier geometry (IMA-220, redrawn for IMA-253: geometry, not a photograph) --
         self._carrier = None          # the _plate.PlateGeometry to draw the holder outline from
         self._carrier_slide = False   # slot-shaped cells (a slide carrier) vs round wells
+        self._slides = None           # [(x, y, w, h), ...] in GRID UNITS: real glass slides drawn
+        #                               behind a tissue acquisition (IMA-265, _slide_art). None on
+        #                               a well plate and on a carrier with no stage coordinates.
         self._tile_rgn = None         # cached QRegion of cells that HAVE an image, at pan origin
         self._tile_rgn_key = None     # (cd, active layer, n tiled cells) the cached region was built for
         # -- loupe (IMA-208) --
@@ -2275,6 +2278,26 @@ class PlateOverview(QWidget):
             self._carrier_slide = isinstance(plate, SlideCarrier)
         except Exception:
             self._carrier_slide = False
+        # SLIDE ART (IMA-265): a tissue acquisition with real stage coordinates is drawn as glass
+        # slides at true size, side by side, with the tissue mosaics sitting on them. The slide
+        # layout REPLACES the plain freeform tissue layout, because the tissue must sit on its
+        # slide at the true micron scale (a 25 mm slide dwarfs an 8 mm tissue) -- fitting the
+        # tissue to the grid, as the freeform path does, would put the slide bodies off-widget.
+        # A well plate / an un-placed carrier returns (None, None) and nothing here changes: the
+        # plate Julio designed is on a path this cannot touch.
+        self._slides = None
+        if plate is not None:
+            try:
+                from squidmip._slide_art import overview_slide_layout
+                tissue_layout, slides = overview_slide_layout(plate)
+            except Exception:                    # noqa: BLE001 - art is never allowed to be fatal
+                tissue_layout = slides = None
+            if tissue_layout is not None:
+                self._layout = {tuple(k): tuple(float(v) for v in val)
+                                for k, val in tissue_layout.items()}
+                self._slides = [tuple(float(v) for v in s) for s in slides]
+                self._scaled = None              # cell rects changed -> drop the zoom cache
+                self._tile_rgn = None
         self.update()
 
     # -- cell rectangles: the ONE place a (row, col) becomes widget pixels (IMA-253) --
@@ -2603,6 +2626,19 @@ class PlateOverview(QWidget):
             return
         cd = self._cd
         ax, ay = self._ox + _HDR, self._oy + _COLH
+        if self._slides is not None:
+            # SLIDE ACQUISITION (IMA-265): real glass slides at true size, side by side, drawn by
+            # _slide_art from the same grid units the tissue cells are placed in. No generic
+            # carrier body -- the slides ARE the holder, and the tissue mosaics paint on top of
+            # them through the ordinary cell path (so every gesture is untouched).
+            from squidmip._slide_art import paint_slides
+            slide_rects_px = [(ax + s[0] * cd, ay + s[1] * cd, s[2] * cd, s[3] * cd)
+                              for s in self._slides]
+            paint_slides(p, slide_rects_px)
+            if cd < 6.0:
+                return
+            self._paint_carrier_cells(p, tiled)
+            return
         # The holder BODY: the union of every cell rectangle, padded by the margin the geometry
         # implies (half a pitch beyond the outer cell centres on a well plate).
         rects = [self._cell_rect(r, c) for r in range(self._nr) for c in range(self._nc)]
@@ -2624,6 +2660,16 @@ class PlateOverview(QWidget):
         p.drawLine(int(body.left()), int(body.top() + ch), int(body.left() + ch), int(body.top()))
         if cd < 6.0:                     # boundaries smaller than the status dots: not worth it
             return
+        self._paint_carrier_cells(p, tiled)
+
+    def _paint_carrier_cells(self, p: QPainter, tiled: set):
+        """The per-cell occupied/empty boundaries, shared by the well plate and the slide holder.
+
+        A cell that already has imaged pixels is left alone (the pixels speak); an occupied but
+        un-imaged cell gets a solid accent-tinted boundary; an empty slot gets a dashed dim one.
+        The SHAPE differs: a well is round, a slide slot / tissue region is rectangular.
+        """
+        cd = self._cd
         for ri in range(self._nr):
             for ci in range(self._nc):
                 rx, ry, rw, rh = self._cell_rect(ri, ci)
