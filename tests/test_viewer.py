@@ -4713,3 +4713,68 @@ def test_the_mosaic_workers_signal_actually_reaches_on_mosaic_plane(qapp, monkey
     op, region, channel, got_levels, bbox = landed[0]
     assert (op, region, channel) == ("raw", "A1", "488")
     assert got_levels is levels
+
+
+def test_the_plate_adopts_napari_s_window_the_moment_a_region_lands(qapp, monkeypatch):
+    """Julio, with a screenshot: "Look at contrast difference between napari window and plate view."
+
+    The event sink was not broken. `on_user_contrast` reports a USER gesture and deliberately
+    filters napari's own autoscale -- otherwise every channel latches MANUAL before anyone touches
+    anything. But that filter also swallows the window napari picks when a region is FIRST shown,
+    so the plate painted from its running percentile histogram, napari from its autoscale, and the
+    panes disagreed from frame one until the user happened to drag a slider.
+
+    An event tells you about a CHANGE; the initial state is not a change. So the plate pulls.
+
+    MUTATION: drop the `_adopt_centre_view()` call in `_on_mosaic_done` and this goes red.
+    """
+    class _Mosaic:
+        def show_op(self, op):
+            pass
+
+        model = type("M", (), {"reset_view": lambda self: None})()
+
+        def contrast(self, ch):
+            return {"488": (11.0, 222.0), "561": (33.0, 444.0)}.get(ch)
+
+        def channel_rgb(self, ch):
+            return {"488": (0.0, 1.0, 0.0), "561": (1.0, 1.0, 0.0)}.get(ch)
+
+        def channel_visible(self, ch):
+            return True
+
+    class _Pane:
+        ok = True
+        mosaic = _Mosaic()
+
+        def say(self, msg):
+            pass
+
+    followed, tinted = [], []
+
+    class _Overview:
+        _labels = ["488", "561"]
+
+        def follow_channel_window(self, ch, lo, hi):
+            followed.append((ch, lo, hi))
+
+        def set_channel_color(self, ch, rgb):
+            tinted.append((ch, tuple(rgb)))
+
+        def set_channel_visible(self, ch, on):
+            pass
+
+    win = V.PlateWindow.__new__(V.PlateWindow)
+    win._mosaic_pane = _Pane()
+    win._overview = _Overview()
+    win._meta = {"channels": [{"name": "488"}, {"name": "561"}]}
+    monkeypatch.setattr(V.PlateWindow, "_restore_dims_step", lambda self: None)
+    monkeypatch.setattr(V.PlateWindow, "_bind_napari_contrast", lambda self: None)
+    monkeypatch.setattr(V.PlateWindow, "_region_frame_done", lambda self: None)
+
+    V.PlateWindow._on_mosaic_done(win, "raw", "A1", 2)
+
+    assert followed == [(0, 11.0, 222.0), (1, 33.0, 444.0)], (
+        f"the plate did not adopt napari's windows on arrival: {followed}")
+    assert tinted == [(0, (0.0, 1.0, 0.0)), (1, (1.0, 1.0, 0.0))], (
+        f"the plate did not adopt napari's colours on arrival: {tinted}")

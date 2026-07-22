@@ -5650,6 +5650,7 @@ class PlateWindow(QMainWindow):
             pass
         self._restore_dims_step()
         self._bind_napari_contrast()
+        self._adopt_centre_view()
         self._region_frame_done()
 
     def _region_frame_done(self):
@@ -5710,6 +5711,41 @@ class PlateWindow(QMainWindow):
 
         pane.mosaic.on_user_colormap(_cmap_sink)
         self._napari_contrast_bound = True
+
+    def _adopt_centre_view(self):
+        """PULL what napari resolved for every channel, and make the plate show the same.
+
+        Julio, with a screenshot: "Look at contrast difference between napari window and plate
+        view." This is why they differed, and it is not the event sink being broken.
+
+        The sink (`on_user_contrast`) only reports a USER gesture -- deliberately, because napari
+        autoscales on every `add_image` and treating that as a gesture latched every channel
+        MANUAL before anyone had touched anything. But that filter also swallows the ONE moment
+        that matters most: the window napari picks when a region is first shown. So the plate kept
+        painting from its own running percentile histogram, napari painted from its autoscale, and
+        the two panes disagreed from the first frame until the user happened to drag a slider.
+
+        An EVENT tells you about a change; the initial state is not a change. So this pulls the
+        current value instead of waiting to be told, at the one point where the layers are known
+        to exist. It lands in the FOLLOW path, so it still is not a user latch, and the same is
+        done for the colormap -- napari resolves the LUT per layer and the plate must tint to
+        match it, not to its own copy of `display_color`.
+        """
+        pane = getattr(self, "_mosaic_pane", None)
+        if pane is None or not getattr(pane, "ok", False) or self._meta is None:
+            return
+        if self._overview is None:
+            return
+        for i, c in enumerate(self._meta["channels"]):
+            window = pane.mosaic.contrast(c["name"])
+            if window is not None:
+                self._overview.follow_channel_window(i, float(window[0]), float(window[1]))
+            rgb = pane.mosaic.channel_rgb(c["name"])
+            if rgb is not None:
+                self._overview.set_channel_color(i, rgb)
+            visible = pane.mosaic.channel_visible(c["name"])
+            if visible is not None:
+                self._overview.set_channel_visible(i, bool(visible))
 
     def _centre_contrast(self) -> dict:
         """The centre viewer's per-channel window — the ONE contrast value per channel.
