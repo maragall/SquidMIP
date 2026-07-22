@@ -18,7 +18,7 @@ import time
 from typing import Any, Callable, Optional
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QLabel, QSizePolicy, QHBoxLayout, QVBoxLayout, QWidget
 
 from squidmip._napari_view import MosaicLayers, resolve_viewer
 
@@ -66,6 +66,32 @@ class SettleCoalescer:
     @property
     def pending(self) -> bool:
         return self._last is not None
+
+
+# --- napari control-widget constructors -------------------------------------------------
+# Imported lazily and one per function so a rename in any single napari version costs that
+# ONE widget, not the whole control column. Binding is asserted by tests/test_napari_view.py
+# rather than trusted -- the _voxel_scale precedent (a patch that bound, ran, and did nothing
+# for its entire life) is why nothing here is assumed.
+
+def _qt_viewer_buttons(model):
+    from napari._qt.widgets.qt_viewer_buttons import QtViewerButtons
+    return QtViewerButtons(model)
+
+
+def _qt_dims(model):
+    from napari._qt.widgets.qt_dims import QtDims
+    return QtDims(model.dims)
+
+
+def _qt_layer_list(model):
+    from napari._qt.containers import QtLayerList
+    return QtLayerList(model.layers)
+
+
+def _qt_layer_controls(model):
+    from napari._qt.layer_controls import QtLayerControlsContainer
+    return QtLayerControlsContainer(model)
 
 
 def _colormap_for(channel_name: str):
@@ -122,9 +148,31 @@ class MosaicPane(QWidget):
             canvas, mosaic = build_pane()
             canvas.setParent(self)
             canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            lay.addWidget(canvas, 1)
             self.canvas = canvas
             self.mosaic = mosaic
+
+            # napari's OWN controls, mounted next to the canvas.
+            #
+            # Julio, driving the GUI: "The contrast sliders should be napari, and they control the
+            # GUI. Napari has lots of awesome embedded functionality" / "I don't see the napari
+            # comtrols" / "we definitely need 3d rendering".
+            #
+            # We embed a bare QtViewer with no napari Window, which is what keeps napari's menus,
+            # docks and plugin surface out (his standing warning: "Watch out for feature bloat").
+            # But the layer list, the layer controls, the dims sliders and the ndisplay button all
+            # live on the Window in a normal napari app, so a bare QtViewer has none of them --
+            # that is why the canvas looked bare. Mount the four widgets DIRECTLY: they are the
+            # real napari controls, not a reimplementation, and they carry for free the three
+            # things he asked for -- per-channel contrast, the z slider, and the 2D/3D toggle.
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(0)
+            row.addWidget(canvas, 1)
+            side = self._build_controls(mosaic.model)
+            if side is not None:
+                row.addWidget(side, 0)
+            lay.addLayout(row, 1)
+
             self._install_camera_settle()
         except Exception as exc:                 # noqa: BLE001 - reported, never swallowed
             self.failure = f"{type(exc).__name__}: {exc}"
@@ -136,6 +184,52 @@ class MosaicPane(QWidget):
             msg.setWordWrap(True)
             msg.setStyleSheet("color:#ffd7d7;background:#3a2020;padding:12px;")
             lay.addWidget(msg, 1)
+
+    # -- napari's own controls ----------------------------------------------------------
+    def _build_controls(self, viewer_model) -> Optional[QWidget]:
+        """The real napari widgets: layer list, layer controls, dims sliders, ndisplay button.
+
+        Each is added independently and a failure of one must not cost the others -- a missing
+        z slider is bad, losing the whole control column because one widget's constructor moved
+        between napari versions is worse. Every failure is REPORTED on the banner, never
+        swallowed: this project has six confirmed silent failures.
+        """
+        col = QWidget(self)
+        # 260, not 320: pane 2 is one third of a three-pane window, and at 320 the control
+        # column left the canvas a ~130 px sliver -- seen in a screenshot of the running GUI,
+        # which is the only way that was ever going to be caught.
+        col.setMaximumWidth(260)
+        col.setMinimumWidth(230)
+        v = QVBoxLayout(col)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(4)
+
+        added, failed = [], []
+
+        def add(label, factory, stretch=0):
+            try:
+                w = factory()
+                v.addWidget(w, stretch)
+                added.append(label)
+            except Exception as exc:             # noqa: BLE001 - reported below, never swallowed
+                failed.append(f"{label}: {type(exc).__name__}: {exc}")
+
+        # QtViewerButtons carries the ndisplay (2D/3D) toggle -- 3D rendering is a stated
+        # customer requirement, and napari does it natively with per-layer scale, so the
+        # anisotropy fix from IMA-255 (dz_um/pixel_size_um) applies through layer.scale.
+        add("viewer buttons", lambda: _qt_viewer_buttons(viewer_model))
+        # QtDims is the per-axis slider set -- this is the z control.
+        add("dims sliders", lambda: _qt_dims(viewer_model))
+        add("layer list", lambda: _qt_layer_list(viewer_model), 1)
+        # QtLayerControlsContainer is where per-channel contrast, colormap, blending and
+        # opacity live. It replaces the plate's duplicate slider row entirely.
+        add("layer controls", lambda: _qt_layer_controls(viewer_model), 1)
+
+        if failed:
+            self.say("some napari controls could not be built: " + "; ".join(failed))
+        if not added:
+            return None
+        return col
 
     # -- camera settle ------------------------------------------------------------------
     def _install_camera_settle(self) -> None:
