@@ -128,6 +128,7 @@ _NDISPLAY_SCRIPT = r"""
     pane.mosaic.model.dims.ndisplay = 2
     app.processEvents()
     out["unchecks_on_model_write"] = bool(btn.isChecked())
+    out["tooltip"] = btn.toolTip()
 """
 
 
@@ -154,6 +155,15 @@ def test_the_3d_button_is_naparis_own_and_sits_where_a_short_pane_shows_it(tmp_p
     # One owner: dims. The button READS it, it does not keep a second copy.
     assert got["follows_model_write"] is True
     assert got["unchecks_on_model_write"] is False
+    # ...and it is SIGNPOSTED, not aliased. Julio: "let's not alias the button, that's bad
+    # design. Let's give the user a tooltip to open in agave for qa higher quality rendering."
+    # napari does not support multiscale in 3D (_scalar_field/_slice.py drops to the coarsest
+    # level whenever ndisplay == 3), so this button is honest about its own limit and names the
+    # separate control that does better. It still does napari 3D — asserted three lines up.
+    from squidmip._napari_pane import NDISPLAY_TOOLTIP
+
+    assert got["tooltip"] == NDISPLAY_TOOLTIP
+    assert "AGAVE" in got["tooltip"]
 
 
 # ---------------------------------------------------------------- the grouped tree

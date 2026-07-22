@@ -664,6 +664,11 @@ _OPERATIONS_BY_KEY = {op.key: op for op in _OPERATIONS}
 # button RUNS. Named, so the two cannot be confused.
 _SAVE_OPERATOR = "mip"
 
+#: Registry key of the AGAVE 3D tab. Deliberately NOT an Operation key: the 3D view produces no
+#: plate result, so it is never offered in the "Process well plates" menu and never routes a
+#: result into pane 3 (results belong in the plate view and the centre viewer, as layers).
+AGAVE_KEY = "agave3d"
+
 # Roadmap cards shown under "TO BE ADDED", as (label, blurb). Empty: everything currently on the
 # roadmap that we're willing to advertise has shipped as a real Operation above. Add an entry when
 # a next operator (e.g. the Nautilus agent) is close enough to promise.
@@ -3929,6 +3934,15 @@ class PlateWindow(QMainWindow):
         self._raw_btn.clicked.connect(self._return_to_raw)
         self._raw_btn.hide()
         v.addWidget(self._raw_btn)
+        # The 3D view. NOT an Operation: it computes no plate result and writes nothing next to
+        # the acquisition, so putting it in _OPERATIONS would advertise it in the "Process well
+        # plates" menu as something that processes wells. It is a VIEW, offered from pane 1 and
+        # opening in pane 3 — the supplementary pane it belongs to.
+        self._agave_btn = QPushButton("3D view (AGAVE)…")
+        self._agave_btn.setStyleSheet(_BTN_QSS)
+        self._agave_btn.setToolTip("Path-trace the selected region's z-stack in the exploration pane")
+        self._agave_btn.clicked.connect(self._open_agave_view)
+        v.addWidget(self._agave_btn)
         cli_btn = QPushButton("Open CLI")                  # opens a CLI tab within this pane (ABOVE Layers)
         cli_btn.setStyleSheet(_BTN_QSS)
         cli_btn.clicked.connect(lambda: self._open_op_tab("cli", "CLI", self._build_cli_tab))
@@ -3938,6 +3952,26 @@ class PlateWindow(QMainWindow):
         layers_btn.clicked.connect(lambda: self._open_op_tab("layers", "Layers", self._build_layers_tab))
         v.addWidget(layers_btn)
         return pane
+
+    # -- the 3D view (AGAVE). Offered from pane 1, OPENS IN PANE 3. -------------------------------
+    def _open_agave_view(self):
+        """Open (or focus) the AGAVE 3D tab in pane 3.
+
+        Goes through ``_open_op_tab`` with ``tabs=self._explore_tabs``, so it inherits the whole
+        embedded-tab contract for free: built once, focused on a second click, torn down through
+        ``_dispose_tab_widget`` (which calls its ``shutdown``, killing the AGAVE server), and
+        floatable like any other pane-3 tab. Never a top-level window of its own."""
+        if self._reader is None or self._meta is None:
+            self._readout.setText(
+                "No acquisition open — drop a Squid acquisition before opening the 3D view.")
+            return
+        self._open_op_tab(AGAVE_KEY, "3D · AGAVE", self._build_agave_tab,
+                          tabs=self._explore_tabs)
+
+    def _build_agave_tab(self) -> QWidget:
+        from squidmip._agave_pane import AgaveTab
+
+        return AgaveTab(self._reader, self._meta, self._acq_path)
 
     # -- operator UIs live as tabs INSIDE pane 1 (home tab + one per opened operator); exploration
     # -- tabs live in pane 3. Both bars share every path below — *tabs* says which one. -----------
