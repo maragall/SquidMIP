@@ -69,6 +69,7 @@ from typing import TYPE_CHECKING, Callable, Iterator, Optional, Sequence
 import numpy as np
 
 from squidmip._engine import _default_workers, _resolve_projector
+from squidmip._placement import PlacedArray, Placement
 from squidmip.projection import project_well, select_fovs
 
 if TYPE_CHECKING:  # avoid import cost / cycle at runtime
@@ -89,6 +90,10 @@ _BLEND_PX = 128                # feather ramp width. Sized to the MEASURED ~208 
 #                                the 10x tissue set: the ramp must fit inside the overlap
 #                                (a ramp wider than the overlap never reaches full weight and
 #                                dims the seam) with margin for registration residual.
+_REG_T = 0                     # geometry is solved at ONE timepoint. Named so the solve site
+#                                and the Placement that reports it cannot drift apart: a
+#                                Placement claiming reg_t=0 while the solve moved to another
+#                                timepoint would be provenance that lies.
 _BLOCK_PX = 2048               # fusion scratchpad edge. Bounds peak fusion memory to
 #                                C x 2048^2 x 4 B x 2 buffers (~134 MB at C=4) regardless of
 #                                mosaic size. fuse_plane's output is block-size independent.
@@ -454,7 +459,7 @@ def stitch_region(
     offsets = np.zeros((len(fovs), 2), dtype=np.float64)
     if register:
         offsets = solve_offsets_px(
-            tiles[:, 0],  # geometry is solved once, on t=0
+            tiles[:, _REG_T],  # geometry is solved once, at ONE timepoint (see _REG_T)
             positions,
             pixel_size,
             tile_shape,
@@ -470,10 +475,36 @@ def stitch_region(
         ]
 
     (h, w), origins = _mosaic_geometry(positions, pixel_size, tile_shape)
+
+    # The placement is built UNCONDITIONALLY (Defect 3). It used to exist only if the caller
+    # remembered to pass a `geometry` out-dict, so by default the solved transform was computed
+    # once at t=0 and then thrown away -- while the viewer separately re-derived placement from
+    # a stage bounding box. Two answers to "where are these pixels", and nothing able to notice
+    # when they disagreed. It now rides back attached to the pixels themselves, and records
+    # WHICH channel and timepoint solved it.
+    placement = Placement(
+        origin_um=(min(y for y, _ in positions), min(x for _, x in positions)),
+        pixel_size_um=pixel_size[0],
+        z_step_um=meta.get("dz_um"),
+        shape=(h, w),
+        tile_shape=tile_shape,
+        fovs=tuple(fovs),
+        offsets_px=tuple((float(o[0]), float(o[1])) for o in offsets),
+        origins_px=tuple((float(y), float(x)) for y, x in origins),
+        # The NAME of the channel actually solved on, not the index the caller passed -- the
+        # two are only the same when the selection happens to contain it, which is precisely
+        # the assumption that made the old registration bug invisible.
+        reg_channel=all_channels[reg_c_global] if register else None,
+        reg_t=_REG_T if register else None,
+    )
+
+    # `geometry` is the legacy out-dict, kept so existing callers (tools/stitch_demo.py) keep
+    # working. It is now a VIEW of the placement rather than a second computation -- one source
+    # of truth, two spellings, and the dict spelling can be deleted once its callers move.
     if geometry is not None:
         geometry.update(
             fovs=list(fovs), offsets_px=offsets, origins_px=origins, shape=(h, w),
-            pixel_size_um=pixel_size[0], tile_shape=tile_shape,
+            pixel_size_um=pixel_size[0], tile_shape=tile_shape, placement=placement,
         )
 
     with timer.stage("fuse"):
@@ -513,7 +544,7 @@ def stitch_region(
                 time_idx=t,
             )
 
-    return out
+    return PlacedArray(out, placement)
 
 
 def _coordinate_region(reader, region, fovs, **kwargs):

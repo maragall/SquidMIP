@@ -572,3 +572,62 @@ def test_an_unknown_registration_channel_is_still_refused_by_name(master):
     with pytest.raises(ValueError, match="not a channel of this acquisition"):
         stitch_region(_SplitChannelReader(master), "A1", [0, 1],
                       registration_channel="Fluorescence_638_nm_Ex")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# Defect 3: the placement travels WITH the array, unconditionally.
+# ═══════════════════════════════════════════════════════════════════════════════════════
+
+
+def test_the_mosaic_carries_its_placement_without_being_asked(master):
+    """No `geometry=` out-dict passed. The geometry must exist anyway.
+
+    This is the defect in one line: the solved transform used to be computed at t=0 and then
+    discarded unless the caller opted in to receiving it.
+    """
+    out = stitch_region(_SplitChannelReader(master, error_px=_ERR), "A1", list(range(4)),
+                        blend_px=24, block_px=512, max_workers=2,
+                        registration_channel=CHANNELS[0])
+    p = out.placement
+    assert p.shape == out.shape[-2:], "placement disagrees with the array it came back on"
+    assert p.fovs == (0, 1, 2, 3)
+    assert p.pixel_size_um == PIXEL_UM
+
+
+def test_the_placement_names_the_channel_that_actually_solved_it(master):
+    """Provenance, and the other half of the Defect 2 fix: the data says which channel
+    solved its transform, instead of leaving it inferred from the caller's arguments."""
+    out = stitch_region(_SplitChannelReader(master, error_px=_ERR), "A1", list(range(4)),
+                        channels=[1], blend_px=24, block_px=512, max_workers=2,
+                        registration_channel=CHANNELS[0])
+    assert out.placement.reg_channel == CHANNELS[0]      # NOT the selected channel 1
+    assert out.placement.reg_t == 0
+    assert out.placement.registered
+
+
+def test_coordinate_placement_does_not_claim_a_registration_channel(master):
+    out = stitch_region(_SplitChannelReader(master), "A1", list(range(4)), register=False,
+                        blend_px=24, block_px=512, max_workers=2,
+                        registration_channel=CHANNELS[0])
+    assert out.placement.reg_channel is None
+    assert not out.placement.registered
+    assert not any(any(o) for o in out.placement.offsets_px)
+
+
+def test_the_placement_offsets_are_the_solved_ones(master):
+    """One source of truth: what the placement reports must BE the solve, not a re-derivation."""
+    g: dict = {}
+    out = stitch_region(_SplitChannelReader(master, error_px=_ERR), "A1", list(range(4)),
+                        blend_px=24, block_px=512, max_workers=2, geometry=g,
+                        registration_channel=CHANNELS[0])
+    np.testing.assert_allclose(np.asarray(out.placement.offsets_px), np.asarray(g["offsets_px"]))
+    assert np.abs(np.asarray(out.placement.offsets_px)[3]).max() > 2.0   # the injected error
+
+
+def test_the_mosaic_is_still_an_ordinary_array_for_every_existing_consumer(master):
+    """stitch_plate yields these into the viewer's worker and the OME-Zarr writer unchanged."""
+    out = stitch_region(_SplitChannelReader(master), "A1", [0, 1], blend_px=24, block_px=512,
+                        max_workers=2, register=False)
+    assert isinstance(out, np.ndarray)
+    assert out.ndim == 5 and out.dtype == np.uint16
+    np.testing.assert_array_equal(np.asarray(out) * 0, np.zeros_like(np.asarray(out)))
