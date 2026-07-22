@@ -11,7 +11,7 @@ WHERE THINGS LIVE, AND WHY
   operator registries (``_OPERATIONS`` and ``runnable_operators()``) launching the same
   operators from panes 1 and 3 with different labels and different ``save`` defaults, and a
   comment in ``_viewer.py`` records that they diverged in production. So "run this on the
-  subset parked in pane 3" is a SCOPE VALUE on the pane-1 panel (:func:`scope_options`),
+  subset parked in pane 3" is a SCOPE VALUE on pane 1's run selector,
   not a second set of buttons. This module adds no third caller to either registry.
 * The deconvolution RESULT - the 2-D image in turbo with the x-z and y-z strips concatenated
   to it - is a TAB IN PANE 3 (:class:`DeconQCResultView`). That is where a preview result is
@@ -120,30 +120,6 @@ STITCH_DEFAULTS = {
 # ---------------------------------------------------------------------------------------
 # policy (no Qt) — the decisions, separated from the pixels
 # ---------------------------------------------------------------------------------------
-
-def scope_options(order, selected, explore_scopes):
-    """``[(label, regions_or_None), ...]`` for the panel's scope selector.
-
-    ``regions=None`` is ``run_operator``'s "the whole plate", so it is offered first and
-    always. A plate selection and each subset parked in pane 3 follow, as VALUES rather
-    than as separate launchers.
-
-    Region lists are COPIED: the selector holds a scope for as long as the panel is open,
-    and a later click on the plate must not retroactively change what a pending run covers.
-    An empty subset is not offered at all - choosing it would only produce "empty selection
-    - nothing to run" at the far end of the click.
-    """
-    order = list(order)
-    options = [(f"Whole dataset — {len(order)} well" + ("s" if len(order) != 1 else ""), None)]
-    selected = list(selected or [])
-    if selected:
-        options.append((f"Selected wells — {len(selected)}", selected))
-    for label, regions in (explore_scopes or []):
-        regions = list(regions or [])
-        if regions:
-            options.append((f"Pane 3 subset · {label} — {len(regions)}", regions))
-    return options
-
 
 def stitch_operator_kwargs(*, register, registration_channel, channels, blend_px,
                            outlier_rel_pct, outlier_abs_px,
@@ -345,18 +321,22 @@ class StitcherPanel(_Panel):
             "mosaic. A region is a MOSAIC of FOVs, so one region produces one image.")
         names = _channel_names(host)
 
-        # -- what to run it on ---------------------------------------------------------
-        self.v.addWidget(_head("SCOPE"))
-        self.scope_combo = QComboBox()
-        self._scopes = scope_options(getattr(host, "_order", []),
-                                     getattr(host, "_selected_regions", []),
-                                     host.explore_scopes() if hasattr(host, "explore_scopes") else [])
-        for label, _regions in self._scopes:
-            self.scope_combo.addItem(label)
-        self.scope_combo.setToolTip(
-            "Every operator control lives here in pane 1. 'Run it on the subset parked in "
-            "pane 3' is one of these values, not a second button over there.")
-        self.v.addLayout(_row(self.scope_combo))
+        # SCOPE IS NOT HERE, DELIBERATELY (Defect 2). It belongs to the RUN, not to the
+        # operator, and pane 1's "run on" selector owns it. This panel used to carry a second
+        # scope combo, and it was wrong in both of its states:
+        #
+        #   * it was built ONCE and cached by _open_op_tab, from a selection read at build
+        #     time. The user opens the stitcher tab BEFORE picking wells, so the selection was
+        #     always empty and the combo always collapsed to its single "Whole dataset" entry
+        #     -- which is the whole of "Only scope available for the stitcher is the whole
+        #     dataset". It was never a capability limit; it was a stale read.
+        #   * and that entry sent regions=None, which run_operator treats as "unscoped" and
+        #     hands to the run selector anyway. So the control the user was looking at said
+        #     "Whole dataset" while the run actually went wherever the OTHER control pointed.
+        #     A mislabeled control is worse than a missing one.
+        #
+        # Two representations of one truth, which is this project's dominant defect shape. The
+        # run selector is the owner because it is the one that reads the selection LIVE.
 
         # -- what to reduce z with before fusing ---------------------------------------
         self.v.addWidget(_head("Z REDUCTION"))
@@ -506,9 +486,10 @@ class StitcherPanel(_Panel):
             self.say(str(exc))
             return
         kwargs["projector"] = self.projector_combo.currentText()
-        _label, regions = self._scopes[max(self.scope_combo.currentIndex(), 0)]
         self.say("")
-        self.host.run_operator("stitch", regions=regions,
+        # regions=None means UNSCOPED, not "the whole plate": run_operator resolves it against
+        # the run selector and the live selection. See the SCOPE note in __init__.
+        self.host.run_operator("stitch", regions=None,
                                save=self.save_cb.isChecked(), operator_kwargs=kwargs)
 
 

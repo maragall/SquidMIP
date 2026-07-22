@@ -278,3 +278,50 @@ def test_subset_selection_rejects_a_region_with_no_fovs():
 def test_subset_selection_rejects_an_empty_subset():
     with pytest.raises(ValueError):
         E.subset_selection([], {"B2": [0]})
+
+
+# ---------------------------------------------------------------------------------------
+# Defect 2: the resolved target set is CONFIRMED before the run starts
+# ---------------------------------------------------------------------------------------
+#
+# Prior art the owner has already accepted: Fractal names the resolved target set before a
+# job starts. "Run" on a 1536-well plate is otherwise indistinguishable from "Run" on the
+# one well the user thought was selected, until the compute is already spent.
+
+def test_the_target_set_is_named_not_just_counted():
+    from squidmip._explore import describe_run_target
+
+    s = describe_run_target(["A1", "A2", "A3"], total=96)
+    assert "3 regions" in s
+    assert "A1, A2, A3" in s
+
+
+def test_one_region_is_not_pluralised():
+    from squidmip._explore import describe_run_target
+
+    assert "1 region:" in describe_run_target(["B7"], total=96)
+
+
+def test_a_long_target_list_is_elided_but_the_count_stays_exact():
+    """The point is the MAGNITUDE. 400 well ids in a status line is the same as none."""
+    from squidmip._explore import describe_run_target
+
+    s = describe_run_target([f"A{i}" for i in range(400)], total=1536)
+    assert "400 regions" in s
+    assert len(s) < 200
+    assert "A0, A1" in s          # the head is still shown
+    assert "..." in s or "…" in s
+
+
+def test_the_whole_plate_says_the_whole_plate_and_its_size():
+    """`regions is None` is the plate-wide path. The user must see the number that implies."""
+    from squidmip._explore import describe_run_target
+
+    s = describe_run_target(None, total=1536)
+    assert "1536" in s
+
+
+def test_an_empty_target_refuses_rather_than_describing_a_run():
+    from squidmip._explore import describe_run_target
+
+    assert describe_run_target([], total=96) is None

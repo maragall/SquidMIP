@@ -2021,6 +2021,7 @@ class _BlockingWorker(V.QThread):
     """An _OperatorWorker stand-in that stays RUNNING until stop() (or the test) releases it."""
     tileReady = V.pyqtSignal(int, int, str, object)
     pushReady = V.pyqtSignal(int, object)
+    resultReady = V.pyqtSignal(str, int, object)     # full-res result -> napari layer group
     progress = V.pyqtSignal(int, int)
     finalReady = V.pyqtSignal(object)
     writtenReady = V.pyqtSignal(str)
@@ -3397,7 +3398,7 @@ def test_the_stitch_card_is_the_stitcher_control_surface(qapp, stub_detail, squi
     assert isinstance(tab, StitcherPanel)
     assert tab.register_cb.isChecked()
     assert tab.reg_channel_combo.count() == len(win._meta["channels"])
-    assert tab.scope_combo.count() >= 1
+    assert not hasattr(tab, "scope_combo")      # Defect 2: the run selector owns scope
     win.close()
 
 
@@ -4825,3 +4826,136 @@ def test_closing_a_tab_restores_the_plate_even_while_the_raw_preview_streams(qap
     assert win._active_exploration is None
     win._retired.clear()
     win.close()
+
+
+# --- Defect 3: an operator result becomes a toggleable LAYER GROUP in pane 2 -------------------
+#
+# Julio: "what if we want to see stitched AND deconvolved AND background subed. That's why we
+# need the toggles." Before this, NO operator's pixels reached pane 2's napari: every result
+# went to register_array (the ndviewer slider) and that was the whole of "it is visible".
+# test_every_operator_streams_live_to_plate_and_slider above pins that slider path and is
+# exactly the test that made the hole look covered -- it asserts nothing about layers.
+
+class _RecordingMosaic:
+    def __init__(self):
+        self.calls = []
+
+    def add_mosaic(self, op, channel, data, **kw):
+        self.calls.append((op, channel, data, kw))
+
+    # the real MosaicLayers' group view, over what was actually added
+    def ops(self):
+        return sorted({c[0] for c in self.calls})
+
+    def group(self, op):
+        return [c for c in self.calls if c[0] == op]
+
+
+class _RecordingPane:
+    ok = True
+
+    def __init__(self):
+        self.mosaic = _RecordingMosaic()
+
+    def say(self, msg):
+        pass
+
+
+def _result_win(op="bgsub", region="A1", channels=("405", "488")):
+    from squidmip._region_nav import RegionCursor
+
+    win = V.PlateWindow.__new__(V.PlateWindow)
+    win._mosaic_pane = _RecordingPane()
+    win._cursor = RegionCursor()
+    win._cursor.set_order([region])
+    win._cursor.activate(region)
+    win._active_op_key = op
+    win._readout = type("R", (), {"setText": lambda self, t: setattr(self, "t", t),
+                                  "text": lambda self: getattr(self, "t", "")})()
+    win._meta = {
+        "fovs_per_region": {region: [0, 1]},
+        "fov_positions_um": {(region, 0): (0.0, 0.0), (region, 1): (6.0, 0.0)},
+        "pixel_size_um": 1.0,
+        "frame_shape": (8, 8),
+        "dtype": "uint16",
+        "channels": [{"name": c} for c in channels],
+        "dz_um": 1.0,
+    }
+    return win
+
+
+def test_a_plane_op_result_becomes_a_layer_group_one_layer_per_channel(qapp):
+    """The hole this branch exists to close: bgsub produced pixels and produced no layer."""
+    win = _result_win("bgsub")
+    for fov in (0, 1):
+        V.PlateWindow._on_result(win, "A1", fov, np.full((2, 8, 8), 7, "uint16"))
+    mos = win._mosaic_pane.mosaic
+    assert mos.ops() == ["bgsub"]                    # one GROUP, keyed by the operator
+    assert [c[1] for c in mos.group("bgsub")] == ["405", "488"]   # one LAYER per channel
+
+
+def test_the_layer_group_is_not_drawn_until_the_region_is_whole(qapp):
+    """Half a region drawn as a layer is a mosaic with holes, and the user reads holes as
+    something the operator did."""
+    win = _result_win("bgsub")
+    V.PlateWindow._on_result(win, "A1", 0, np.zeros((2, 8, 8), "uint16"))
+    assert win._mosaic_pane.mosaic.calls == []
+
+
+def test_the_operator_layer_lands_in_the_raw_mosaic_s_frame(qapp):
+    """bbox_um is what puts the group ON TOP of raw. Without it the toggle would jump, and
+    every difference the user saw would be misregistration, not the operator."""
+    from squidmip._mosaic_source import mosaic_bbox_um
+
+    win = _result_win("bgsub")
+    for fov in (0, 1):
+        V.PlateWindow._on_result(win, "A1", fov, np.zeros((2, 8, 8), "uint16"))
+    kw = win._mosaic_pane.mosaic.group("bgsub")[0][3]
+    assert kw["bbox_um"] == mosaic_bbox_um(win._meta, "A1")
+
+
+def test_two_operators_make_TWO_groups_so_both_can_be_toggled(qapp):
+    """'stitched AND deconvolved AND background subed'. A second operator must ADD a group,
+    not replace the first one's."""
+    win = _result_win("bgsub")
+    for fov in (0, 1):
+        V.PlateWindow._on_result(win, "A1", fov, np.zeros((2, 8, 8), "uint16"))
+    win._active_op_key = "decon"
+    for fov in (0, 1):
+        V.PlateWindow._on_result(win, "A1", fov, np.zeros((2, 8, 8), "uint16"))
+    assert win._mosaic_pane.mosaic.ops() == ["bgsub", "decon"]
+
+
+def test_a_result_for_a_region_that_is_not_on_screen_is_dropped_not_accumulated(qapp):
+    """Pane 2 shows ONE region. Holding full-res mosaics for every well of a plate run would
+    be gigabytes of layers nobody can look at -- the same rule the raw path already follows."""
+    win = _result_win("bgsub")
+    for fov in (0, 1):
+        V.PlateWindow._on_result(win, "B7", fov, np.zeros((2, 8, 8), "uint16"))
+    assert win._mosaic_pane.mosaic.calls == []
+
+
+def test_a_result_that_cannot_be_placed_SAYS_SO_instead_of_vanishing(qapp):
+    """NO SILENT FAILURES. A channel-count mismatch used to be impossible to notice because
+    nothing was ever drawn from a result in the first place."""
+    win = _result_win("bgsub")
+    V.PlateWindow._on_result(win, "A1", 0, np.zeros((1, 8, 8), "uint16"))
+    assert "not shown as a layer" in win._readout.text()
+    assert win._mosaic_pane.mosaic.calls == []
+
+
+def test_a_region_operator_s_fused_mosaic_is_added_whole_not_re_tiled(qapp):
+    """stitch already returns the fused region; running it back through FOV placement would
+    tile a mosaic as if it were a FOV."""
+    win = _result_win("stitch")
+    V.PlateWindow._on_result(win, "A1", 0, np.full((2, 20, 30), 3, "uint16"))
+    layers = win._mosaic_pane.mosaic.group("stitch")
+    assert len(layers) == 2
+    assert layers[0][2].shape == (20, 30)
+
+
+def test_no_napari_pane_means_the_ndviewer_path_still_stands(qapp):
+    """A window without napari must not raise out of the result slot."""
+    win = _result_win("bgsub")
+    win._mosaic_pane = None
+    V.PlateWindow._on_result(win, "A1", 0, np.zeros((2, 8, 8), "uint16"))

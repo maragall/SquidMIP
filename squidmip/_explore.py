@@ -46,6 +46,7 @@ __all__ = [
     "SCOPE_SELECTION",
     "SCOPE_SUBSET",
     "resolve_run_scope",
+    "describe_run_target",
     "exploration_tab_key",
     "exploration_tab_label",
     "preview_tab_key",
@@ -96,6 +97,37 @@ SCOPE_PLATE = "whole dataset"
 SCOPE_REGION = "current region"
 SCOPE_SUBSET = "side pane subset"
 RUN_SCOPES = (SCOPE_SELECTION, SCOPE_PLATE, SCOPE_REGION, SCOPE_SUBSET)
+
+
+def describe_run_target(regions, *, total: int, head: int = 6) -> "Optional[str]":
+    """Name the resolved target set, in one sentence, BEFORE the run starts.
+
+    Fractal's pre-run confirmation, which the owner has already accepted as prior art: a job
+    tells you what it resolved to rather than making you infer it from what comes back. This
+    codebase needs it more than most, because scope is resolved from THREE pieces of live
+    state (the plate selection, the open region, the parked subset) and the selector only
+    names the RULE — "selected wells" — not the answer. "Run" on an accidental whole-plate
+    selection and "Run" on the one well the user meant look identical until the compute is
+    spent.
+
+    ``regions is None`` is the plate-wide path, so the sentence carries *total* instead: the
+    number is the whole point, and "the whole dataset" alone reads the same at 2 wells and at
+    1536.
+
+    Returns ``None`` for an empty target — there is no run to describe, and the caller must
+    refuse with its own sentence rather than print a cheerful "0 regions".
+    """
+    if regions is None:
+        return (f"this will run on the whole dataset — {int(total)} region"
+                f"{'' if int(total) == 1 else 's'}")
+    regions = [str(r) for r in regions]
+    if not regions:
+        return None
+    n = len(regions)
+    shown = ", ".join(regions[:head])
+    if n > head:
+        shown += f", ... (+{n - head} more)"
+    return f"this will run on {n} region{'' if n == 1 else 's'}: {shown}"
 
 
 def resolve_run_scope(scope: str, *, selection=None, current_region=None,

@@ -19,54 +19,23 @@ import pytest
 from squidmip._op_panels import (
     STITCH_DEFAULTS,
     plane_op_refusal,
-    scope_options,
     stitch_operator_kwargs,
 )
 
 
 # ---------------------------------------------------------------------------------------
-# scope: ONE control surface, in pane 1 (the selector replaces a second set of buttons)
+# scope: ONE control surface, and it is NOT on the operator panel (Defect 2)
 # ---------------------------------------------------------------------------------------
 #
-# A UI audit found two operator registries launching the same operators from pane 1 and
-# pane 3 with different labels and different `save` defaults, and they had diverged in
-# production. The fix is not a third caller: it is that "run this on the subset parked in
-# pane 3" is a SCOPE VALUE on the pane-1 panel, not a button in pane 3.
-
-def test_whole_dataset_is_always_offered_and_is_the_first_choice():
-    opts = scope_options(["A1", "A2", "A3"], selected=[], explore_scopes=[])
-    assert len(opts) == 1
-    label, regions = opts[0]
-    assert regions is None                     # None is run_operator's "whole plate"
-    assert "3" in label                        # the count is shown, not just the word
-
-
-def test_a_plate_selection_becomes_a_scope_choice():
-    opts = scope_options(["A1", "A2", "A3"], selected=["A2", "A3"], explore_scopes=[])
-    assert [r for _, r in opts] == [None, ["A2", "A3"]]
-    assert "2" in opts[1][0]
-
-
-def test_each_pane3_subset_is_a_scope_choice_not_a_button_in_pane_3():
-    opts = scope_options(["A1", "A2", "A3"], selected=[],
-                         explore_scopes=[("A1+A2", ["A1", "A2"]), ("A3", ["A3"])])
-    assert [r for _, r in opts] == [None, ["A1", "A2"], ["A3"]]
-    assert "A1+A2" in opts[1][0]
-
-
-def test_an_empty_subset_is_not_offered_as_a_runnable_scope():
-    """Choosing it would produce 'empty selection -- nothing to run' at the far end of the
-    click. Refusing to OFFER it is the honest version."""
-    opts = scope_options(["A1"], selected=[], explore_scopes=[("stale", [])])
-    assert [r for _, r in opts] == [None]
-
-
-def test_scope_regions_are_copies_so_a_later_plate_click_cannot_rewrite_a_pending_run():
-    selected = ["A1"]
-    opts = scope_options(["A1", "A2"], selected=selected, explore_scopes=[])
-    selected.append("A2")
-    assert opts[1][1] == ["A1"]
-
+# This block used to test `scope_options`, a per-panel scope combo. It is deleted, and so is
+# the function. Scope belongs to the RUN, not to the operator: `_explore.resolve_run_scope`
+# is the single owner and pane 1's "run on" selector is its control. The panel combo was
+# wrong in both of its states -- always stale (built once, from an empty selection) and, in
+# its only reachable state, mislabeled (it said "Whole dataset" while sending regions=None,
+# which run_operator hands to the run selector anyway).
+#
+# What replaces the coverage: tests/test_explore.py's resolve_run_scope and
+# describe_run_target tests, plus test_the_panel_does_not_carry_its_own_scope below.
 
 # ---------------------------------------------------------------------------------------
 # the stitcher's control surface -> stitch_region's kwargs
@@ -278,7 +247,22 @@ def test_the_stitcher_panel_builds_and_offers_the_ported_controls(qapp):
     assert p.blend_spin.value() == STITCH_DEFAULTS["blend_px"]
     assert p.rel_spin.value() == STITCH_DEFAULTS["outlier_rel_pct"]
     assert p.abs_spin.value() == STITCH_DEFAULTS["outlier_abs_px"]
-    assert p.scope_combo.count() >= 1
+
+
+def test_the_panel_does_not_carry_its_own_scope(qapp):
+    """Defect 2: scope belongs to the RUN. One representation, owned by pane 1's selector."""
+    p = StitcherPanel(_Host())
+    assert not hasattr(p, "scope_combo")
+
+
+def test_the_run_leaves_scope_unresolved_so_the_run_selector_owns_it(qapp):
+    """regions=None is UNSCOPED, not 'the whole plate'. run_operator resolves it against the
+    LIVE selection -- which is the whole point: the panel is built once and cached, so any
+    region list it captured would be stale by the time the user pressed Run."""
+    host = _Host()
+    p = StitcherPanel(host)
+    p.run_btn.click()
+    assert host.calls[0][1]["regions"] is None
 
 
 def test_the_stitcher_run_button_launches_the_operator_with_the_panel_s_kwargs(qapp):
