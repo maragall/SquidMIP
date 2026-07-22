@@ -105,6 +105,8 @@ class MosaicPane(QWidget):
         self.mosaic: Optional[MosaicLayers] = None
         self._viewer = None
         self._native_window = None
+        self.ndisplay_button: Optional[QWidget] = None
+        self._button_source = None               # keeps napari's row alive; see _install_ndisplay
         self.canvas: Optional[QWidget] = None
         self.failure: Optional[str] = None
         self._settle: Optional[SettleCoalescer] = None
@@ -156,6 +158,7 @@ class MosaicPane(QWidget):
             # That was the wrong reading: the Window is not the bloat, it is where contrast
             # behaviour, blending, the dims sliders, the ndisplay (2D/3D) button, the layer
             # controls AND the stylesheet all live. Use it.
+            self._install_ndisplay_button(lay)
             self._embed_native_window(lay)
             self._install_camera_settle()
         except Exception as exc:                 # noqa: BLE001 - reported, never swallowed
@@ -168,6 +171,55 @@ class MosaicPane(QWidget):
             msg.setWordWrap(True)
             msg.setStyleSheet("color:#ffd7d7;background:#3a2020;padding:12px;")
             lay.addWidget(msg, 1)
+
+    # -- the 2D/3D toggle, where a short pane still shows it -----------------------------
+    def _install_ndisplay_button(self, lay) -> None:
+        """Lift NAPARI'S OWN ndisplay button into a fixed row at the top of the pane.
+
+        Julio has asked for a visible 3D toggle twice, and the button was never missing: a probe
+        of the embedded window found ``QtViewerButtons.ndisplayButton`` present and visible at
+        y=752 inside a 900 px host — the last row of the left dock column, under a layer list
+        that grows with every layer added. On a small monitor it is simply below the fold. So
+        this does not BUILD a button (PartSeg's ``QtNDisplayButton`` does not exist in napari
+        0.6.6 anyway); it constructs napari's own button row, takes the one button out of it and
+        puts it where a short pane still shows it.
+
+        Reparenting a BUTTON is not the canvas trap: the canvas is the QMainWindow's central
+        widget and pulling it out guts the window (506c813). A button is a leaf in a dock.
+        The napari row that produced it is kept alive on ``self._button_source`` because napari's
+        check-state sync (``viewer.dims.events.ndisplay`` -> ``setChecked``) is a closure owned by
+        that row; drop the row and the button silently stops following the viewer.
+
+        There is exactly one owner of 2D/3D — ``viewer.dims.ndisplay``. This button and the one
+        napari docks read and write that same property, so they cannot disagree.
+        """
+        try:
+            from napari._qt.widgets.qt_viewer_buttons import QtViewerButtons
+            from napari.qt import get_current_stylesheet
+        except Exception as exc:                 # noqa: BLE001 - said out loud, never swallowed
+            self.say(f"napari's 2D/3D button could not be mounted ({exc}); "
+                     "use the one at the bottom of napari's left column.")
+            return
+
+        self._button_source = QtViewerButtons(self._viewer)
+        btn = self._button_source.ndisplayButton
+
+        row = QWidget(self)
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(6, 4, 6, 4)
+        rl.setSpacing(6)
+        rl.addWidget(btn)
+        rl.addStretch(1)
+        # napari's icons live in napari's stylesheet, which is applied to napari's own window.
+        # Outside it the button would render as an empty square -- a control that is technically
+        # visible and reads as broken. get_current_stylesheet is public and in napari.qt.__all__.
+        try:
+            row.setStyleSheet(get_current_stylesheet())
+        except Exception:                        # noqa: BLE001 - cosmetic only
+            pass
+        row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        lay.addWidget(row)
+        self.ndisplay_button = btn
 
     # -- the native napari window -------------------------------------------------------
     def _embed_native_window(self, lay) -> None:
