@@ -4318,10 +4318,16 @@ def test_ima260_the_empty_pane_shows_example_usage_not_a_blank_strip(qapp, stub_
     assert "control fov" not in low, "the action is Control Well, not Control FOV"
     # SECONDARY: hold Shift to view a subset here.
     assert "hold shift" in low
-    # ...and the whole thing is framed as an EXAMPLE, never as an instruction. This is Julio's
-    # explicit second correction, so it is asserted rather than left to the reviewer's eye.
-    assert "for example" in low
-    assert "only examples" in low
+    # ...and it does NOT hedge. The copy said "here is an example", "for example" and "these are
+    # only examples" in four consecutive paragraphs, which reads as apologetic rather than
+    # instructive. Julio: "The exploration pane message is really unprofessional and unlike AI."
+    assert "for example" not in low, "the copy is hedging again"
+    assert "only examples" not in low, "the copy is hedging again"
+    # It must also teach the RIGHT MODEL: operator results go to the plate and the centre viewer
+    # as layers. Copy promising results will "land here" made pane 3 look like the result surface.
+    assert "not here" in low or "centre viewer" in low, (
+        "the copy no longer says where operator results actually appear"
+    )
     win.close()
 
 

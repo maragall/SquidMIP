@@ -115,22 +115,26 @@ _EMPTY_HEAD_PX = 19                   # heading, one step up from body
 
 # The empty exploration pane's copy (IMA-260). Framed as an EXAMPLE of what you might do, never as
 # an instruction: Julio asked for "example usage", so the pane shows one concrete path and then
-# says out loud that it is only an example. Primary line first (right-click -> Control Well),
-# secondary second (Shift-drag). Plain sentences, no UI jargon.
-_EMPTY_EXPLORE_HEAD = "Exploration pane"
+# Control Well first (Julio's stated priority), Shift-drag second. Plain sentences, no jargon,
+# and no hedging: the previous copy said "here is an example", "for example" and "these are only
+# examples" in four consecutive paragraphs, which reads as apologetic rather than instructive.
+# Julio: "The exploration pane message is really unprofessional and unlike AI."
+#
+# It also described the WRONG ROLE. Operator results belong in the plate view and the centre
+# viewer as toggleable layers -- pane 3 is SUPPLEMENTARY (3D rendering, decon previews, fields
+# worth keeping in view). Copy that promises results will "land here" teaches the wrong model.
+_EMPTY_EXPLORE_HEAD = "Exploration"
 _EMPTY_EXPLORE_LEDE = (
-    "Nothing here yet. It is a second viewer on a few wells at a time, and results you preview "
-    "show up here while they compute. Here is an example of how you might use it.")
+    "A second viewer, for a subset of the plate. Operator results appear as layers in the plate "
+    "and the centre viewer \u2014 not here.")
 _EMPTY_EXPLORE_PRIMARY = (
-    "For example, you can right-click a well on the plate and choose Control Well from the menu. "
-    "That well opens here with its own viewer and stays, so you can compare the other wells "
+    "Right-click a well and choose Control Well to pin it here, so you can compare the rest "
     "against it.")
 _EMPTY_EXPLORE_SECONDARY = (
-    "You can also hold Shift and drag across the plate to pick a few wells. They open here in "
-    "their own tab, with a slider to step through them.")
+    "Hold Shift and drag across the plate to open a subset in its own tab, with a slider to "
+    "step through it.")
 _EMPTY_EXPLORE_CODA = (
-    "These are only examples. Operators run from the panel on the left \u2014 set \u201crun on\u201d "
-    "to the side pane subset and their results land here.")
+    "Use it for 3D volume rendering, deconvolution previews, and fields worth keeping in view.")
 _EXPLORE_W = 380                      # pane 3's width on open, in px (see PlateWindow.__init__)
 
 # Processing-status hue coding, adopted from Hongquan Li's record-zstack-viewer plate navigator.

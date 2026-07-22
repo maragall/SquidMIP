@@ -402,7 +402,23 @@ class MosaicLayers:
         key = MosaicKey(str(op), str(channel))
         existing = self.find(key.op, key.channel)
         if existing is not None:
-            self.remove_op_channel(key.op, key.channel)
+            # REUSE the layer: assign new pixels instead of destroying and rebuilding it.
+            #
+            # A region change used to remove four layers and add four back. Measured on a bare
+            # ViewerModel that is 18 ms against 2 ms for an in-place update, and on a LIVE viewer
+            # the gap is far worse -- `remove_op` was measured growing 176 ms -> 960 ms over six
+            # region changes, because each removal tears down vispy nodes and layer-control
+            # widgets that then have to be rebuilt. Julio: "I can't cycle rapidly through these
+            # mosaics."
+            #
+            # Reuse also deletes a whole BUG CLASS rather than just time. Every subscription in
+            # this app binds to layer objects -- contrast, visibility, colormap -- and each one
+            # has already broken once because `_load_mosaic` destroyed the object underneath it
+            # ("the sink went deaf after a rebuild"). A layer that is never destroyed cannot
+            # strand its subscribers. It also keeps the user's contrast, colormap and visibility
+            # across a region change, which is what "one value per channel" is supposed to mean.
+            return self._reuse_layer(existing, data, bbox_um=bbox_um, z_scale_um=z_scale_um,
+                                     multiscale=multiscale, visible=visible)
 
         kwargs: dict[str, Any] = {
             "name": key.label(),
@@ -482,6 +498,30 @@ class MosaicLayers:
                     self._model.reset_view()
             except Exception:                    # noqa: BLE001 - view convenience, never fatal
                 pass
+        return layer
+
+    def _reuse_layer(self, layer: Any, data: Any, *, bbox_um, z_scale_um, multiscale, visible):
+        """Point an EXISTING layer at new pixels, keeping everything the user owns.
+
+        What is deliberately NOT touched: contrast_limits, colormap, gamma, opacity, blending.
+        Those are the user's, and a region change is not a reason to reset them -- that is the
+        whole point of one contrast value per channel. What IS updated: the data, the placement
+        (each region sits at its own stage coordinates) and the z scale.
+
+        Everything happens inside `programmatic()` so the plate's sinks do not read our write as
+        a user gesture. napari re-renders on the data assignment; nothing else has to be told.
+        """
+        with self.programmatic():
+            layer.data = data
+            if visible is not None:
+                layer.visible = bool(visible)
+            if bbox_um is not None:
+                shape = tuple(_first_level_shape(data, bool(multiscale)))[-2:]
+                scale, translate = scale_translate_from_bbox_um(bbox_um, shape)
+                extra = max(0, int(getattr(layer, "ndim", len(shape))) - 2)
+                lead = (float(z_scale_um) if (extra and z_scale_um) else 1.0,) * extra
+                layer.scale = lead + tuple(scale)
+                layer.translate = (0.0,) * extra + tuple(translate)
         return layer
 
     def _register_channel(self, channel: str, layer: Any) -> None:
