@@ -124,6 +124,22 @@ def test_dz_may_be_absent_but_asking_for_it_raises_naming_the_field():
     assert Acquisition(**_kw()).require_dz_um() == 1.5
 
 
+def test_a_zero_dz_is_STORED_but_refused_as_a_scale():
+    # A single-plane acquisition really does record delta_z_mm: 0 — four of this repo's own
+    # fixtures do, and an early `gt=0` draft of this model refused all four. So 0.0 is a legal
+    # stored value. It is only meaningless once used as a z SCALE, so that is where it dies.
+    a = Acquisition(**_kw(dz_um=0.0, n_z=1, z_levels=[0]))
+    assert a.dz_um == 0.0
+    assert a["dz_um"] == 0.0
+    with pytest.raises(ValueError, match="dz_um"):
+        a.require_dz_um()
+
+
+def test_a_negative_dz_is_refused_outright():
+    with pytest.raises(ValidationError, match="dz_um"):
+        Acquisition(**_kw(dz_um=-1.5))
+
+
 def test_channel_index_refuses_an_unknown_channel_rather_than_returning_zero():
     # The Defect-2 shape: `names.index(x) if x in names else 0` is a silent wrong answer.
     a = Acquisition(**_kw())
@@ -160,3 +176,79 @@ def test_an_unknown_key_raises_keyerror_not_none():
     # The old dict did this too; keep it, so a typo is never a silent None.
     with pytest.raises(KeyError):
         Acquisition(**_kw())["pixel_size"]
+
+
+# --- validated ONCE, at the reader boundary ----------------------------------------------
+
+def test_every_reader_returns_a_validated_acquisition(squid_dataset, multipage_dataset,
+                                                      ome_tiff_dataset, zarr_hcs_dataset):
+    """The point of the model: it is not an optional wrapper some call sites remember to use.
+
+    All four reader classes build the same 13-key dict, so all four must hand back the same
+    validated type — otherwise a consumer has to ask which reader it holds before it can trust
+    what it was given, which is the situation the model exists to end.
+    """
+    from squidmip.reader import open_reader
+
+    for root, _ in (squid_dataset, multipage_dataset, ome_tiff_dataset, zarr_hcs_dataset):
+        meta = open_reader(root).metadata
+        assert isinstance(meta, Acquisition), f"{root} reader returned {type(meta).__name__}"
+        assert meta.channel_names, "no channels"
+        assert meta.frame_shape[0] > 0 and meta.frame_shape[1] > 0
+
+
+def test_the_reader_boundary_refuses_a_malformed_acquisition(squid_dataset, monkeypatch):
+    """A bad acquisition must die AT THE READER, naming the field.
+
+    Before the model, a reader that produced a nonsense n_z handed it downstream and the
+    failure appeared wherever someone first allocated against it — a stack trace pointing at
+    the victim rather than the cause.
+    """
+    import squidmip.reader as reader_mod
+    from squidmip.reader import open_reader
+
+    real = reader_mod.load_acquisition_metadata
+
+    def broken(root):
+        m = dict(real(root))
+        m["pixel_size_um"] = -1.0       # physically impossible; would invert every offset
+        return m
+
+    monkeypatch.setattr(reader_mod, "load_acquisition_metadata", broken)
+    with pytest.raises(ValidationError, match="pixel_size_um"):
+        open_reader(squid_dataset[0]).metadata
+
+
+def test_the_mapping_shim_is_not_dramatically_slower_than_the_dict_it_replaced():
+    """A regression gate on the shim's lookup cost — this was a real bug, not a micro-worry.
+
+    The first draft consulted ``model_fields`` on every ``meta["..."]``. That is a pydantic
+    CLASSPROPERTY which does real work per access, making the shim ~18x slower than the plain
+    dict. ``reader.metadata`` is read in the viewer's paint and ingest paths, so the cost
+    landed on Qt event-loop tests: ``test_viewer.py`` went from ~60s to ~110s and failed a
+    DIFFERENT test on 2 of 3 runs. That presents exactly like flakiness, and it was not — it
+    was this. Hence a test.
+
+    The bound is RELATIVE (against a dict measured in the same process, same moment) rather
+    than an absolute time, so it does not turn into a load-sensitive flake on a busy machine.
+    ``min`` of several repeats measures the least-interrupted run, which is the standard way to
+    read timeit under load.
+
+    The bound sits between the two measured states rather than just below the regression: the
+    fixed shim is ~3x a dict lookup and the regressed one ~15x, so 6x has ~2x headroom in BOTH
+    directions. An earlier draft bounded at 10x and passed once WITH the regression applied —
+    a 1.5x margin is not a gate, and a test that has been watched passing against the bug it
+    exists to catch is worse than no test.
+    """
+    import timeit
+
+    a = Acquisition(**_kw())
+    d = dict(_kw())
+    n = 20000
+    dict_s = min(timeit.repeat(lambda: d["channels"], number=n, repeat=7))
+    model_s = min(timeit.repeat(lambda: a["channels"], number=n, repeat=7))
+    assert model_s < dict_s * 6, (
+        f"Acquisition subscript is {model_s / dict_s:.1f}x a dict lookup "
+        f"({model_s:.4f}s vs {dict_s:.4f}s for {n} lookups). The Mapping shim must not consult "
+        "pydantic's model_fields classproperty at lookup time — see _ACQ_KEYS."
+    )

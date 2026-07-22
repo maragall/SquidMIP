@@ -81,7 +81,7 @@ from typing import Optional
 import numpy as np
 import tifffile
 
-from squidmip._acquisition import load_acquisition_metadata
+from squidmip._acquisition import Acquisition, load_acquisition_metadata
 from squidmip._channels import fallback_color, load_channel_yaml, resolve_channels
 
 # region has no underscore; fov and z are ints; channel is the remainder (may contain _ and -).
@@ -645,7 +645,7 @@ class SquidReader:
         sample = _validate_plane(tifffile.imread(sample_path), sample_path)
 
         fovs_per_region = {r: sorted(fovs[r]) for r in regions}
-        self._meta = {
+        self._meta = Acquisition(**{
             "regions": regions,
             "fovs_per_region": fovs_per_region,
             # {(region, fov): (x_um, y_um)} — MICROMETRES, per the package units invariant.
@@ -662,7 +662,7 @@ class SquidReader:
             "frame_shape": tuple(sample.shape),
             "dtype": sample.dtype,
             "n_t": n_t,
-        }
+        })
         return self._meta
 
     # -- read -------------------------------------------------------------
@@ -915,7 +915,7 @@ class SquidMultiPageTiffReader:
         # frame shape + dtype come from a real decoded page — they vary with binning / pixel format.
         s_region, s_fov, s_z, s_channel = next(iter(index))
         sample = self.read(s_region, s_fov, s_channel, s_z)
-        self._meta = {
+        self._meta = Acquisition(**{
             "regions": regions,
             "fovs_per_region": fovs_per_region,
             "fov_positions_um": self._positions_um(fovs_per_region),
@@ -928,7 +928,7 @@ class SquidMultiPageTiffReader:
             "frame_shape": tuple(sample.shape),
             "dtype": sample.dtype,
             "n_t": n_t,
-        }
+        })
         return self._meta
 
     def _positions_um(self, fovs_per_region: dict) -> dict:
@@ -1054,7 +1054,7 @@ class SquidOMEReader:
         if acq["n_z_declared"] is not None and acq["n_z_declared"] != n_z:
             warnings.warn(f"Recorded Nz ({acq['n_z_declared']}) != OME Z ({n_z}); using {n_z}.")
         fovs_per_region = {r: sorted(fovs[r]) for r in regions}
-        self._meta = {
+        self._meta = Acquisition(**{
             "regions": regions,
             "fovs_per_region": fovs_per_region,
             # Same key, same meaning as SquidReader — the shared-interface promise in this
@@ -1072,7 +1072,7 @@ class SquidOMEReader:
             "frame_shape": (int(dims.get("Y", sample.shape[-2])), int(dims.get("X", sample.shape[-1]))),
             "dtype": np.dtype(sample.dtype),
             "n_t": n_t,
-        }
+        })
         return self._meta
 
     def _page_index(self, t: int, z: int, c: int) -> int:
@@ -1488,7 +1488,7 @@ class SquidZarrReader:
         n_z = ms.size(shape, "z")
         n_t = ms.size(shape, "t")
 
-        self._meta = {
+        self._meta = Acquisition(**{
             "regions": regions,
             "fovs_per_region": fovs_per_region,
             "fov_positions_um": self._positions_um(fields, fovs_per_region),
@@ -1501,7 +1501,7 @@ class SquidZarrReader:
             "frame_shape": (ms.size(shape, "y", shape[-2]), ms.size(shape, "x", shape[-1])),
             "dtype": dtype,
             "n_t": n_t,
-        }
+        })
         return self._meta
 
     def _positions_um(self, fields: dict, fovs_per_region: dict) -> dict:
