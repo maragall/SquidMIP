@@ -500,6 +500,38 @@ def test_a_user_drag_does_reach_the_sink(layers):
     assert seen == [("488", 33.0, 777.0)]
 
 
+def test_a_user_drag_on_a_LATER_layer_also_reaches_the_sink(layers):
+    """The plate must keep following napari for layers added AFTER it subscribed.
+
+    ``_bind_napari_contrast`` connects ONCE, on the first mosaic; every op run after that
+    (a second region, a re-ingest, a plane-op) calls ``add_mosaic`` again. If the sink is
+    only wired to the layers that happened to exist at subscribe time, those later layers
+    drive napari and nothing else, and the plate's contrast silently diverges from what
+    the user is looking at. Julio, repeatedly: "contrast of regions and napari are different."
+    """
+    seen: list = []
+    layers.on_user_contrast(lambda ch, lo, hi: seen.append((ch, lo, hi)))
+
+    layers.add_mosaic("raw", "488", _img())            # added AFTER the subscribe
+    layers.find("raw", "488").contrast_limits = (33.0, 777.0)     # a real user drag
+
+    assert seen == [("488", 33.0, 777.0)], (
+        "a layer added after on_user_contrast() never reached the sink"
+    )
+
+
+def test_a_second_op_layer_added_later_still_reaches_the_sink(layers):
+    """Same defect, the shape it actually ships in: op 2 arrives after the bind."""
+    layers.add_mosaic("raw", "488", _img())
+    seen: list = []
+    layers.on_user_contrast(lambda ch, lo, hi: seen.append((ch, lo, hi)))
+
+    layers.add_mosaic("bgsub", "561", _img())          # a NEW channel, after the bind
+    layers.find("bgsub", "561").contrast_limits = (12.0, 345.0)
+
+    assert seen == [("561", 12.0, 345.0)]
+
+
 def test_programmatic_is_reentrant_and_restores_state(layers):
     with layers.programmatic():
         assert layers.is_programmatic

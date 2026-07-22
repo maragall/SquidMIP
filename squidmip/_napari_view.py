@@ -269,6 +269,8 @@ class MosaicLayers:
         # Depth of "this write came from US, not the user". See `programmatic()`.
         self._programmatic = 0
         self._user_contrast_cbs: list[Any] = []
+        # id(layer) of every layer already wired to the sink — see _connect_user_contrast.
+        self._contrast_connected: set[int] = set()
 
     # -- who moved the contrast: us, or the user? ---------------------------------------
     @contextmanager
@@ -422,6 +424,11 @@ class MosaicLayers:
     def _register_channel(self, channel: str, layer: Any) -> None:
         peers = self._by_channel.setdefault(channel, [])
         peers.append(layer)
+        # Wire the sink HERE, not in on_user_contrast. The plate binds once, on the first
+        # mosaic; every op run after that adds more layers. Connecting only what existed at
+        # subscribe time left those later layers driving napari and nothing else, so the
+        # plate's contrast silently diverged from the picture on screen.
+        self._connect_user_contrast(channel, layer)
         # Link contrast across every processing layer showing this channel, so the
         # before->after toggle preserves the window and there is only ever one value.
         if len(peers) > 1:
@@ -499,25 +506,39 @@ class MosaicLayers:
         # Linked, so writing one writes them all; write the first and let napari propagate.
         peers[0].contrast_limits = (float(lo), float(hi))
 
+    def _connect_user_contrast(self, channel: str, layer: Any) -> None:
+        """Make *layer* report a USER contrast drag to every sink, now and in the future.
+
+        Connected once per layer (``_contrast_connected`` is keyed on layer identity, so a
+        re-add or a second subscribe cannot double-fire). The handler reads the callback list
+        at emit time, so a layer added before anyone subscribed is still wired correctly.
+        """
+        if id(layer) in self._contrast_connected:
+            return
+
+        def _fire(event=None, _ch=channel, _layer=layer):
+            if self.is_programmatic:
+                return
+            lo, hi = _layer.contrast_limits
+            for cb in list(self._user_contrast_cbs):
+                cb(_ch, float(lo), float(hi))
+
+        layer.events.contrast_limits.connect(_fire)
+        self._contrast_connected.add(id(layer))
+
     def on_user_contrast(self, callback) -> None:
         """Subscribe to contrast changes the USER made. Programmatic writes never arrive here.
 
         ``callback(channel, lo, hi)``. This is the seam that lets the plate be a pure sink: it
         is told what the owner resolved, and it never writes back.
+
+        Layers are wired in ``_register_channel``, so this stays correct for every layer added
+        after the subscribe — which is all of them after the first mosaic.
         """
         self._user_contrast_cbs.append(callback)
         for channel, peers in self._by_channel.items():
-            if not peers:
-                continue
-
-            def _fire(event=None, _ch=channel, _peers=peers):
-                if self.is_programmatic:
-                    return
-                lo, hi = _peers[0].contrast_limits
-                for cb in self._user_contrast_cbs:
-                    cb(_ch, float(lo), float(hi))
-
-            peers[0].events.contrast_limits.connect(_fire)
+            for layer in peers:
+                self._connect_user_contrast(channel, layer)
 
     def on_contrast_changed(self, callback) -> None:
         """Subscribe to contrast changes via napari's PUBLIC event.
