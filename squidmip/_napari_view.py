@@ -269,6 +269,13 @@ class MosaicLayers:
         # Depth of "this write came from US, not the user". See `programmatic()`.
         self._programmatic = 0
         self._user_contrast_cbs: list[Any] = []
+        # Last contrast value SEEN per channel, updated on every event including our own
+        # programmatic writes. Linked layers propagate a write to their peers and each peer
+        # then emits its own event, so one user drag arrives here once per layer showing the
+        # channel. Those echoes carry an identical value, which is what distinguishes them
+        # from a real gesture. Tracking programmatic writes here too matters: without it, a
+        # user dragging BACK to a previously delivered value would be suppressed as an echo.
+        self._last_seen: dict[str, tuple[float, float]] = {}
 
     # -- who moved the contrast: us, or the user? ---------------------------------------
     @contextmanager
@@ -422,6 +429,15 @@ class MosaicLayers:
     def _register_channel(self, channel: str, layer: Any) -> None:
         peers = self._by_channel.setdefault(channel, [])
         peers.append(layer)
+        # Subscribe THIS layer to the channel's user-contrast fan-out.
+        #
+        # This is the Defect 5 fix. on_user_contrast used to walk _by_channel once, at
+        # subscribe time, and connect to the layer objects it found. _load_mosaic destroys and
+        # recreates every layer on a region change, so the recreated layers had no connection
+        # and the sync silently stopped after exactly one region change. Connecting HERE means
+        # the subscription is keyed on the CHANNEL and any layer that ever shows it is wired
+        # up, whenever it is created.
+        self._connect_user_contrast(channel, layer)
         # Link contrast across every processing layer showing this channel, so the
         # before->after toggle preserves the window and there is only ever one value.
         if len(peers) > 1:
@@ -499,25 +515,44 @@ class MosaicLayers:
         # Linked, so writing one writes them all; write the first and let napari propagate.
         peers[0].contrast_limits = (float(lo), float(hi))
 
+    def _connect_user_contrast(self, channel: str, layer: Any) -> None:
+        """Wire one layer into *channel*'s user-contrast fan-out.
+
+        Every layer of the channel is connected, not just the first, because "the first" is a
+        layer object and layer objects do not survive a region change.
+
+        Linked layers propagate a write to their peers, and each peer then emits its own
+        event, so one user drag arrives here once per layer showing the channel. The echoes
+        are collapsed by VALUE, not by a re-entrancy flag: napari emits the peers' events
+        after this handler has already returned, so a flag set and cleared around the delivery
+        catches none of them (measured -- three linked layers delivered three callbacks).
+        """
+        def _fire(event=None, _ch=channel):
+            peers = self._by_channel.get(_ch) or []
+            if not peers:
+                return
+            lo, hi = float(peers[0].contrast_limits[0]), float(peers[0].contrast_limits[1])
+            if self._last_seen.get(_ch) == (lo, hi):
+                return                      # a link echo of a value already accounted for
+            self._last_seen[_ch] = (lo, hi)
+            if self.is_programmatic:
+                return                      # OUR write: recorded, never reported as a gesture
+            for cb in list(self._user_contrast_cbs):
+                cb(_ch, lo, hi)
+
+        layer.events.contrast_limits.connect(_fire)
+
     def on_user_contrast(self, callback) -> None:
         """Subscribe to contrast changes the USER made. Programmatic writes never arrive here.
 
         ``callback(channel, lo, hi)``. This is the seam that lets the plate be a pure sink: it
         is told what the owner resolved, and it never writes back.
+
+        The subscription is per CHANNEL and outlives the layers: channels added after this
+        call are covered too, because the connection is made in ``_register_channel`` rather
+        than swept up here. Only the callback is recorded here.
         """
         self._user_contrast_cbs.append(callback)
-        for channel, peers in self._by_channel.items():
-            if not peers:
-                continue
-
-            def _fire(event=None, _ch=channel, _peers=peers):
-                if self.is_programmatic:
-                    return
-                lo, hi = _peers[0].contrast_limits
-                for cb in self._user_contrast_cbs:
-                    cb(_ch, float(lo), float(hi))
-
-            peers[0].events.contrast_limits.connect(_fire)
 
     def on_contrast_changed(self, callback) -> None:
         """Subscribe to contrast changes via napari's PUBLIC event.
