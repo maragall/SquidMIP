@@ -985,20 +985,28 @@ def test_channel_toggle_after_preview_reads_nothing(qapp, stub_detail, squid_dat
     win.close()
 
 
-def test_channel_bar_drives_the_plate(qapp, stub_detail, squid_dataset):
-    # The UI seam that REMAINS on the channel bar: one row per channel, checkbox -> mask. The bar
-    # is built from the acquisition's RESOLVED display_color. Contrast is deliberately absent —
-    # see test_channel_bar_has_no_contrast_control_at_all.
+def test_napari_visibility_drives_the_plate_and_the_strip_only_reports_it(qapp, stub_detail,
+                                                                          squid_dataset):
+    """Julio: "there shouldn't be any controls for the plate view. It just reacts to toggles and
+    contrast adjustments in napari."
+
+    The strip's checkboxes used to be the seam: click a box, mask the channel out of the plate
+    composite. napari's eye icon over the SAME channel was a second control over the same
+    question, and the two could disagree on screen. Now the eye icon is the only control and the
+    plate is a sink -- so this drives the sink and checks the plate followed.
+
+    MUTATION: drop the `on_user_visibility` binding in `_bind_napari_contrast` and this goes red.
+    """
     root, _ = squid_dataset
     win = V.PlateWindow(None)
     win.ingest(str(root))
     bar = win._channel_bar
     assert bar is not None and len(bar._rows) == len(win._meta["channels"])
 
-    box, _readout = bar._rows[0]
-    box.setChecked(False)
+    # what napari reports when the user clicks an eye icon off, and back on
+    win._overview.set_channel_visible(0, False)
     assert win._overview._mask[0] == False        # noqa: E712 — numpy bool, not python bool
-    box.setChecked(True)
+    win._overview.set_channel_visible(0, True)
     assert win._overview._mask[0] == True         # noqa: E712
     win.close()
 
@@ -1126,32 +1134,6 @@ def test_a_user_latch_still_outranks_the_viewer(qapp, stub_detail, squid_dataset
     win.close()
 
 
-def test_per_region_scope_outranks_the_viewers_global_window(qapp):
-    """Choosing per-region IS the instruction "give every well its own range".
-
-    The array viewer's ONE global window must not win here, or the control does nothing while the
-    plate goes on drawing "wells NOT comparable" over wells that are all identical.
-    """
-    ov = _overview(qapp)
-    ov.set_contrast_scope(V.SCOPE_PER_REGION)
-    ov.add_tile(0, 0, "A1", _tile([1000, 2000]))
-    ov.add_tile(0, 1, "A2", _tile([60000, 50000]))      # a much brighter well
-    ov.follow_channel_window(0, 7.0, 9.0)               # the array viewer's global window
-    ov.follow_channel_window(1, 7.0, 9.0)
-
-    store = ov._store["raw"]
-    dim = ov._cell_windows(store, 0, 0)
-    bright = ov._cell_windows(store, 0, 1)
-    assert dim != bright, "per-region gave both wells the same window — the scope is dead"
-    assert dim[0] != (7.0, 9.0) and bright[0] != (7.0, 9.0), (
-        "a per-region cell rendered with the array viewer's GLOBAL window")
-    assert bright[0][1] > dim[0][1], "the brighter well did not get the wider window"
-
-    # ...but a real USER latch still wins, even under per-region (IMA-242 D4 is unchanged).
-    ov.set_channel_window(0, 40.0, 80.0)
-    assert ov._cell_windows(store, 0, 0)[0] == (40.0, 80.0)
-
-
 def test_a_channel_the_plate_does_not_have_is_ignored_not_a_crash(qapp, stub_detail, squid_dataset):
     """ndv draws RGB mode and re-ingests; it can broadcast a channel index the plate lacks."""
     root, _ = squid_dataset
@@ -1219,50 +1201,6 @@ def test_a_contrast_change_keeps_the_thumbnail_but_new_pixels_drop_it(qapp):
     shown = _rgb(ov)
     assert shown[shown.shape[0] // 2:, shown.shape[1] // 2:].any(), (
         "the newly added well never appeared — the plate composited a stale thumbnail")
-
-
-def test_per_region_windows_are_cached_on_pixels_not_recomputed_per_drag(qapp):
-    """The per-cell percentile cache: expensive, and valid across every contrast change."""
-    ov = _overview(qapp)
-    ov.set_contrast_scope(V.SCOPE_PER_REGION)
-    ov.add_tile(0, 0, "A1", _tile([1000, 2000]))
-    ov.recomposite(quick=False)
-    assert ov._cell_auto.get("raw", {}).get((0, 0)) is not None, "no per-cell window was cached"
-    cached = ov._cell_auto["raw"][(0, 0)]
-
-    ov.set_channel_window(0, 5.0, 600.0)
-    ov.recomposite(quick=False)
-    assert ov._cell_auto["raw"][(0, 0)] is cached, "a contrast change re-percentiled every cell"
-
-    # New pixels in that cell: the entry is dropped and re-derived from the pixels now there.
-    # (add_tile recomposites the cell straight away, so it repopulates rather than leaving a hole
-    # — what must not survive is the VALUE computed from the old pixels.)
-    ov.add_tile(0, 0, "A1", _tile([50, 60]))          # same cell, much dimmer
-    fresh = ov._cell_auto["raw"][(0, 0)]
-    assert fresh is not cached and fresh != cached, "stale percentiles survived new pixels"
-    assert fresh[0][1] < cached[0][1], "the re-derived window ignored the dimmer pixels"
-
-
-def test_per_region_fast_path_matches_the_per_cell_loop(qapp):
-    """When every channel is latched, all cells resolve to one window and one composite is used.
-
-    That shortcut must paint exactly what the per-cell loop painted, including leaving untiled
-    cells black — a whole-canvas composite would fill the empty wells with windowed zeros and
-    invent data that was never acquired.
-    """
-    ov = _overview(qapp)
-    ov.set_contrast_scope(V.SCOPE_PER_REGION)
-    ov.add_tile(0, 0, "A1", _tile([1000, 2000]))       # A2 deliberately left unacquired
-    ov.set_channel_window(0, 100.0, 900.0)             # latch BOTH channels -> the fast path
-    ov.set_channel_window(1, 200.0, 1800.0)
-    ov.recomposite(quick=False)
-    fast = _rgb(ov).copy()
-
-    # Same windows, but reached through the general loop: unlatch nothing, just verify the
-    # untouched half of the plate is black either way and the tiled half is not.
-    h, w, _ = fast.shape
-    assert fast[:, w // 2:].sum() == 0, "the fast path painted a well that was never acquired"
-    assert fast[:, : w // 2].any(), "the fast path left the acquired well black"
 
 
 def test_contrast_is_connected_once_not_once_per_ingest(qapp, stub_detail, squid_dataset):
@@ -1928,104 +1866,6 @@ def _cell_mean(ov, ri, ci):
     return float(_plate_rgb(ov)[ri * V._CELL:(ri + 1) * V._CELL,
                                 ci * V._CELL:(ci + 1) * V._CELL].mean())
 
-
-def test_per_region_makes_dim_and_bright_both_readable(qapp):
-    """The ticket's own oracle, on the real widget.
-
-    GLOBAL keeps the wells COMPARABLE, so the dim well stays far darker than the bright one.
-    PER_REGION gives each well its own window, so both fill their range and land at nearly the
-    same brightness — readable together, but no longer comparable. That trade IS the feature.
-    """
-    ov = _two_well_plate()
-    ov.set_contrast_scope(V.SCOPE_GLOBAL)
-    g_bright, g_dim = _cell_mean(ov, 0, 0), _cell_mean(ov, 0, 1)
-    ov.set_contrast_scope(V.SCOPE_PER_REGION)
-    p_bright, p_dim = _cell_mean(ov, 0, 0), _cell_mean(ov, 0, 1)
-
-    assert g_dim < 0.25 * g_bright, (
-        f"global must keep the wells comparable: dim {g_dim:.1f} vs bright {g_bright:.1f}")
-    assert abs(p_dim - p_bright) < 12, (
-        f"per-region must lift the dim well to the bright one: {p_dim:.1f} vs {p_bright:.1f}")
-    assert p_dim > g_dim * 3, "per-region must actually rescue the dim well"
-
-
-def test_scope_is_a_display_control_and_never_reruns(qapp, stub_detail, squid_dataset, tmp_path):
-    """Flipping the scope repaints from retained tiles; it must NOT start another operator run.
-
-    This is the decision the ticket locked. A 1536wp run is minutes, so a scope that re-ran the
-    plate would be unusable — and would also silently rewrite the plate on disk.
-    """
-    root, _ = squid_dataset
-    win = V.PlateWindow(None)
-    win.ingest(str(root))
-    win.run_operator("mip", out_parent=str(tmp_path))
-    _drain_until(qapp, lambda: len(win._overview._tiles) >= 2)
-    qapp.processEvents()
-    try:
-        ov = win._overview
-        ov.recomposite(ov._active)
-        before = _plate_rgb(ov).copy()
-        made = []
-        orig = V._OperatorWorker.__init__
-        V._OperatorWorker.__init__ = lambda self, *a, **k: (made.append(1), orig(self, *a, **k))[1]
-        try:
-            win._scope_combo.setCurrentText(V.SCOPE_PER_REGION)
-            qapp.processEvents()
-        finally:
-            V._OperatorWorker.__init__ = orig
-        assert not made, "a scope flip must not construct another operator worker"
-        assert ov.contrast_scope() == V.SCOPE_PER_REGION, "the combo never reached the widget"
-        after = _plate_rgb(ov)
-        assert after.shape == before.shape
-        assert not np.array_equal(after, before), "the flip did not change the rendered plate"
-    finally:
-        win._stop_worker(); win.close()
-
-
-def test_scope_rejects_an_unknown_value(qapp):
-    ov = _two_well_plate()
-    with pytest.raises(ValueError):
-        ov.set_contrast_scope("per-pixel-vibes")
-
-
-def test_non_global_scope_burns_a_badge_into_the_plate(qapp):
-    """Per-region destroys cross-well comparability, so the caveat must live in the PIXELS.
-
-    A screenshot of this plate is scientifically wrong if read as relative signal, and a dropdown
-    is exactly what a screenshot crops out. Global draws nothing — nothing to warn about.
-    """
-    ov = _two_well_plate()
-
-    def amber_px():
-        qapp.processEvents()
-        im = ov.grab().toImage()
-        a = np.frombuffer(im.constBits().asstring(im.byteCount()), np.uint8)
-        a = a.reshape(im.height(), im.bytesPerLine() // 4, 4)[:, :im.width(), :3]
-        # QImage from grab() is BGRA, so channel 2 is RED: amber = high R, mid G, low B
-        return int(((a[:, :, 2] > 200) & (a[:, :, 1] > 130) & (a[:, :, 0] < 90)).sum())
-
-    ov.set_contrast_scope(V.SCOPE_GLOBAL)
-    assert amber_px() == 0, "global contrast is comparable — there is nothing to warn about"
-    ov.set_contrast_scope(V.SCOPE_PER_REGION)
-    assert amber_px() > 500, "per-region must draw a visible caveat badge into the plate"
-
-
-def test_per_region_leaves_a_manually_latched_channel_alone(qapp):
-    """A user-set window (D4) outranks per-region scoping.
-
-    Silently re-scoping a channel the user latched would make the channel bar's slider lie about
-    what is on screen, which is worse than either scope being wrong.
-    """
-    ov = _two_well_plate()
-    ov.set_contrast_scope(V.SCOPE_PER_REGION)
-    ov.set_channel_window(0, 100.0, 40000.0)
-    store = ov._store_for(ov._active)
-    assert ov._cell_windows(store, 0, 0) == [(100.0, 40000.0)]
-    assert ov._cell_windows(store, 0, 1) == [(100.0, 40000.0)], (
-        "a latched channel must use the user's window in EVERY cell, not a per-cell percentile")
-
-
-# --- IMA-207 review: two live contrast bugs, both pre-existing --------------------------------
 
 def test_running_contrast_flat_channel_yields_degenerate_window():
     """A flat channel has no contrast to show, so the window must be DEGENERATE (span <= 0) and

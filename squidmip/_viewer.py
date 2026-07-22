@@ -952,9 +952,6 @@ class _RunningContrast:
 #
 # PER_FOV is deliberately absent. It slots into `_scoped_windows`' bucketing when someone wants
 # per-field windows inside a mosaic cell — no other change.
-SCOPE_GLOBAL = "global"
-SCOPE_PER_REGION = "per-region"
-SCOPES = (SCOPE_GLOBAL, SCOPE_PER_REGION)
 
 _PCT = (1.0, 99.8)   # clip the darkest 1% / brightest 0.2% so hot pixels don't crush the window
 
@@ -1490,7 +1487,6 @@ class PlateOverview(QWidget):
         #                                        on the PIXELS only — never on the contrast.
         self._mask = None                 # (C,) bool: which channels composite into the plate
         self._contrast = None             # _RunningContrast: global per-channel window + auto/manual
-        self._scope = SCOPE_GLOBAL        # contrast scope (IMA-207): a DISPLAY control. A flip
         #                                   re-composites from the store above — it never re-runs.
         self._full = QTimer(self)         # coalesces the full-res recomposite behind a gesture
         self._full.setSingleShot(True)    # (a drag repaints at DISPLAY res; full-res lands once)
@@ -1720,27 +1716,6 @@ class PlateOverview(QWidget):
         """The effective (lo, hi) per channel — the latched manual window, else the running one."""
         return self._contrast.windows() if self._contrast is not None else []
 
-    # -- contrast scope (IMA-207) --
-    def contrast_scope(self) -> str:
-        return self._scope
-
-    def set_contrast_scope(self, scope: str) -> bool:
-        """Switch how wide a net each contrast window is computed over, and REPAINT — never re-run.
-
-        Returns False when there is nothing retained to re-composite yet; the scope is still
-        recorded, so the next tile to land renders under it.
-        """
-        if scope not in SCOPES:
-            raise ValueError(f"unknown contrast scope {scope!r}; expected one of {SCOPES}")
-        if scope == self._scope:
-            return False
-        self._scope = scope
-        self.update()                 # the badge changes even with nothing to re-composite
-        if self._store.get(self._active) is None:
-            return False
-        self.recomposite(self._active)
-        return True
-
     def _invalidate_pixels(self, layer: str, rc=None):
         """The layer's STORE changed. Drop everything derived from its pixels.
 
@@ -1778,91 +1753,20 @@ class PlateOverview(QWidget):
         self._disp[layer] = (step, thumb)
         return thumb
 
-    def _cell_auto_windows(self, layer: str, store: np.ndarray, ri: int, ci: int) -> list:
-        """The AUTO (exact-percentile) window per channel for ONE cell, cached on the pixels.
-
-        ``np.percentile`` over a cell is the expensive half of SCOPE_PER_REGION — on a 1536-well
-        plate it is 1536 cells x C channels of sorting per repaint, which measured ~268 ms and is
-        why per-region contrast was unusable under a drag. It depends on the cell's PIXELS only,
-        so it survives every contrast change and is recomputed only when a tile lands there.
-        """
-        cache = self._cell_auto.setdefault(layer, {})
-        hit = cache.get((ri, ci))
-        if hit is not None:
-            return hit
-        y0, x0 = ri * _CELL, ci * _CELL
-        cell = store[:, y0:y0 + _CELL, x0:x0 + _CELL]
-        wins = [_pct_window(cell[ch]) for ch in range(cell.shape[0])]
-        cache[(ri, ci)] = wins
-        return wins
-
-    def _cell_windows(self, store: np.ndarray, ri: int, ci: int, layer: Optional[str] = None) -> list:
-        """Per-channel windows for ONE cell, computed exactly over that cell's own pixels.
-
-        A latched channel (D4) keeps the user's manual window even under per-region: the user
-        setting a window explicitly outranks any automatic scoping.
-
-        THE VIEWER'S GLOBAL WINDOW DOES NOT OUTRANK PER-REGION (``follow=False``). Choosing
-        per-region IS the instruction "give every well its own range"; letting the array viewer's
-        one global window win here made all 1536 cells identical while the plate went on drawing
-        the amber "wells NOT comparable" badge — the control did nothing and the caveat lied.
-        """
-        n_ch = store.shape[0]
-        c = self._contrast
-        if c is not None and all(c.is_manual(ch) for ch in range(n_ch)):
-            # Every channel carries a USER latch, so `resolve` will discard every auto window it
-            # is handed. Don't compute 1536 x C percentiles to throw all of them away. Note this
-            # tests is_manual, not is_followed: a followed window is exactly what per-region must
-            # ignore, so it can never license skipping the percentiles.
-            return [c.resolve(ch, (0.0, 0.0)) for ch in range(n_ch)]
-        auto = self._cell_auto_windows(layer or self._active, store, ri, ci)
-        if c is None:
-            return auto
-        return [c.resolve(ch, auto[ch], follow=False) for ch in range(len(auto))]
-
-    def _composite_per_region(self, store: np.ndarray, step: int) -> np.ndarray:
-        """Composite the plate one CELL at a time, each under its own window (SCOPE_PER_REGION).
-
-        Only cells that actually HAVE a tile are composited; an untiled cell's zero padding would
-        percentile to a degenerate window and, worse, is not data. Everything else stays black,
-        exactly as the global path leaves it.
-
-        *step* is the same sub-sampling stride the global path uses for a quick repaint. Cell
-        bounds are converted into the strided frame by ceil-division rather than by dividing the
-        cell size, so a stride that does not divide _CELL cannot drift cells apart by a pixel.
-        Cells are cut out of the SAME cached thumbnail the global path composites, and
-        ``thumb[:, ys:ye]`` is by construction ``store[:, ys*step:ye*step:step]`` — the same
-        pixels the old per-cell re-stride produced, without re-striding 1536 times.
-        """
-        thumb = self._disp_store(self._active, store, step)
-        h, w = thumb.shape[1], thumb.shape[2]
-        cells = sorted(self._tiles_by_layer.get(self._active, set()))
-        per_cell = [(rc, self._cell_windows(store, rc[0], rc[1])) for rc in cells]
-        # EVERY CHANNEL LATCHED == EVERY CELL THE SAME WINDOW == ONE COMPOSITE (IMA-261).
-        # `_RunningContrast.resolve` returns the manual window whatever the caller computed, so
-        # once the array viewer owns all C channels the per-cell percentiles are all overridden
-        # and every cell resolves to the identical window. Compositing 1536 cells separately then
-        # costs 1536 numpy dispatches to paint pixels that one call would paint identically --
-        # measured 46 ms vs 4 ms. This is not a special case in the CONTRAST rule (there is still
-        # exactly one, `resolve`); it is only a refusal to do the same arithmetic 1536 times.
-        if per_cell and all(w2 == per_cell[0][1] for _, w2 in per_cell):
-            full = composite(thumb, self._colors, per_cell[0][1], self._mask)
-            rgb = np.zeros_like(full)                     # untiled cells are NOT data: they stay
-            for (ri, ci), _ in per_cell:                  # black, exactly as the loop below does
-                ys, ye = -(-ri * _CELL // step), -(-(ri + 1) * _CELL // step)
-                xs, xe = -(-ci * _CELL // step), -(-(ci + 1) * _CELL // step)
-                ye, xe = min(ye, h), min(xe, w)
-                rgb[ys:ye, xs:xe] = full[ys:ye, xs:xe]    # rect copies; a boolean mask over the
-            return rgb                                    # whole canvas measured 10x slower
-        rgb = np.zeros((h, w, 3), np.uint8)
-        for (ri, ci), wins in per_cell:
-            ys, ye = -(-ri * _CELL // step), -(-(ri + 1) * _CELL // step)     # ceil-div bounds
-            xs, xe = -(-ci * _CELL // step), -(-(ci + 1) * _CELL // step)
-            ye, xe = min(ye, h), min(xe, w)
-            if ys >= ye or xs >= xe:
-                continue
-            rgb[ys:ye, xs:xe] = composite(thumb[:, ys:ye, xs:xe], self._colors, wins, self._mask)
-        return rgb
+    # PER-REGION CONTRAST IS GONE, AND THAT IS THE POINT.
+    #
+    # `_cell_auto_windows`, `_cell_windows` and `_composite_per_region` lived here: one contrast
+    # window per WELL, each cell stretched to its own percentiles. Julio: "the contrast should be
+    # only global, I don't understand why there's a per region contrast... I don't think that
+    # there's any scientific basis." He is right. It makes a dim well readable next to a bright
+    # one, which is a presentation trick, and it costs the one thing a plate view exists for:
+    # two wells that look identical may differ by orders of magnitude, so the plate can no longer
+    # be read as relative signal. The amber "wells NOT comparable" badge was an admission that
+    # the picture was misleading, printed on top of the misleading picture.
+    #
+    # Deleting it also removes the `follow=False` branch, which is why napari's contrast did not
+    # reach the plate: per-region DELIBERATELY ignored the owning viewer's window. There is now
+    # one window per channel, owned by napari, and the plate follows it. One owner, one value.
 
     def set_channel_visible(self, ch: int, on: bool):
         """Toggle a channel in/out of the plate composite. Recomposites from the RETAINED store —
@@ -1946,11 +1850,8 @@ class PlateOverview(QWidget):
         if store is None or self._colors is None:
             return
         step = max(1, int(round(_CELL / max(1.0, self._cd)))) if quick else 1
-        if self._scope == SCOPE_PER_REGION:
-            rgb = self._composite_per_region(store, step)
-        else:
-            rgb = composite(self._disp_store(layer, store, step), self._colors,
-                            self.channel_windows(), self._mask)
+        rgb = composite(self._disp_store(layer, store, step), self._colors,
+                        self.channel_windows(), self._mask)
         self._final_arr[layer] = rgb          # hold the buffer: the QImage below only wraps it
         h, w, _ = rgb.shape
         self.set_final(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888), layer)
@@ -2011,8 +1912,7 @@ class PlateOverview(QWidget):
         self._invalidate_pixels(layer, (ri, ci))   # these pixels are new: nothing derived survives
         for c_i in range(tile.shape[0]):
             self._contrast.add(c_i, tile[c_i])     # real FOV pixels only — see the docstring
-        wins = (self._cell_windows(store, ri, ci, layer) if self._scope == SCOPE_PER_REGION
-                else self.channel_windows())      # per-region windows THIS cell, not the plate
+        wins = self.channel_windows()     # ONE window per channel, owned by napari (see above)
         cell = composite(store[:, y0:y0 + _CELL, x0:x0 + _CELL], self._colors, wins, self._mask)
         img = QImage(cell.data, _CELL, _CELL, 3 * _CELL, QImage.Format_RGB888)
         p = QPainter(self._canvas_for(layer))
@@ -2637,23 +2537,6 @@ class PlateOverview(QWidget):
                        int(abs(mx1 - mx0)), int(abs(my1 - my0)))
         if self._loupe is not None:        # press-and-hold magnifier, over everything else
             self._paint_loupe(p)
-        # CONTRAST SCOPE BADGE (IMA-207), drawn INTO the plate. Per-region contrast stretches every
-        # well to its own range, so a dim and a bright well can look identical — a screenshot of
-        # this plate is scientifically wrong if read as relative signal. The badge travels with the
-        # pixels; a dropdown would be cropped out of that screenshot. Nothing is drawn for global:
-        # there is no caveat to give when the wells are comparable.
-        if self._scope != SCOPE_GLOBAL:
-            label = f"contrast: {self._scope}  ·  wells NOT comparable"
-            p.setFont(QFont("Helvetica Neue", 10, QFont.Bold))
-            fm = p.fontMetrics()
-            tw = fm.horizontalAdvance(label) if hasattr(fm, "horizontalAdvance") else fm.width(label)
-            bw, bh = tw + 18, 24
-            bx, by = self.width() - bw - 10, self.height() - bh - 10
-            p.setPen(Qt.NoPen)
-            p.setBrush(QColor(255, 176, 0, 235))            # amber: a caveat, not an error
-            p.drawRoundedRect(bx, by, bw, bh, 6, 6)
-            p.setPen(QPen(QColor("#1b1300")))
-            p.drawText(bx + 9, by + bh - 7, label)
         # a fine outer white frame around the whole plate view
         p.setPen(QPen(QColor("#c9d1d9"), 1))
         p.setBrush(Qt.NoBrush)
@@ -2918,10 +2801,12 @@ class _ChannelBar(QWidget):
             row.setSpacing(8)
             dot = QLabel("\u25cf")   # the channel's own LUT color, so the strip reads as a legend too
             dot.setStyleSheet("color:rgb({});".format(",".join(str(int(v * 255)) for v in colors[c_i])))
-            box = QCheckBox(str(label))
-            box.setChecked(True)
-            box.setStyleSheet(_CHECK_QSS)
-            box.toggled.connect(lambda on, i=c_i: self._overview.set_channel_visible(i, on))
+            # NO CHECKBOX. Julio: "there shouldn't be any controls for the plate view. It just
+            # reacts to toggles and contrast adjustments in napari." Visibility is owned by
+            # napari's eye icons and arrives here through `on_user_visibility`; this label only
+            # dims to show the answer.
+            box = QLabel(str(label))
+            box.setStyleSheet("color:#e6edf3;")
             win = QLabel("\u2014")
             win.setStyleSheet("color:#8b949e;")   # dimmer than a control: this REPORTS, never sets
             win.setToolTip("contrast window, owned by the array viewer on the right \u2014 set it there")
@@ -2936,6 +2821,11 @@ class _ChannelBar(QWidget):
         """Show the window the CENTRAL VIEWER resolved for *ch*. Display only — it sets nothing."""
         if 0 <= ch < len(self._rows):
             self._rows[ch][1].setText(f"{lo:g} \u2013 {hi:g}")
+
+    def set_visible_state(self, ch: int, on: bool):
+        """Show whether napari has this channel on. Display only — it toggles nothing."""
+        if 0 <= ch < len(self._rows):
+            self._rows[ch][0].setStyleSheet("color:#e6edf3;" if on else "color:#4a5364;")
 
 
 # --- operator worker: stream a projection over the plate, fill row-major -------------------
@@ -3815,27 +3705,15 @@ class PlateWindow(QMainWindow):
         self._plate_title = QLabel("well plate")   # plate name; shows the hovered well (large) on hover
         self._plate_title.setStyleSheet(           # the BAR below now carries background + border
             "color:#e6edf3;font-size:17px;font-weight:800;padding:9px 14px;border:none;")
-        # CONTRAST SCOPE selector (IMA-207), in the plate's OWN title bar because it governs the
-        # plate, not the run — flipping it re-composites the retained tiles and never re-runs.
-        self._scope_combo = QComboBox()
-        self._scope_combo.setStyleSheet(_COMBO_QSS)
-        self._scope_combo.addItems(list(SCOPES))
-        self._scope_combo.setToolTip(
-            "How wide a net each contrast window is computed over.\n"
-            "global — one window across the plate; wells stay comparable.\n"
-            "per-region — every well fills its own range, so a dim and a bright well are both\n"
-            "readable, but they are NO LONGER comparable.")
-        self._scope_combo.currentTextChanged.connect(self._on_scope_changed)
-        _scope_lbl = QLabel("contrast")
-        _scope_lbl.setStyleSheet("color:#8b98ad;font-size:12px;border:none;")
+        # NO CONTRAST CONTROL HERE. Julio: "there shouldn't be any controls for the plate
+        # view. It just reacts to toggles and contrast adjustments in napari." The scope
+        # dropdown that used to sit here is gone with per-region contrast itself.
         plate_title_bar = QWidget()
         plate_title_bar.setStyleSheet("background:#0b0e14;border-bottom:1px solid #232b3a;")
         _tb = QHBoxLayout(plate_title_bar)
         _tb.setContentsMargins(0, 0, 12, 0)
         _tb.setSpacing(8)
         _tb.addWidget(self._plate_title, 1)
-        _tb.addWidget(_scope_lbl)
-        _tb.addWidget(self._scope_combo)
         self._drop = QLabel("Drop a Squid acquisition folder here\n\n"
                             "then pick an operator in  Process wells")
         self._drop.setAlignment(Qt.AlignCenter)
@@ -5489,7 +5367,6 @@ class PlateWindow(QMainWindow):
         # build_plate RESOLVED (measured pitch beat the 2x2's mis-declared "384 well plate"), so the
         # background can only ever be drawn at the same scale the grid is laid out at.
         self._overview.set_carrier(plate)
-        self._overview.set_contrast_scope(self._scope_combo.currentText())   # IMA-207
         self._selected_regions = []                  # a new acquisition starts with nothing picked
         self._overview.hovered.connect(self._on_hover)
         self._overview.wellActivated.connect(self.activate_well)
@@ -5799,6 +5676,19 @@ class PlateWindow(QMainWindow):
             self._push_contrast_to_side_pane(channel, lo, hi)
 
         pane.mosaic.on_user_contrast(_sink)
+
+        # ...and the eye icons, for exactly the same reason. Julio: "there shouldn't be any
+        # controls for the plate view. It just reacts to toggles and contrast adjustments in
+        # napari." The plate's own checkboxes are gone; this is what replaces them.
+        def _vis_sink(channel: str, on: bool):
+            ch = index.get(channel)
+            if ch is None:
+                return
+            self._overview.set_channel_visible(ch, on)
+            if self._channel_bar is not None:
+                self._channel_bar.set_visible_state(ch, on)
+
+        pane.mosaic.on_user_visibility(_vis_sink)
         self._napari_contrast_bound = True
 
     def _centre_contrast(self) -> dict:
@@ -6060,7 +5950,6 @@ class PlateWindow(QMainWindow):
         except (PlateShapeError, PlateBuildError):
             self._plate = None
         self._overview.set_carrier(self._plate)
-        self._overview.set_contrast_scope(self._scope_combo.currentText())   # IMA-207
         self._overview.hovered.connect(self._on_hover)
         self._overview.wellActivated.connect(self.activate_well)
         self._overview.controlRequested.connect(self.set_control_well)
@@ -6553,22 +6442,6 @@ class PlateWindow(QMainWindow):
         """The current selection as (region, fov) pairs — the payload IMA-205 will consume."""
         per = (self._meta or {}).get("fovs_per_region", {})
         return [(r, f) for r in self._selected_regions for f in (per.get(r) or [0])]
-
-    def _on_scope_changed(self, scope: str):
-        """Contrast scope picked (IMA-207). A DISPLAY control: re-composite, never re-run.
-
-        Deliberately does not touch the operator, the reader or any worker. The plate re-windows
-        from the native-dtype tiles PlateOverview already retains, so the flip is instant even on a
-        1536wp — where re-running would be minutes and would make the control unusable.
-        """
-        if self._overview is None:
-            return
-        self._overview.set_contrast_scope(scope)
-        if scope == SCOPE_GLOBAL:
-            self._readout.setText("contrast: global — wells are comparable")
-        else:
-            self._readout.setText(f"contrast: {scope} — each well fills its own range, "
-                                  "wells are NOT comparable")
 
     def _on_hover(self, text: str):
         # BOTTOM-LEFT plate title bar: "<acq>  ·  <mode>" (mode = raw / the operator that processed it),

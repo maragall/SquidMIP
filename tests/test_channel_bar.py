@@ -76,12 +76,32 @@ def test_the_bar_still_REPORTS_the_window_the_owner_resolved():
     assert "3400" in bar._rows[1][1].text()
 
 
-def test_the_channel_visibility_checkbox_survives():
-    """Visibility masks a channel out of the PLATE composite — a different value from napari's
-    per-layer visibility, which hides the layer in pane 2. Two controls, two values."""
-    from PyQt5.QtWidgets import QCheckBox
+def test_the_plate_strip_carries_NO_CONTROLS_AT_ALL():
+    """Julio: "there shouldn't be any controls for the plate view. It just reacts to toggles and
+    contrast adjustments in napari."
 
-    assert len(_bar().findChildren(QCheckBox)) == 3
+    This strip used to own per-channel checkboxes, on the argument that plate visibility and
+    napari layer visibility were "two controls, two values". They are not two values -- they are
+    one question ("is this channel on screen") asked twice, and the two answers drifted. The
+    checkboxes are gone; visibility arrives from napari's eye icons through `on_user_visibility`.
+
+    MUTATION: put any QCheckBox / QSlider / QPushButton back on the strip and this goes red.
+    """
+    from PyQt5.QtWidgets import QAbstractButton, QCheckBox, QSlider
+
+    bar = _bar()
+    assert bar.findChildren(QCheckBox) == []
+    assert bar.findChildren(QSlider) == []
+    assert bar.findChildren(QAbstractButton) == [], "the plate strip grew a control again"
+
+
+def test_the_strip_reports_napari_visibility_without_being_able_to_change_it():
+    bar = _bar()
+    bar.set_visible_state(1, False)          # napari's eye icon went off
+    bar.set_visible_state(1, True)           # ...and back on; a readout, not a toggle
+    assert not hasattr(bar, "set_channel_visible"), (
+        "the strip must not expose a way to SET visibility; it is a sink"
+    )
 
 
 def test_a_window_for_a_channel_the_plate_does_not_have_is_ignored():

@@ -268,6 +268,11 @@ class MosaicLayers:
         # Depth of "this write came from US, not the user". See `programmatic()`.
         self._programmatic = 0
         self._user_contrast_cbs: list[Any] = []
+        #: Subscribers to the eye icons, so the plate can drop its own channel checkboxes.
+        self._user_visibility_cbs: list[Any] = []
+        #: channel -> last visibility REPORTED, so a peer flip that does not change the answer
+        #: ("is this channel on screen at all") is not delivered as a user gesture.
+        self._last_visible: dict[str, bool] = {}
         # Last contrast value SEEN per channel, updated on every event including our own
         # programmatic writes. Linked layers propagate a write to their peers and each peer
         # then emits its own event, so one user drag arrives here once per layer showing the
@@ -437,6 +442,7 @@ class MosaicLayers:
         # the subscription is keyed on the CHANNEL and any layer that ever shows it is wired
         # up, whenever it is created.
         self._connect_user_contrast(channel, layer)
+        self._connect_user_visibility(channel, layer)
         # Link contrast across every processing layer showing this channel, so the
         # before->after toggle preserves the window and there is only ever one value.
         if len(peers) > 1:
@@ -542,6 +548,49 @@ class MosaicLayers:
                 cb(_ch, lo, hi)
 
         layer.events.contrast_limits.connect(_fire)
+
+    def _connect_user_visibility(self, channel: str, layer: Any) -> None:
+        """Wire one layer's eye icon into *channel*'s visibility fan-out.
+
+        Exactly the same shape as the contrast tap, and for the same reason: Julio, on the plate
+        view -- "there shouldn't be any controls for the plate view. It just reacts to toggles
+        and contrast adjustments in napari." A plate that owns its own checkboxes is a second
+        control over one quantity, which is this project's most-repeated defect; a plate that
+        SUBSCRIBES cannot disagree with what is on the canvas.
+
+        Visibility is NOT linked across processing layers the way contrast is -- hiding the
+        stitched 488 must not hide the raw 488, because the before/after toggle IS a visibility
+        flip over a processing-layer group. So the channel is reported visible when ANY layer
+        showing it is visible, which is what "is this channel on screen" actually means.
+        """
+        def _fire(event=None, _ch=channel):
+            peers = self._by_channel.get(_ch) or []
+            if not peers:
+                return
+            on = any(bool(getattr(p, "visible", False)) for p in peers)
+            if self._last_visible.get(_ch) == on:
+                return                      # an echo, or a peer flip that did not change the answer
+            self._last_visible[_ch] = on
+            if self.is_programmatic:
+                return                      # OUR write: recorded, never reported as a gesture
+            for cb in list(self._user_visibility_cbs):
+                cb(_ch, on)
+
+        layer.events.visible.connect(_fire)
+
+    def on_user_visibility(self, callback) -> None:
+        """Subscribe to channel visibility the USER changed, via napari's own eye icons.
+
+        ``callback(channel, visible)``. The seam that lets the plate drop its checkboxes.
+        """
+        self._user_visibility_cbs.append(callback)
+
+    def channel_visible(self, channel: str) -> Optional[bool]:
+        """Is this channel on screen anywhere? None when the channel has no layers."""
+        peers = self._by_channel.get(channel) or []
+        if not peers:
+            return None
+        return any(bool(getattr(p, "visible", False)) for p in peers)
 
     def on_user_contrast(self, callback) -> None:
         """Subscribe to contrast changes the USER made. Programmatic writes never arrive here.
