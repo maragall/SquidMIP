@@ -1,0 +1,439 @@
+"""napari mosaic view — the processing-layer/channel hierarchy, behind a flag.
+
+WHY THIS EXISTS
+---------------
+ndviewer_light renders one plane at a time. Our mosaics are multiscale pyramids, and the
+reason to move to napari is that it renders pyramids natively. Two measurements gated this
+module (see ``docs/napari-gate.md``): napari is *faster* than ndv per warm tile
+(16.7 ms vs 26.5 ms on identical 512² tiles, identical checksum), and clipped pan over a
+16384² lazy pyramid costs 22.6 ms median / 29.8 ms p90 while RSS grows 52 MB against a
+537 MB level — i.e. issue #1942's "multiscale zarrs go slow when clipped" does NOT
+reproduce, because napari fetches the clipped region rather than materialising the level.
+
+THE EMBEDDING PATH IS PUBLIC
+----------------------------
+Earlier spikes drove napari through ``viewer.window._qt_viewer``. That is private, and
+``Window.qt_viewer`` is public but raises a FutureWarning describing itself as an
+"implementation detail" to be removed in >= 0.9.0. Neither is a foundation, and this project
+has already lost a day to a private binding that bound cleanly and did nothing
+(``_voxel_scale``, swallowed by ``except AttributeError: pass`` because vispy had frozen the
+Visual).
+
+The supported path is:
+
+    ViewerModel()            # napari.components.ViewerModel, in components.__all__
+    QtViewer(model)          # napari.qt.QtViewer, in napari.qt.__all__
+
+``QtViewer.__init__`` is annotated ``viewer: ViewerModel``, so this is the intended
+construction, not a lucky accident. Verified present and identical on napari 0.6.6 (the
+version installed here) AND 0.8.0.
+
+Building the canvas this way means there is no napari ``Window`` at all, so the menu bar,
+the dock widgets and the plugin surface are never constructed — measured: 0 menu items,
+0 dock widgets, no layer-controls container. That is a structural answer to "watch out for
+feature bloat", not chrome hidden after the fact.
+
+THE LAYER HIERARCHY
+-------------------
+Julio's model is two levels deep::
+
+    PROCESSING LAYER   (raw | stitched | deconvolved | background-subtracted | ...)
+      -> CHANNELS      (405, 488, 561, 638 ...)
+         -> CONTRAST   per channel
+
+**napari has no layer groups.** ``LayerGroup``/``GroupLayer`` appear nowhere in the package
+and ``LayerList`` is flat. The hierarchy is therefore built here, out of three public pieces:
+
+* **Group identity lives in ``layer.metadata``**, never parsed back out of ``layer.name``.
+  ian-stitcher recovers the wavelength with ``extractWavelength(layer.name)``, and that class
+  of bug has already bitten this codebase twice: petakit's OME-TIFF reader emits channel names
+  its own ``wavelength_from_channel`` regex cannot parse, and 3f1bf3f fixed Squid's
+  ``Fluorescence_488_nm_Ex`` failing a parser that wanted ``\\s*nm``. The name is a human
+  label; the metadata is the truth.
+* **A processing-layer toggle is a visibility flip over one group** — the before/after
+  stitching toggle.
+* **Per-channel contrast is shared across processing layers via ``LayerList.link_layers``**,
+  keyed on CHANNEL. This is what makes contrast survive the before->after toggle, and it means
+  there is exactly ONE contrast value per channel in the whole application. That is a
+  structural answer to "make sure there's no knowledge duplication in the GUI — I can still see
+  the duplicated sliders": a second slider for the same channel cannot disagree with the first,
+  because they are the same linked property.
+
+WHAT THIS MODULE DELIBERATELY DOES NOT DO
+-----------------------------------------
+It does not compute contrast windows. ``_viewer._pct_window`` already owns that rule,
+including the deliberate choice NOT to widen a degenerate window to ``(lo, lo + 1)`` — which
+would clip a blank channel to full white so it reads as signal. Re-deriving it here is exactly
+the duplication we are trying to delete, so callers pass ``contrast_limits`` in.
+
+It does not own channel colours either; ``_channels.CHANNEL_COLORS_MAP`` is Squid's
+authoritative palette and is resolved through ``_channels`` rather than restated.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Any, Iterable, Optional, Sequence
+
+# NOTE: napari is NOT imported at module scope. It costs ~88 ms and pulls Qt, and the pure
+# hierarchy logic below must stay importable (and testable) in a headless process with no
+# napari installed at all. Every napari touch is inside a function.
+
+VIEWER_ENV = "SQUIDMIP_VIEWER"
+_NAPARI = "napari"
+META_KEY = "squidmip"
+
+
+def napari_enabled(env: Optional[dict] = None) -> bool:
+    """True when the napari view is switched on.
+
+    Default is OFF. ndviewer_light stays the viewer until this is flipped deliberately, so a
+    failed napari path can never leave the GUI with no viewer at all — Julio is reviewing
+    functionality commit by commit and must always have something that runs.
+    """
+    src = os.environ if env is None else env
+    return str(src.get(VIEWER_ENV, "")).strip().lower() == _NAPARI
+
+
+# --------------------------------------------------------------------------------------
+# Binding assertions
+# --------------------------------------------------------------------------------------
+# Everything this module uses is public, but "public" is not "permanent" — napari renamed
+# and deprecated the Qt access path twice between 0.5 and 0.8. These assertions turn a napari
+# upgrade that moves one of them into a loud, named failure at construction time instead of a
+# viewer that silently renders nothing. They are mutation-tested (test_napari_view.py proves
+# the check bites when a symbol is renamed); an assertion nobody has watched fail is only a
+# comment.
+
+REQUIRED_NAPARI_BINDINGS: tuple[tuple[str, str], ...] = (
+    ("napari.components", "ViewerModel"),
+    ("napari.components", "LayerList"),
+    ("napari.qt", "QtViewer"),
+)
+
+# Attributes we drive on a layer / model. Same reasoning.
+REQUIRED_LAYER_ATTRS: tuple[str, ...] = ("metadata", "visible", "contrast_limits", "scale",
+                                         "translate", "name", "events")
+REQUIRED_LAYERLIST_ATTRS: tuple[str, ...] = ("link_layers", "unlink_layers")
+
+
+class NapariBindingError(RuntimeError):
+    """A napari symbol this module depends on has moved, been renamed, or been removed."""
+
+
+def verify_napari_bindings(modules: Optional[dict] = None) -> None:
+    """Fail loudly if any napari API this module drives is missing.
+
+    ``modules`` is an injection seam for the mutation test: it maps a dotted module name to an
+    object to inspect instead of importing. Production passes nothing.
+    """
+    import importlib
+
+    missing: list[str] = []
+    for dotted, attr in REQUIRED_NAPARI_BINDINGS:
+        try:
+            mod = modules[dotted] if modules and dotted in modules else importlib.import_module(dotted)
+        except Exception as exc:  # pragma: no cover - import failure is reported, not swallowed
+            missing.append(f"{dotted} (import failed: {exc!r})")
+            continue
+        if not hasattr(mod, attr):
+            missing.append(f"{dotted}.{attr}")
+        # A public name that exists but is no longer exported is a deprecation in progress.
+        exported = getattr(mod, "__all__", None)
+        if exported is not None and attr not in exported:
+            missing.append(f"{dotted}.{attr} (present but no longer in __all__)")
+
+    if missing:
+        raise NapariBindingError(
+            "napari's API has moved under us; the mosaic view cannot be trusted to render.\n"
+            "Missing or de-exported: " + ", ".join(missing) + "\n"
+            "This is a hard failure on purpose. The alternative — binding to whatever is there "
+            "and hoping — is how `_voxel_scale` ran every time and did nothing for its whole life."
+        )
+
+
+# --------------------------------------------------------------------------------------
+# The hierarchy — pure logic, no napari import
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MosaicKey:
+    """Identity of one displayed mosaic: which processing layer, which channel.
+
+    The unit displayed is always an assembled MOSAIC, never a single FOV.
+    """
+
+    op: str
+    channel: str
+
+    def label(self) -> str:
+        """Human label for the napari layers list. NOT parsed back — see module docstring."""
+        return f"{self.op} · {self.channel}"
+
+    def as_metadata(self) -> dict:
+        return {META_KEY: {"op": self.op, "channel": self.channel}}
+
+
+def key_of(layer: Any) -> Optional[MosaicKey]:
+    """Recover a layer's identity from its METADATA. Returns None for foreign layers.
+
+    Foreign layers (a user-added points layer, a plugin's output) are deliberately tolerated
+    and ignored rather than crashing the group logic.
+    """
+    meta = getattr(layer, "metadata", None) or {}
+    ours = meta.get(META_KEY)
+    if not isinstance(ours, dict):
+        return None
+    op, channel = ours.get("op"), ours.get("channel")
+    if op is None or channel is None:
+        return None
+    return MosaicKey(str(op), str(channel))
+
+
+def scale_translate_from_bbox_um(
+    bbox_um: Sequence[float], shape: Sequence[int]
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Map ``_tiling``'s world box onto napari's per-layer placement.
+
+    ``bbox_um`` is ``(x0, y0, x1, y1)`` in stage micrometres — X FIRST. napari's world axes for
+    a 2D image are ``(row, col)`` = ``(y, x)`` — Y FIRST. The axis order flips, which is exactly
+    the sort of silent transpose that produces a mosaic that looks plausible and is wrong, so it
+    is done once, here, and pinned by a test.
+
+    Both sides already speak stage micrometres, so there is no unit conversion — only the flip.
+    """
+    x0, y0, x1, y1 = (float(v) for v in bbox_um)
+    if not (x1 > x0 and y1 > y0):
+        raise ValueError(f"bbox_um must satisfy x1 > x0 and y1 > y0, got {tuple(bbox_um)!r}")
+    h, w = int(shape[0]), int(shape[1])
+    if h <= 0 or w <= 0:
+        raise ValueError(f"shape must be positive, got {tuple(shape)!r}")
+    scale = ((y1 - y0) / h, (x1 - x0) / w)
+    translate = (y0, x0)
+    return scale, translate
+
+
+class MosaicLayers:
+    """The two-level hierarchy over a napari ``ViewerModel``.
+
+    Wraps a ViewerModel rather than subclassing it: napari owns that model's lifecycle, and
+    inheriting from a pydantic-evented model to add two dicts is how you acquire a base class
+    you cannot upgrade.
+    """
+
+    def __init__(self, model: Any) -> None:
+        self._model = model
+        # channel -> the layers showing that channel, across every processing layer. Linked.
+        self._by_channel: dict[str, list[Any]] = {}
+
+    # -- introspection ------------------------------------------------------------------
+    @property
+    def model(self) -> Any:
+        return self._model
+
+    def ours(self) -> list[Any]:
+        return [ly for ly in self._model.layers if key_of(ly) is not None]
+
+    def ops(self) -> list[str]:
+        """Processing layers currently present, in insertion order, de-duplicated."""
+        seen: list[str] = []
+        for ly in self.ours():
+            k = key_of(ly)
+            assert k is not None
+            if k.op not in seen:
+                seen.append(k.op)
+        return seen
+
+    def group(self, op: str) -> list[Any]:
+        """Every channel layer belonging to one processing layer."""
+        return [ly for ly in self.ours() if (k := key_of(ly)) is not None and k.op == op]
+
+    def channels(self, op: str) -> list[str]:
+        out: list[str] = []
+        for ly in self.group(op):
+            k = key_of(ly)
+            assert k is not None
+            if k.channel not in out:
+                out.append(k.channel)
+        return out
+
+    def find(self, op: str, channel: str) -> Optional[Any]:
+        for ly in self.ours():
+            if key_of(ly) == MosaicKey(op, channel):
+                return ly
+        return None
+
+    # -- construction -------------------------------------------------------------------
+    def add_mosaic(
+        self,
+        op: str,
+        channel: str,
+        data: Any,
+        *,
+        contrast_limits: Optional[tuple[float, float]] = None,
+        colormap: Optional[Any] = None,
+        multiscale: Optional[bool] = None,
+        bbox_um: Optional[Sequence[float]] = None,
+        visible: bool = True,
+    ) -> Any:
+        """Add (or replace) the mosaic for one processing layer / channel pair.
+
+        ``contrast_limits`` is supplied by the caller on purpose — ``_viewer._pct_window`` owns
+        the percentile rule and this module must not grow a second copy of it.
+        """
+        key = MosaicKey(str(op), str(channel))
+        existing = self.find(key.op, key.channel)
+        if existing is not None:
+            self.remove_op_channel(key.op, key.channel)
+
+        kwargs: dict[str, Any] = {
+            "name": key.label(),
+            "metadata": key.as_metadata(),
+            "visible": visible,
+        }
+        if contrast_limits is not None:
+            lo, hi = float(contrast_limits[0]), float(contrast_limits[1])
+            # A degenerate window is passed through, NOT widened. _pct_window returns hi <= lo
+            # for a blank channel deliberately, because widening it to (lo, lo+1) renders a
+            # blank channel as full white, i.e. as signal.
+            if hi > lo:
+                kwargs["contrast_limits"] = (lo, hi)
+        if colormap is not None:
+            kwargs["colormap"] = colormap
+        if multiscale is not None:
+            kwargs["multiscale"] = multiscale
+
+        layer = self._model.add_image(data, **kwargs)
+
+        if bbox_um is not None:
+            shape = _first_level_shape(data, bool(multiscale))
+            scale, translate = scale_translate_from_bbox_um(bbox_um, shape)
+            layer.scale = scale
+            layer.translate = translate
+
+        self._register_channel(key.channel, layer)
+        return layer
+
+    def _register_channel(self, channel: str, layer: Any) -> None:
+        peers = self._by_channel.setdefault(channel, [])
+        peers.append(layer)
+        # Link contrast across every processing layer showing this channel, so the
+        # before->after toggle preserves the window and there is only ever one value.
+        if len(peers) > 1:
+            self._model.layers.link_layers(peers, ("contrast_limits",))
+
+    def remove_op_channel(self, op: str, channel: str) -> bool:
+        layer = self.find(op, channel)
+        if layer is None:
+            return False
+        peers = self._by_channel.get(channel, [])
+        if layer in peers:
+            # Unlink BEFORE removal: a linked layer that is destroyed while still linked leaves
+            # napari holding a callback onto a dead layer.
+            if len(peers) > 1:
+                self._model.layers.unlink_layers(peers, ("contrast_limits",))
+            peers.remove(layer)
+            if len(peers) > 1:
+                self._model.layers.link_layers(peers, ("contrast_limits",))
+        self._model.layers.remove(layer)
+        return True
+
+    def remove_op(self, op: str) -> list[str]:
+        gone = []
+        for channel in list(self.channels(op)):
+            if self.remove_op_channel(op, channel):
+                gone.append(channel)
+        return gone
+
+    # -- the before/after toggle --------------------------------------------------------
+    def show_op(self, op: str) -> list[str]:
+        """Make exactly one processing layer visible. Returns the channels now showing.
+
+        This is the stitching before->after toggle. Channel contrast is preserved across the
+        switch because contrast is linked per channel, not stored per processing layer.
+        """
+        if op not in self.ops():
+            raise KeyError(f"no processing layer named {op!r}; have {self.ops()!r}")
+        for ly in self.ours():
+            k = key_of(ly)
+            assert k is not None
+            ly.visible = k.op == op
+        return self.channels(op)
+
+    def visible_op(self) -> Optional[str]:
+        for ly in self.ours():
+            if ly.visible:
+                k = key_of(ly)
+                assert k is not None
+                return k.op
+        return None
+
+    def set_channel_visible(self, channel: str, visible: bool) -> None:
+        """Show/hide one channel across the visible processing layer only."""
+        current = self.visible_op()
+        if current is None:
+            return
+        for ly in self.group(current):
+            k = key_of(ly)
+            assert k is not None
+            if k.channel == channel:
+                ly.visible = bool(visible)
+
+    # -- contrast, one value per channel -------------------------------------------------
+    def contrast(self, channel: str) -> Optional[tuple[float, float]]:
+        peers = self._by_channel.get(channel) or []
+        if not peers:
+            return None
+        lo, hi = peers[0].contrast_limits
+        return float(lo), float(hi)
+
+    def set_contrast(self, channel: str, lo: float, hi: float) -> None:
+        peers = self._by_channel.get(channel) or []
+        if not peers:
+            raise KeyError(f"no layer for channel {channel!r}")
+        # Linked, so writing one writes them all; write the first and let napari propagate.
+        peers[0].contrast_limits = (float(lo), float(hi))
+
+    def on_contrast_changed(self, callback) -> None:
+        """Subscribe to contrast changes via napari's PUBLIC event.
+
+        This replaces the ndv contrast tap, which subclassed ``ndv.views.bases.LutView`` and
+        reached into the private ``_lut_controllers`` dict — the most ndv-entangled design in
+        the codebase and the one thing that could not have been ported.
+        """
+        for peers in self._by_channel.values():
+            if peers:
+                peers[0].events.contrast_limits.connect(callback)
+
+
+def _first_level_shape(data: Any, multiscale: bool) -> Sequence[int]:
+    """Shape of the full-resolution plane, whether or not ``data`` is a pyramid."""
+    if multiscale:
+        return data[0].shape
+    return data.shape
+
+
+# --------------------------------------------------------------------------------------
+# The embedded pane
+# --------------------------------------------------------------------------------------
+
+
+def build_pane(parent: Any = None) -> tuple[Any, MosaicLayers]:
+    """Build a napari canvas as a plain QWidget component, with no napari Window.
+
+    Returns ``(widget, MosaicLayers)``. The widget is an ordinary QWidget: parent it into our
+    three-pane layout like any other. No menu bar, no docks, no plugin surface, no
+    ``napari.run()`` and no second event loop — the host application's QApplication drives it.
+    """
+    verify_napari_bindings()
+
+    from napari.components import ViewerModel
+    from napari.qt import QtViewer
+
+    model = ViewerModel()
+    qt_viewer = QtViewer(model)
+    if parent is not None:
+        qt_viewer.setParent(parent)
+    return qt_viewer, MosaicLayers(model)
