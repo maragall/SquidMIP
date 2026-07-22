@@ -3492,8 +3492,8 @@ class _ExplorationTab(QWidget):
         return
 
 
-def _make_mosaic_pane():
-    """Build pane 2's napari mosaic viewer, or report why it could not be built.
+def _make_mosaic_pane(show_docks: bool = True):
+    """Build a napari mosaic viewer, or report why it could not be built.
 
     Returns ``(pane_or_None, mode, message)``. Import failures are caught here rather than at
     module import so that a machine without napari still opens the window with ndviewer_light —
@@ -3502,7 +3502,7 @@ def _make_mosaic_pane():
     try:
         from squidmip._napari_pane import make_pane
 
-        return make_pane()
+        return make_pane(show_docks=show_docks)
     except Exception as exc:                     # noqa: BLE001 - surfaced, not swallowed
         return None, "ndv", f"napari viewer unavailable ({type(exc).__name__}: {exc}) — using ndviewer_light."
 
@@ -3632,6 +3632,14 @@ class PlateWindow(QMainWindow):
         self._explore_tabs.setAutoFillBackground(True)
         self._explore_tabs.setStyleSheet(_TABS_DARK)
         self._explore_tabs.setTabsClosable(True)
+        # ELIDE long tab titles. A preview tab is named after its operator ("Maximum Intensity
+        # Projection - C3-C5 (3)"), and a QTabBar's size hint includes every tab's full width: the
+        # third such tab pushed the WHOLE WINDOW 260 px wider than it was asked to be, on a small
+        # monitor, which is the "controls eclipsing content" failure arriving from the one
+        # direction nobody watches. Measured on screen, not reasoned about.
+        self._explore_tabs.setElideMode(Qt.ElideRight)
+        self._explore_tabs.tabBar().setExpanding(False)
+        self._explore_tabs.tabBar().setUsesScrollButtons(True)
         self._explore_tabs.tabCloseRequested.connect(
             lambda i: self._close_op_tab(i, self._explore_tabs))
         self._explore_tabs.currentChanged.connect(self._on_tab_changed)
@@ -4608,7 +4616,7 @@ class PlateWindow(QMainWindow):
         It exists as a named method purely so tests can swap in a recording stub: napari's
         canvas needs OpenGL and the headless gate has none.
         """
-        return _make_mosaic_pane()
+        return _make_mosaic_pane(show_docks=False)
 
     def _build_exploration_tab(self, regions: list, tab_key: str) -> QWidget:
         """One side-pane tab: A VIEWER ON THIS SUBSET, a slider under it, and the Minerva hand-off.
@@ -4773,6 +4781,7 @@ class PlateWindow(QMainWindow):
             return
         tab.cursor.mark_loaded(region)
         tab.viewer.say("")
+        self._apply_centre_contrast(tab)     # the centre viewer owns contrast; this pane follows
 
     # -- the subset this pane owns, read by pane 1's scope selector -------------------------------
     def parked_subset(self) -> list:
@@ -5328,7 +5337,10 @@ class PlateWindow(QMainWindow):
         # reads a single plane per well precisely to stay fast), so say which one you're looking at.
         multi = sum(1 for r in order if len(meta["fovs_per_region"][r]) > 1)
         note = (f" · {multi} multi-FOV region(s), previewing as mosaics" if multi else "")
-        self._readout.setText(f"live · {len(self._fov_index)} wells · double-click to open{note}")
+        # NOT "live". This is a POST-ACQUISITION tool: nothing here is a feed, and calling the
+        # opened plate live is the word the owner asked to retire. What the line has to say is
+        # what is loaded and what you can do with it.
+        self._readout.setText(f"{len(self._fov_index)} wells loaded · double-click to open{note}")
 
     def _load_mosaic(self, region: Optional[str] = None, op: str = "raw"):
         """Show one region's fused MOSAIC in pane 2, one napari layer per channel.
@@ -5434,9 +5446,61 @@ class PlateWindow(QMainWindow):
             ch = index.get(channel)
             if ch is not None:
                 self._on_detail_contrast(ch, lo, hi)
+            self._push_contrast_to_side_pane(channel, lo, hi)
 
         pane.mosaic.on_user_contrast(_sink)
         self._napari_contrast_bound = True
+
+    def _centre_contrast(self) -> dict:
+        """The centre viewer's per-channel window — the ONE contrast value per channel.
+
+        Read from ``MosaicLayers``, not remembered here. A remembered copy is a second answer to
+        a question that already has an owner, and this file has shipped four bugs of exactly that
+        shape."""
+        pane = getattr(self, "_mosaic_pane", None)
+        if pane is None or not getattr(pane, "ok", False) or self._meta is None:
+            return {}
+        out = {}
+        for c in self._meta["channels"]:
+            window = pane.mosaic.contrast(c["name"])
+            if window is not None:
+                out[c["name"]] = window
+        return out
+
+    def _push_contrast_to_side_pane(self, channel: str, lo: float, hi: float):
+        """Every side-pane viewer FOLLOWS the centre viewer's contrast for that channel.
+
+        Julio: "the channel toggling and contrast adjustment for the plate view should happen
+        from our central viewer window." A side-pane tab is a second napari viewer, and a second
+        viewer that autoscales independently is a second owner of one quantity however few
+        widgets it shows. napari cannot link layers across viewers, so the link is made here —
+        one direction only, centre -> side, and written inside ``programmatic()`` so a followed
+        value can never be mistaken for the user having dragged the side pane's own slider and
+        bounce back."""
+        for w in list(self._op_tabs.values()):
+            if not isinstance(w, _ExplorationTab) or w.viewer is None:
+                continue
+            try:
+                with w.viewer.mosaic.programmatic():
+                    w.viewer.mosaic.set_contrast(channel, lo, hi)
+            except KeyError:
+                continue          # this tab is not showing that channel yet — nothing to follow
+
+    def _apply_centre_contrast(self, tab: "_ExplorationTab"):
+        """Bring a side-pane viewer up to the centre viewer's current windows.
+
+        Called after a region's layers land in a tab. Without it a tab opened after the user had
+        already tuned contrast would show its own autoscale instead — the follower would be
+        correct only for changes made from that moment on, which is the same half-life defect as
+        a subscription that dies when its layers are rebuilt."""
+        if tab.viewer is None:
+            return
+        for channel, (lo, hi) in self._centre_contrast().items():
+            try:
+                with tab.viewer.mosaic.programmatic():
+                    tab.viewer.mosaic.set_contrast(channel, lo, hi)
+            except KeyError:
+                continue
 
     def _setup_raw_detail(self, order: Optional[list] = None):
         """Point the detail viewer at the RAW acquisition: full z-stack, full frame, FOV slider.

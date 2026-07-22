@@ -22,6 +22,7 @@ aims it at its own subset, and puts real layers on it as results arrive.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 
@@ -56,6 +57,9 @@ class _StubMosaic:
         self.added = []        # (op, channel, shape, bbox_um)
         self.removed = []
         self.shown = []
+        self.windows = {}      # channel -> (lo, hi)
+        self.written = []      # (channel, lo, hi, was_programmatic)
+        self._programmatic = 0
 
     def add_mosaic(self, op, channel, data, **kw):
         self.added.append((op, channel, np.asarray(data).shape, kw.get("bbox_um")))
@@ -71,6 +75,24 @@ class _StubMosaic:
 
     def ops(self):
         return list(dict.fromkeys(op for op, _c, _s, _b in self.added))
+
+
+    def contrast(self, channel):
+        return self.windows.get(channel)
+
+    def set_contrast(self, channel, lo, hi):
+        if channel not in {c for _op, c, _s, _b in self.added}:
+            raise KeyError(channel)
+        self.windows[channel] = (float(lo), float(hi))
+        self.written.append((channel, float(lo), float(hi), self._programmatic > 0))
+
+    @contextlib.contextmanager
+    def programmatic(self):
+        self._programmatic += 1
+        try:
+            yield
+        finally:
+            self._programmatic -= 1
 
 
 class _StubPane(QWidget):
@@ -203,10 +225,14 @@ def test_the_default_viewer_constructor_is_pane_2s(qapp, monkeypatch):
     duplication the brief calls out ('two divergent viewer implementations').
     """
     calls = []
-    monkeypatch.setattr(V, "_make_mosaic_pane", lambda: (calls.append(1), (None, "ndv", "x"))[1])
+    monkeypatch.setattr(V, "_make_mosaic_pane",
+                        lambda **kw: (calls.append(kw), (None, "ndv", "x"))[1])
     w = V.PlateWindow.__new__(V.PlateWindow)          # no Qt window needed to test the delegation
     assert V.PlateWindow._make_explore_viewer(w) == (None, "ndv", "x")
-    assert calls == [1]
+    # ...and it asks for the canvas WITHOUT napari's control docks: contrast and channel
+    # visibility have one owner, the centre viewer, and a second full control surface in a 380 px
+    # column both duplicates it and eclipses the mosaic it is meant to be showing.
+    assert calls == [{"show_docks": False}]
 
 
 # --- the slider under it ------------------------------------------------------------------------
@@ -456,3 +482,59 @@ def test_closing_a_tab_frees_its_viewer(win):
     win._close_op_tab(idx, win._explore_tabs)
     assert tab.viewer is None
     assert pane.parent() is None
+
+
+# --- contrast has ONE owner, and it is the centre viewer -----------------------------------------
+
+def test_a_side_pane_viewer_follows_the_centre_viewers_contrast(win, monkeypatch):
+    """Julio: "the channel toggling and contrast adjustment for the plate view should happen from
+    our central viewer window."
+
+    A side-pane tab is a SECOND napari viewer, and napari cannot link layers across viewers. A
+    second viewer that autoscales on its own is a second owner of one quantity however few
+    widgets it shows, so the follow is made explicitly here — one direction, centre to side.
+
+    MUTATION: drop the ``_push_contrast_to_side_pane`` call from the centre sink and this goes
+    red.
+    """
+    ch = win._meta["channels"][0]["name"]
+    key = win.open_exploration_tab(["B3"])
+    tab = win._op_tabs[key]
+    tab.viewer.mosaic.add_mosaic("raw · B3", ch, np.zeros((2, 2), np.uint16))
+
+    win._push_contrast_to_side_pane(ch, 12.0, 345.0)
+
+    assert tab.viewer.mosaic.contrast(ch) == (12.0, 345.0)
+
+
+def test_a_followed_window_is_never_mistaken_for_a_user_drag(win):
+    """Written inside ``programmatic()``: a follower that looks like a gesture bounces back at
+    the owner, and the plate has already been latched MANUAL once by exactly that."""
+    ch = win._meta["channels"][0]["name"]
+    key = win.open_exploration_tab(["B3"])
+    tab = win._op_tabs[key]
+    tab.viewer.mosaic.add_mosaic("raw · B3", ch, np.zeros((2, 2), np.uint16))
+
+    win._push_contrast_to_side_pane(ch, 1.0, 2.0)
+
+    assert tab.viewer.mosaic.written == [(ch, 1.0, 2.0, True)]
+
+
+def test_a_channel_the_tab_is_not_showing_yet_is_skipped_not_crashed_on(win):
+    key = win.open_exploration_tab(["B3"])
+    win._push_contrast_to_side_pane("a channel nobody has", 1.0, 2.0)   # must not raise
+
+
+def test_a_tab_opened_later_is_brought_up_to_the_current_windows(win):
+    """A follower that only hears changes made from now on is correct for nothing the user
+    already did — the same half-life defect as a subscription that dies with its layers."""
+    ch = win._meta["channels"][0]["name"]
+    key = win.open_exploration_tab(["B3"])
+    tab = win._op_tabs[key]
+    tab.viewer.mosaic.add_mosaic("raw · B3", ch, np.zeros((2, 2), np.uint16))
+    monkey = {ch: (7.0, 77.0)}
+    win._centre_contrast = lambda: monkey
+
+    win._apply_centre_contrast(tab)
+
+    assert tab.viewer.mosaic.contrast(ch) == (7.0, 77.0)

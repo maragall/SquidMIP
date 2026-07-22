@@ -100,8 +100,9 @@ def _colormap_for(channel_name: str):
 class MosaicPane(QWidget):
     """Pane 2. Hosts the napari canvas, or a message saying why it could not be built."""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, show_docks: bool = True) -> None:
         super().__init__(parent)
+        self.show_docks = bool(show_docks)
         self.mosaic: Optional[MosaicLayers] = None
         self._viewer = None
         self._native_window = None
@@ -208,6 +209,34 @@ class MosaicPane(QWidget):
             central.setMinimumSize(360, 360)
             central.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         qt_window.setMinimumHeight(560)
+        if not self.show_docks:
+            # THE SIDE PANE gets the canvas and none of napari's control docks.
+            #
+            # Two reasons, and the first is the one that matters. Contrast and channel
+            # VISIBILITY have exactly one owner, and it is the CENTRE viewer — Julio: "the
+            # channel toggling and contrast adjustment for the plate view should happen from our
+            # central viewer window". A second full layer-controls surface in a second viewer is
+            # the same duplication as a second contrast slider, just wearing napari's own
+            # clothes: two widgets that can move one quantity and disagree.
+            #
+            # The second is size. In a 380 px column the docks take essentially all of it and the
+            # canvas collapses to a strip — measured on screen, not reasoned about: the mosaic
+            # was ~40 px wide beside a full-height layer list. "Controls eclipsing content" is a
+            # complaint this project has already had twice.
+            #
+            # The layers still EXIST and are still linked; only their control widgets are hidden.
+            from PyQt5.QtWidgets import QDockWidget, QStatusBar
+
+            for dock in qt_window.findChildren(QDockWidget):
+                dock.hide()
+            # napari's status bar too ("Ready ... activity"). It reports on the viewer it belongs
+            # to, and in a side-pane tab it is a second status line sitting under a mosaic, six
+            # pixels from the window's real one. Two status lines is two places to look.
+            for bar in qt_window.findChildren(QStatusBar):
+                bar.hide()
+            if central is not None:
+                central.setMinimumSize(180, 180)   # a narrow column is still a usable canvas
+            qt_window.setMinimumHeight(220)
         lay.addWidget(qt_window, 1)
         self._native_window = qt_window
 
@@ -272,7 +301,7 @@ def gl_available(env: Optional[dict] = None) -> tuple[bool, str]:
     return True, ""
 
 
-def make_pane(readout: Optional[Callable[[str], None]] = None):
+def make_pane(readout: Optional[Callable[[str], None]] = None, *, show_docks: bool = True):
     """Build pane 2 honouring ``SQUIDMIP_VIEWER``.
 
     Returns ``(widget_or_None, mode, message)``:
@@ -291,7 +320,7 @@ def make_pane(readout: Optional[Callable[[str], None]] = None):
     if not ok:
         return None, "ndv", f"napari needs OpenGL ({why}) — using ndviewer_light."
 
-    pane = MosaicPane()
+    pane = MosaicPane(show_docks=show_docks)
     if pane.ok:
         return pane, "napari", ""
 

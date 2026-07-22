@@ -490,6 +490,28 @@ def test_our_own_contrast_writes_do_not_look_like_the_user_moving_a_slider(layer
     assert seen == [], f"programmatic contrast write leaked to the sink: {seen}"
 
 
+def test_a_write_we_make_ourselves_after_arming_still_does_not_reach_the_sink(layers):
+    """The guard above only covers a write made while the layer is being CONSTRUCTED, so it
+    passes whether or not ``is_programmatic`` is checked — the tap is armed after the limits are
+    set, and no event ever fires. This one writes through the tap, which is where the guard has
+    to hold: the plate treating our own autoscale as a user gesture is what latched every
+    channel MANUAL on open and killed per-region contrast from the first frame.
+
+    MUTATION: drop the ``is_programmatic`` check in the tap and this goes red.
+    """
+    layers.add_mosaic("raw", "488", _img())
+    seen = []
+    layers.on_user_contrast(lambda ch, lo, hi: seen.append((ch, lo, hi)))
+
+    with layers.programmatic():
+        layers.set_contrast("488", 11.0, 222.0)
+
+    assert seen == [], f"our own write leaked to the sink: {seen}"
+    # ...and the sink is not left deaf afterwards.
+    layers.find("raw", "488").contrast_limits = (13.0, 444.0)
+    assert seen == [("488", 13.0, 444.0)]
+
+
 def test_a_user_drag_does_reach_the_sink(layers):
     layers.add_mosaic("raw", "488", _img())
     seen = []
@@ -498,6 +520,51 @@ def test_a_user_drag_does_reach_the_sink(layers):
     layers.find("raw", "488").contrast_limits = (33.0, 777.0)   # the user moving napari's slider
 
     assert seen == [("488", 33.0, 777.0)]
+
+
+def test_the_sink_survives_the_layers_being_rebuilt(layers):
+    """THE HALF-LIFE BUG: ``on_user_contrast`` connected to the layer objects that existed at
+    SUBSCRIBE time, and ``_load_mosaic`` removes and re-adds every layer on each region change.
+    So the plate followed napari's contrast until the user opened a second region, and then
+    stopped — silently, with the slider still moving and nothing downstream listening.
+
+    A subscription that dies the first time the thing it watches is rebuilt is worse than none:
+    it works in the demo and is gone by the second click.
+
+    MUTATION: connect only inside ``on_user_contrast`` (the old shape) and this goes red.
+    """
+    layers.add_mosaic("raw", "488", _img())
+    seen = []
+    layers.on_user_contrast(lambda ch, lo, hi: seen.append((ch, lo, hi)))
+
+    layers.remove_op("raw")                       # exactly what a region change does
+    layers.add_mosaic("raw", "488", _img())       # ...and then rebuilds
+
+    layers.find("raw", "488").contrast_limits = (12.0, 345.0)
+    assert seen == [("488", 12.0, 345.0)], f"the sink went deaf after a rebuild: {seen}"
+
+
+def test_a_channel_added_after_subscribing_is_also_heard(layers):
+    """A subscriber must not have to know the channel order the mosaic worker happens to use."""
+    ly = layers
+    seen = []
+    ly.on_user_contrast(lambda ch, lo, hi: seen.append(ch))
+    ly.add_mosaic("raw", "561", _img())
+    ly.find("raw", "561").contrast_limits = (1.0, 2.0)
+    assert seen == ["561"]
+
+
+def test_one_user_drag_is_reported_once_however_many_layers_share_the_channel(layers):
+    """Contrast is LINKED per channel, so one drag moves every peer and each peer fires. The
+    sink must still hear it once — a plate that recomposites per peer does N times the work for
+    one gesture."""
+    layers.add_mosaic("raw", "488", _img())
+    layers.add_mosaic("stitched", "488", _img())
+    seen = []
+    layers.on_user_contrast(lambda ch, lo, hi: seen.append((ch, lo, hi)))
+
+    layers.find("raw", "488").contrast_limits = (5.0, 55.0)
+    assert seen == [("488", 5.0, 55.0)]
 
 
 def test_programmatic_is_reentrant_and_restores_state(layers):

@@ -269,6 +269,9 @@ class MosaicLayers:
         # Depth of "this write came from US, not the user". See `programmatic()`.
         self._programmatic = 0
         self._user_contrast_cbs: list[Any] = []
+        # channel -> the last window REPORTED to subscribers. Linked peers all fire on one drag;
+        # this is what turns that fan-in back into one report per real change.
+        self._last_user_contrast: dict[str, tuple[float, float]] = {}
 
     # -- who moved the contrast: us, or the user? ---------------------------------------
     @contextmanager
@@ -426,6 +429,13 @@ class MosaicLayers:
         # before->after toggle preserves the window and there is only ever one value.
         if len(peers) > 1:
             self._model.layers.link_layers(peers, ("contrast_limits",))
+        # ...and arm the user-contrast tap on THIS layer, now, rather than only on the layers
+        # that happened to exist when someone subscribed. Every layer here is destroyed and
+        # rebuilt on a region change, so a subscription made once at startup was connected to
+        # objects that no longer exist by the second region — the plate followed napari's
+        # contrast exactly until the user looked at a second well, and then stopped, silently.
+        # Arming at REGISTRATION is what makes the subscription outlive the layers.
+        self._arm_contrast_tap(channel, layer)
 
     def remove_op_channel(self, op: str, channel: str) -> bool:
         layer = self.find(op, channel)
@@ -499,25 +509,38 @@ class MosaicLayers:
         # Linked, so writing one writes them all; write the first and let napari propagate.
         peers[0].contrast_limits = (float(lo), float(hi))
 
+    def _arm_contrast_tap(self, channel: str, layer: Any) -> None:
+        """Connect one layer's contrast event to the user-contrast fan-out.
+
+        Every layer of a channel is armed, not just the first, because "the first" is a moving
+        target: layers are removed and re-added on every region change, and linked peers all
+        fire on one drag. ``_last_user_contrast`` collapses that fan-in back to ONE report per
+        actual change — a plate that recomposites once per peer does N times the work for one
+        gesture, and a subscriber has no way to tell the duplicates apart.
+        """
+        def _fire(event=None, _ch=channel, _layer=layer):
+            if self.is_programmatic:
+                return
+            lo, hi = (float(v) for v in _layer.contrast_limits)
+            if self._last_user_contrast.get(_ch) == (lo, hi):
+                return                       # a linked peer echoing the same change
+            self._last_user_contrast[_ch] = (lo, hi)
+            for cb in list(self._user_contrast_cbs):
+                cb(_ch, lo, hi)
+
+        layer.events.contrast_limits.connect(_fire)
+
     def on_user_contrast(self, callback) -> None:
         """Subscribe to contrast changes the USER made. Programmatic writes never arrive here.
 
         ``callback(channel, lo, hi)``. This is the seam that lets the plate be a pure sink: it
         is told what the owner resolved, and it never writes back.
+
+        The connection itself is made in ``_register_channel``, per layer, so a subscriber keeps
+        hearing changes after the layers it originally watched have been rebuilt. Subscribing
+        here only adds the callback to the fan-out; it never has to be re-subscribed.
         """
         self._user_contrast_cbs.append(callback)
-        for channel, peers in self._by_channel.items():
-            if not peers:
-                continue
-
-            def _fire(event=None, _ch=channel, _peers=peers):
-                if self.is_programmatic:
-                    return
-                lo, hi = _peers[0].contrast_limits
-                for cb in self._user_contrast_cbs:
-                    cb(_ch, float(lo), float(hi))
-
-            peers[0].events.contrast_limits.connect(_fire)
 
     def on_contrast_changed(self, callback) -> None:
         """Subscribe to contrast changes via napari's PUBLIC event.
