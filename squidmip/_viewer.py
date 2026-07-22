@@ -3192,6 +3192,13 @@ class PlateWindow(QMainWindow):
         self._run_label = ""          # the in-flight run's operator label, and where it is going —
         self._run_dest = ""           # one source for the status line AND the side-pane tab
         self._pending_resync = False  # a tab switch was deferred because a run was live (IMA-205 bugs)
+        self._runs_settled = 0        # monotonic: bumped once a run's TERMINAL cascade has run — the
+        #                               tiles, the streamEnded recomposite AND _on_run_drained. It is
+        #                               the honest "done" signal a test must wait on: QThread.finished
+        #                               (hence _busy()==False) fires BEFORE Qt dispatches the queued
+        #                               tileReady/streamEnded/finished slots to the main thread, so a
+        #                               test that waited on `not _busy()` was reading state its own
+        #                               event loop had not yet applied (IMA-258 flakes).
         self._loupe_sources = {}      # layer key -> _LoupeSource backing that layer's pixels (IMA-208)
 
         # THREE HORIZONTAL PANES on one monitor (IMA-237). Tabs live inside a pane (their bar sits at
@@ -4107,6 +4114,10 @@ class PlateWindow(QMainWindow):
         if _explore.operator_busy(self._worker, self._retired):
             return                       # another operator run is still draining — wait for it
         self._run_tab_key = self._run_view_tab_key = None
+        # A genuine drain: every worker has exited AND (finished being FIFO-queued after this
+        # worker's tileReady/streamEnded) their terminal slots have already run on this thread.
+        # Bump BEFORE the pending-resync branch so a run with no deferred switch still counts.
+        self._runs_settled += 1
         if not self._pending_resync:
             return
         self._pending_resync = False

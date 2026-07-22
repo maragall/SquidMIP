@@ -1375,11 +1375,17 @@ def test_two_tabs_same_operator_get_separate_layers(qapp, stub_detail, squid_dat
     win = V.PlateWindow(None)
     win.ingest(str(root))
     k1 = win.open_exploration_tab(["B2"])
+    # Wait on the run's TERMINAL cascade (tiles + streamEnded recomposite), not on QThread liveness:
+    # _busy() flips False when run() returns, which is BEFORE Qt dispatches the queued tileReady/
+    # streamEnded slots that fill _op_canvas — so `not _busy()` raced the very state we assert on.
+    # _runs_settled is bumped only after that cascade has run (IMA-258).
+    n = win._runs_settled
     win.run_operator("mip", regions=["B2"], save=False, tab_key=k1)
-    assert _drain_until(qapp, lambda: not win._busy())
+    assert _drain_until(qapp, lambda: win._runs_settled > n)
     k2 = win.open_exploration_tab(["B3"])
+    n = win._runs_settled
     win.run_operator("mip", regions=["B3"], save=False, tab_key=k2)
-    assert _drain_until(qapp, lambda: not win._busy())
+    assert _drain_until(qapp, lambda: win._runs_settled > n)
     keys = {ly.key for ly in win._op_stack.layers()}
     assert f"mip@{k1}" in keys and f"mip@{k2}" in keys          # distinct layers, no collision
     assert f"mip@{k1}" in win._overview._op_canvas
@@ -2161,8 +2167,11 @@ def test_deferred_resync_survives_a_failed_run(qapp, stub_detail, squid_dataset,
     assert win._detail._fov_labels == ["B2:0"]                 # still tab A's live run
     blocking_worker[-1].failed.emit("boom")
     blocking_worker[-1].release()
-    assert _drain_until(qapp, lambda: not win._busy())
-    qapp.processEvents()
+    # Wait on the actual post-condition — the deferred switch being DELIVERED — not on QThread
+    # liveness. _pending_resync is cleared only inside the terminal cascade (_on_run_drained),
+    # in the same synchronous slot that rewrites _fov_labels/_active_exploration, so it cannot go
+    # False before the state below exists. `not _busy()` went True one queued-signal too early.
+    assert _drain_until(qapp, lambda: not win._pending_resync)
     assert win._detail._fov_labels == ["B3:0"]                 # handed to the front tab anyway
     assert win._active_exploration is win._op_tabs[key_b]
     assert not win._pending_resync

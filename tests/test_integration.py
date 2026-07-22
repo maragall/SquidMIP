@@ -206,51 +206,69 @@ def test_ima188_sim1536_parallel_pixel_identical(sim_1536wp):
 @pytest.mark.filterwarnings("ignore:Recorded Nz")
 @pytest.mark.integration
 def test_ima188_sim1536_scaling_measured_no_regression(sim_1536wp, capsys):
-    # THROUGHPUT on the WARM sim is memory-bandwidth-bound (183 §10: the np.maximum compute is
-    # bandwidth-bound, and cache-served reads are memcpy), so the *magnitude* of the speedup is
-    # not a stable gate: parallelism overlaps wells, it does not make any single well cheaper, so
-    # per-well cost on warm cache is ~equal to the §10 baseline (measured: 465ms vs 463ms — dead
-    # even). The real multiplier appears on COLD / real storage (I/O-bound), which the
-    # cache-served symlink sim cannot exercise (the epic's open Decision C — needs Nick's storage).
+    # WHAT THIS GATES: the engine must actually run wells CONCURRENTLY — no accidental
+    # serialization, no global lock that funnels the pool to one-at-a-time.
     #
-    # We therefore MEASURE and print the scaling curve for the record, and hard-assert only what
-    # is robust here: threading must not make the plate materially SLOWER than single-thread (a
-    # real regression like accidental serialization / lock contention). Pixel-identity and bounded
-    # memory — the guarantees that ARE unconditional — are gated by the other two cross tests.
-    # BEST-OF-N, not a single sample. A single wall-clock pair measures the MACHINE as much as
-    # the code: on a box running several agents at once this test failed intermittently on an
-    # UNTOUCHED tree (load average ~14 flipped it; in isolation it reports a healthy 1.8x). A
-    # gate that goes red because something else was busy teaches everyone to re-run it, which
-    # is how a real regression eventually gets waved through as "the flaky one".
+    # It used to gate that with a WALL-CLOCK RATIO (t_8 <= t_1 * 1.2, best-of-3). That measured
+    # the HOST, not the code: throughput on the warm symlink sim is memory-bandwidth-bound
+    # (§10 — np.maximum is bandwidth-bound and cache-served reads are memcpy), so there is no
+    # real speedup to observe here, and the "no regression" margin was pure scheduler noise. On
+    # a box running several agents it flipped red on an UNTOUCHED tree (load average ~14), and
+    # best-of-N does not fix it: contention between a 1-thread and an 8-thread run is asymmetric,
+    # so the 8-worker minimum can be scheduled worse than the 1-worker minimum with nothing
+    # regressed. A timing gate that goes red because the box was busy teaches everyone to re-run
+    # it, which is how a real regression eventually gets waved through as "the flaky one".
     #
-    # `min` over repeats is the standard way to read a timing under interference: contention
-    # can only ever make a sample SLOWER, so the minimum is the least-interrupted observation
-    # of the code itself. This does not weaken the gate - a genuine serialization regression
-    # makes EVERY sample slower, including the minimum - it only removes the machine's noise.
-    _REPEATS = 3
+    # The property we care about is ALGORITHMIC (did the pool parallelize?), so measure THAT
+    # directly: wrap project_well to record the peak number of wells inside it at once. A
+    # serialization regression drops the peak to 1 regardless of machine load; contention can
+    # only ever slow threads, never reduce how many are simultaneously running. Load-independent
+    # by construction — verified stable at load average 79. Pixel-identity and bounded memory,
+    # the unconditional guarantees, stay gated by the other two cross tests.
+    import threading
+    from unittest import mock
 
-    def _best(workers):
-        best, produced = float("inf"), None
-        for _ in range(_REPEATS):
-            t0 = time.perf_counter()
-            produced = _first_n_projected(reader, _SUBSET, workers=workers)
-            best = min(best, time.perf_counter() - t0)
-        return best, produced
+    from squidmip import _engine
 
     reader = open_reader(sim_1536wp)
     regions = reader.metadata["regions"]
     project_well(reader, regions[50], 0)                       # warm cache / steady state
-    base = benchmark_single_well(reader, regions[0], 0)        # §10 single-thread per-well
 
-    t_1, got1 = _best(1)
-    t_8, got8 = _best(8)
+    def _peak_concurrency(workers):
+        real = _engine.project_well
+        lock = threading.Lock()
+        state = {"cur": 0, "peak": 0}
+
+        def counting(*args, **kwargs):
+            with lock:
+                state["cur"] += 1
+                state["peak"] = max(state["peak"], state["cur"])
+            try:
+                # Hold each well briefly so overlap is observed even when a warm well would
+                # otherwise finish before the next thread is scheduled. 5 ms >> scheduling
+                # jitter, so the measurement is deterministic rather than timing-dependent — and
+                # it changes no pixel, since the real projection still runs underneath.
+                time.sleep(0.005)
+                return real(*args, **kwargs)
+            finally:
+                with lock:
+                    state["cur"] -= 1
+
+        # project_plate looks up project_well in the _engine namespace, so patching it there is
+        # seen by the pool. No registry mutation, so re-running the test (the gate's isolation
+        # re-run) cannot collide on a projector name.
+        with mock.patch.object(_engine, "project_well", counting):
+            produced = _first_n_projected(reader, _SUBSET, workers=workers)
+        return state["peak"], produced
+
+    peak_1, got1 = _peak_concurrency(1)
+    peak_8, got8 = _peak_concurrency(8)
 
     with capsys.disabled():
         print(
-            f"\n[IMA-188] {_SUBSET} wells warm: workers=1 {t_1:.1f}s -> workers=8 {t_8:.1f}s "
-            f"({t_1 / t_8:.2f}x) | per-well @8 {t_8 / len(got8) * 1000:.0f}ms vs §10 "
-            f"single-thread {base['full_ms']:.0f}ms. Warm cache is bandwidth-bound — the real "
-            f"speedup needs cold/real storage (Decision C)."
+            f"\n[IMA-188] {_SUBSET} wells: peak concurrent project_well workers=1 -> {peak_1}, "
+            f"workers=8 -> {peak_8}. Gate is on concurrency, not wall clock (warm cache is "
+            f"bandwidth-bound; the real speedup needs cold/real storage, Decision C)."
         )
     # NOT `set(got8) == set(got1)`. Both sides are the first _SUBSET wells to FINISH, and with 8
     # workers that set is completion-ordered — on a loaded machine well A26 lands before A24 and
@@ -261,8 +279,11 @@ def test_ima188_sim1536_scaling_measured_no_regression(sim_1536wp, capsys):
     plate = {(r, f) for r in regions for f in reader.metadata["fovs_per_region"][r]}
     assert len(got8) == len(got1) == _SUBSET, "the engine yielded fewer wells than asked"
     assert set(got8) <= plate and set(got1) <= plate, "the engine yielded a well not on the plate"
-    # Non-regression gate (robust): parallel must not be materially slower than single-thread.
-    assert t_8 <= t_1 * 1.2, f"parallel materially slower than single-thread ({t_8:.1f}s vs {t_1:.1f}s)"
+    # The non-regression gate, load-independent: a single worker runs exactly one well at a time,
+    # and an 8-worker pool genuinely overlaps wells. Serialization (a global lock, or submitting
+    # one-at-a-time instead of priming the window) collapses peak_8 to 1 and trips this.
+    assert peak_1 == 1, f"single-thread engine ran {peak_1} wells at once — expected 1"
+    assert peak_8 >= 2, f"8-worker engine peaked at {peak_8} concurrent wells — pool serialized"
 
 
 @pytest.mark.filterwarnings("ignore:Recorded Nz")
