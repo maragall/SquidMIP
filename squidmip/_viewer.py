@@ -2891,6 +2891,9 @@ class _PreviewWorker(QThread):
     IS_PREVIEW = True
 
     streamEnded = pyqtSignal()                      # preview complete -> recomposite the whole plate
+    failed = pyqtSignal(str)                         # a preview that could not finish NAMES why —
+    #                                                 a bare `except: pass` left the plate frozen
+    #                                                 half-grey, indistinguishable from "loading".
 
     def __init__(self, reader, meta, fov_index: dict, order: list, mosaic: bool = True):
         super().__init__()
@@ -2962,8 +2965,14 @@ class _PreviewWorker(QThread):
                                         np.stack(tiles).astype(self._dtype), box)
             if not self._stop.is_set():
                 self.streamEnded.emit()   # the running window is mature now -> one clean recomposite
-        except Exception:
-            pass   # preview is best-effort; the operator run is the authoritative result
+        except Exception as exc:
+            # Preview is best-effort, but best-effort is not SILENT. Finalise the tiles that did
+            # land (so a partial mosaic still paints) and then name the failure — the old bare
+            # `except: pass` stranded the plate half-grey forever, and streamEnded never fired so
+            # the status line kept claiming the load was still in progress.
+            if not self._stop.is_set():
+                self.streamEnded.emit()
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
 class _ComputedPlateWorker(QThread):
@@ -3075,6 +3084,12 @@ class _ExplorationTab(QWidget):
         pane = self.viewer
         self.viewer = None
         if pane is not None:
+            # Close the napari Viewer FIRST. deleteLater() on the Qt wrapper does not close it —
+            # napari holds every Viewer in its own instance registry — so without this the GL
+            # context and its ~tens of MB leaked once per Shift-drag (the very leak this docstring
+            # names). MosaicPane.shutdown() is idempotent and no-ops when no viewer was built.
+            if hasattr(pane, "shutdown"):
+                pane.shutdown()
             pane.setParent(None)
             pane.deleteLater()
 
@@ -5127,6 +5142,7 @@ class PlateWindow(QMainWindow):
         self._preview_order = list(order)
         self._preview.tileReady.connect(self._on_preview_tile)
         self._preview.streamEnded.connect(lambda: self._recomposite("raw"))
+        self._preview.failed.connect(self._on_preview_failed)
         self._preview.start()   # (the detail already landed on order[0] via _setup_raw_detail)
         # top-left = STATUS (what's happening / what's shown); the plate name is the pane title.
         # "live" is retired from user-facing copy: this is POST-ACQUISITION review, and calling
@@ -5532,6 +5548,7 @@ class PlateWindow(QMainWindow):
             self._preview_order = list(order)
             self._preview.tileReady.connect(self._on_preview_tile)
             self._preview.streamEnded.connect(lambda: self._recomposite("raw"))
+            self._preview.failed.connect(self._on_preview_failed)
             self._preview.start()
         self._pushed = set()
         # The raw slider is 1:1 with `order`, so pushes must map into THAT, not the plate index.
@@ -5591,6 +5608,7 @@ class PlateWindow(QMainWindow):
         self._preview_order = list(self._order)
         self._preview.tileReady.connect(self._on_preview_tile)
         self._preview.streamEnded.connect(lambda: self._recomposite("raw"))
+        self._preview.failed.connect(self._on_preview_failed)
         self._preview.start()
         self._readout.setText("raw view")
 
@@ -5624,6 +5642,8 @@ class PlateWindow(QMainWindow):
             wells_meta = sorted(plate["wells"], key=lambda w: (w["rowIndex"], w["columnIndex"]))
             w0 = wells_meta[0]["path"]
 
+            fov_fallbacks: list = []          # wells whose own image id could not be read (per-well)
+
             def _fov_path(well_path, default=None):
                 """Each well declares its OWN first image; do not assume well 0's id fits all.
 
@@ -5631,11 +5651,14 @@ class PlateWindow(QMainWindow):
                 plate whose wells carry differing image ids. No dataset produces that today, so
                 it stayed latent — but the loupe reads through this same mapping, and a loupe
                 that magnifies a different well than the one under the cursor is precisely the
-                failure the FOV seam exists to prevent."""
+                failure the FOV seam exists to prevent. So the per-well fallback is RECORDED (see
+                fov_fallbacks) and named to the user, never silently substituted."""
                 try:
                     meta_w = json.loads((zroot / well_path / "zarr.json").read_text())
                     return meta_w["attributes"]["ome"]["well"]["images"][0]["path"]
-                except Exception:
+                except Exception as exc:
+                    if default is not None:      # a per-well lookup (not well 0's own bootstrap read)
+                        fov_fallbacks.append((well_path, f"{type(exc).__name__}: {exc}"))
                     return default
 
             fov0 = _fov_path(w0)
@@ -5726,6 +5749,17 @@ class PlateWindow(QMainWindow):
         self._push_shape = (_PUSH_PX, _PUSH_PX)
         self._push_problem = None
         self._dropped_pushes = 0
+        # One or more wells could not declare their own image id, so they fell back to well 0's. On
+        # a uniform plate that is harmless; on a heterogeneous one the loupe would magnify the wrong
+        # field. We cannot tell which from here, so NAME it rather than hide it. It rides the success
+        # line below because the plain setText calls in this method would drop a sticky suffix.
+        fov_warn = ""
+        if fov_fallbacks:
+            shown = ", ".join(wp for wp, _ in fov_fallbacks[:3])
+            more = f" (+{len(fov_fallbacks) - 3} more)" if len(fov_fallbacks) > 3 else ""
+            fov_warn = (f"  ·  {len(fov_fallbacks)} well(s) could not read their own image id and "
+                        f"fell back to well 0's [{shown}{more}] — the loupe may magnify the wrong "
+                        f"field for them")
         # Every well came from disk, so the loupe is available across the whole plate here.
         try:
             import tensorstore as _ts
@@ -5747,7 +5781,8 @@ class PlateWindow(QMainWindow):
             lambda i, n: self._readout.setText(f"loading computed plate — {i}/{n} wells"))
         self._worker.failed.connect(self._on_failed)
         self._worker.finished_ok.connect(
-            lambda: self._readout.setText(f"✓ computed MIP · {len(self._order)} wells (read-only)"))
+            lambda: self._readout.setText(
+                f"✓ computed MIP · {len(self._order)} wells (read-only){fov_warn}"))
         self._readout.setText(f"loading computed plate · {len(self._order)} wells …")
         self._worker.start()
 
@@ -6045,6 +6080,11 @@ class PlateWindow(QMainWindow):
         is the single-tile path, where the field fills the cell."""
         if self._overview is not None:                       # raw preview fills the base ("raw") layer
             self._overview.add_tile(ri, ci, well_id, tile, layer="raw", box=box)
+
+    def _on_preview_failed(self, message: str):
+        """The raw preview aborted before it finished. Name it in the status line instead of
+        leaving a half-grey plate that looks identical to one still loading."""
+        self._readout.setText(f"the raw preview could not finish: {message}")
 
     def _on_tile(self, ri, ci, well_id, tile, box=None):
         """A field landed. ``box`` is None for the single-tile producers (_ComputedPlateWorker emits

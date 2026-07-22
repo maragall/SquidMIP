@@ -1358,6 +1358,26 @@ def test_preview_spinner_still_runs_first_n_wells(qapp, stub_detail, squid_datas
     win._stop_worker(); win.close()
 
 
+def test_a_preview_that_cannot_read_names_the_failure_instead_of_freezing_the_plate(qapp):
+    """The raw preview used to `except Exception: pass` over its whole run, so a bad read left the
+    plate half-grey forever — indistinguishable from 'still loading' — and streamEnded never fired.
+    It must now finalise what landed AND name the failure."""
+    class _BoomReader:
+        def read(self, *a, **k):
+            raise OSError("disk gone")
+
+    meta = {"channels": [{"name": "c0"}], "dtype": "uint16", "z_levels": [0, 1, 2],
+            "fovs_per_region": {"A1": [0]}, "frame_shape": (4, 4),
+            "fov_positions_um": {}, "pixel_size_um": 1.0}
+    w = V._PreviewWorker(_BoomReader(), meta, {"A1": {"rc": (0, 0)}}, ["A1"])
+    failures, ended = [], []
+    w.failed.connect(failures.append)
+    w.streamEnded.connect(lambda: ended.append(True))
+    w.run()                                    # in-thread: signal delivery is synchronous here
+    assert failures and "disk gone" in failures[0]   # the failure is NAMED, not swallowed
+    assert ended                                     # the plate still recomposites what it has
+
+
 def test_operator_tab_opened_twice_is_one_tab(qapp, stub_detail, squid_dataset):
     """REGRESSION: exploration tabs are multi-instance, operator tabs must stay singletons."""
     root, _ = squid_dataset
@@ -1580,6 +1600,56 @@ def test_completed_save_run_is_not_marked_incomplete(qapp, stub_detail, squid_da
     win._close_op_tab(idx, win._explore_tabs)           # close AFTER it finished
     assert not (out / "INCOMPLETE").exists(), "a completed plate must not be flagged incomplete"
     win.close()
+
+
+def test_open_computed_names_a_well_that_cannot_read_its_own_image_id(
+        qapp, stub_detail, squid_dataset, tmp_path, monkeypatch):
+    """A well whose own group metadata is unreadable falls back to well 0's image id. On this
+    uniform plate that still reads correct pixels, but on a heterogeneous plate the loupe would
+    magnify the WRONG field — so the substitution must be NAMED, never silent."""
+    import json
+
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    key = win.open_exploration_tab(["B2", "B3"])
+    win.run_operator("mip", out_parent=str(tmp_path), regions=["B2", "B3"], save=True, tab_key=key)
+    assert _drain_until(qapp, lambda: not win._busy(), timeout=90)
+    out = tmp_path / f"{win._acq_name}.hcs"
+    idx = win._explore_tabs.indexOf(win._op_tabs[key])
+    win._close_op_tab(idx, win._explore_tabs)
+
+    # Corrupt the group metadata of a NON-zero well, so its own image-id lookup fails.
+    zroot = out / "plate.ome.zarr"
+    plate = json.loads((zroot / "zarr.json").read_text())["attributes"]["ome"]["plate"]
+    wells = sorted(plate["wells"], key=lambda w: (w["rowIndex"], w["columnIndex"]))
+    assert len(wells) >= 2, "need a non-zero well to corrupt"
+    (zroot / wells[-1]["path"] / "zarr.json").write_text("{ not valid json")
+
+    monkeypatch.setattr(V.QFileDialog, "getExistingDirectory", lambda *a, **k: str(out))
+    win._open_computed()
+    assert _drain_until(qapp, lambda: "read-only" in win._readout.text(), timeout=90)
+    assert "wrong field" in win._readout.text(), win._readout.text()  # named, not silently wrong
+    win._stop_worker(); win.close()
+
+
+def test_disposing_an_exploration_tab_shuts_down_its_napari_viewer(qapp):
+    """dispose() used to only deleteLater() the pane — which does NOT close the napari Viewer inside
+    it (napari keeps every Viewer in its own registry), so one GL context + tens of MB leaked per
+    Shift-drag. dispose() must call the pane's shutdown() first."""
+    from PyQt5.QtWidgets import QWidget
+
+    closed = []
+
+    class _StubPane(QWidget):
+        def shutdown(self):
+            closed.append(True)
+
+    tab = V._ExplorationTab(["B2"], "exp:test")
+    tab.viewer = _StubPane()
+    tab.dispose()
+    assert closed == [True]           # the viewer was shut down, not merely deleteLater()'d
+    assert tab.viewer is None
 
 
 def test_operation_stack_remove_and_remove_suffix():
