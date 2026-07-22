@@ -271,6 +271,9 @@ class MosaicLayers:
         self._user_contrast_cbs: list[Any] = []
         # id(layer) of every layer already wired to the sink — see _connect_user_contrast.
         self._contrast_connected: set[int] = set()
+        # channel -> the last window REPORTED to subscribers. Linked peers all fire on one drag;
+        # this is what turns that fan-in back into one report per real change.
+        self._last_user_contrast: dict[str, tuple[float, float]] = {}
 
     # -- who moved the contrast: us, or the user? ---------------------------------------
     @contextmanager
@@ -428,6 +431,10 @@ class MosaicLayers:
         # mosaic; every op run after that adds more layers. Connecting only what existed at
         # subscribe time left those later layers driving napari and nothing else, so the
         # plate's contrast silently diverged from the picture on screen.
+        # Every layer here is destroyed and rebuilt on a region change, so a subscription made
+        # once at startup was connected to objects that no longer exist by the second region —
+        # the plate followed napari's contrast exactly until the user looked at a second well,
+        # and then stopped, silently. Arming at REGISTRATION is what outlives the layers.
         self._connect_user_contrast(channel, layer)
         # Link contrast across every processing layer showing this channel, so the
         # before->after toggle preserves the window and there is only ever one value.
@@ -509,9 +516,19 @@ class MosaicLayers:
     def _connect_user_contrast(self, channel: str, layer: Any) -> None:
         """Make *layer* report a USER contrast drag to every sink, now and in the future.
 
-        Connected once per layer (``_contrast_connected`` is keyed on layer identity, so a
-        re-add or a second subscribe cannot double-fire). The handler reads the callback list
-        at emit time, so a layer added before anyone subscribed is still wired correctly.
+        Every layer of a channel is wired, not just the first, because "the first" is a moving
+        target: layers are removed and re-added on every region change. Two guards keep that
+        from turning one gesture into a storm of reports:
+
+        - ``_contrast_connected`` is keyed on layer identity, so a re-add or a second subscribe
+          cannot connect the same layer twice.
+        - ``_last_user_contrast`` collapses the linked-peer fan-in — all peers of a channel fire
+          on one drag — back to ONE report per actual change. A plate that recomposites once per
+          peer does N times the work for one gesture, and a subscriber cannot tell the
+          duplicates apart.
+
+        The handler reads the callback list at emit time, so a layer added before anyone
+        subscribed is still wired correctly.
         """
         if id(layer) in self._contrast_connected:
             return
@@ -519,9 +536,12 @@ class MosaicLayers:
         def _fire(event=None, _ch=channel, _layer=layer):
             if self.is_programmatic:
                 return
-            lo, hi = _layer.contrast_limits
+            lo, hi = (float(v) for v in _layer.contrast_limits)
+            if self._last_user_contrast.get(_ch) == (lo, hi):
+                return                       # a linked peer echoing the same change
+            self._last_user_contrast[_ch] = (lo, hi)
             for cb in list(self._user_contrast_cbs):
-                cb(_ch, float(lo), float(hi))
+                cb(_ch, lo, hi)
 
         layer.events.contrast_limits.connect(_fire)
         self._contrast_connected.add(id(layer))
@@ -532,8 +552,10 @@ class MosaicLayers:
         ``callback(channel, lo, hi)``. This is the seam that lets the plate be a pure sink: it
         is told what the owner resolved, and it never writes back.
 
-        Layers are wired in ``_register_channel``, so this stays correct for every layer added
-        after the subscribe — which is all of them after the first mosaic.
+        The connection itself is made in ``_register_channel``, per layer, so a subscriber keeps
+        hearing changes after the layers it originally watched have been rebuilt; it never has
+        to re-subscribe. The backfill below covers only the layers that already existed when
+        this callback arrived, and is idempotent.
         """
         self._user_contrast_cbs.append(callback)
         for channel, peers in self._by_channel.items():
