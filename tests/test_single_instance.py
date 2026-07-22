@@ -83,6 +83,31 @@ def test_the_refusal_names_the_limit_and_how_to_override(slots):
     assert "1" in msg, "the refusal must say what the cap is"
 
 
+def test_a_window_built_directly_still_takes_a_slot(slots, monkeypatch):
+    """main() is not the only door. Proof scripts and debug launchers construct a PlateWindow
+    themselves, which is exactly how the screen filled up, so the slot is taken on show()."""
+    pytest.importorskip("PyQt5")
+    from PyQt5.QtWidgets import QApplication
+
+    import squidmip._viewer as V
+
+    app = QApplication.instance() or QApplication([])
+    app.setProperty("_squidmip_test", True)
+    monkeypatch.setattr(V, "_gui_cap_applies", lambda: True)   # offscreen is exempt; force the cap
+
+    first = V.PlateWindow(None)
+    first.show()
+    try:
+        assert getattr(first, "_gui_slot", None) is not None, "a visible window took no slot"
+        with pytest.raises(GuiAlreadyOpen):
+            acquire_gui_slot()                                 # the cap is really held
+    finally:
+        first.close()
+
+    freed = acquire_gui_slot()          # closing the window gave the slot back
+    release_gui_slot(freed)
+
+
 def test_a_crashed_gui_does_not_wedge_the_app_shut(slots):
     """The self-healing property. A slot whose holder died is reusable with no cleanup.
 

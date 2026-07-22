@@ -6023,7 +6023,29 @@ class PlateWindow(QMainWindow):
         self._retire(self._minerva)
         self._minerva = None
 
+    def showEvent(self, e):
+        """Take a GUI slot the moment this window becomes VISIBLE.
+
+        The cap cannot live in ``main()`` alone: every proof script and debug launcher builds a
+        ``PlateWindow`` directly and never goes through it, which is exactly how Julio's screen
+        filled up. This is the one call every visible window makes, whoever constructed it.
+
+        A refusal closes the window rather than raising: an exception out of showEvent leaves a
+        half-built top-level on screen, which is the state we are trying to prevent.
+        """
+        if _gui_cap_applies() and getattr(self, "_gui_slot", None) is None:
+            try:
+                self._gui_slot = acquire_gui_slot()
+            except GuiAlreadyOpen as exc:
+                print(f"squidmip-view: {exc}", file=sys.stderr)
+                self._gui_slot = None
+                QTimer.singleShot(0, self.close)   # unwind out of showEvent first, then close
+                return
+        super().showEvent(e)
+
     def closeEvent(self, e):
+        release_gui_slot(getattr(self, "_gui_slot", None))   # let the next window open
+        self._gui_slot = None
         self._stop_worker()          # stop the run cleanly; nothing on disk to clean up (no cache)
         self._stop_preview()
         self._stop_minerva()         # files already written stay; only the launch poll is abandoned
