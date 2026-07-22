@@ -3645,6 +3645,54 @@ def test_an_impossible_feather_is_refused_in_the_readout_not_at_the_end_of_a_fus
     win.close()
 
 
+def test_panel_kwargs_reach_stitch_plate_on_the_PREVIEW_path(qapp, stub_detail, squid_dataset,
+                                                             monkeypatch):
+    """Not just "the worker stored them" -- they must reach the function that fuses.
+
+    Storing a dict on the worker and then not forwarding it is invisible to any assertion
+    made on the worker itself, so this spies on the engine call instead.
+    """
+    import squidmip
+    seen = {}
+
+    def fake_stitch_plate(reader, **kw):
+        seen.update(kw)
+        return iter(())
+
+    monkeypatch.setattr(squidmip, "stitch_plate", fake_stitch_plate)
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("stitch", regions=["B2"], save=False,
+                     operator_kwargs={"blend_px": 3, "register": False})
+    _drain_until(qapp, lambda: "blend_px" in seen)
+    assert seen["blend_px"] == 3 and seen["register"] is False
+    win._stop_worker(); win.close()
+
+
+def test_panel_kwargs_reach_write_plate_on_the_SAVE_path(qapp, stub_detail, squid_dataset,
+                                                        monkeypatch, tmp_path):
+    """The save path is the one that matters most: a registration tuned on a preview and then
+    silently dropped is thrown away at exactly the moment it is written to disk."""
+    import squidmip
+    seen = {}
+
+    def fake_write_plate(reader, out_dir, **kw):
+        seen.update(kw)
+        return {"plate": str(out_dir), "levels": 1}
+
+    monkeypatch.setattr(squidmip, "write_plate", fake_write_plate)
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win.run_operator("stitch", out_parent=str(tmp_path), regions=["B2"], save=True,
+                     operator_kwargs={"blend_px": 3, "register": False})
+    _drain_until(qapp, lambda: "operator_kwargs" in seen)
+    assert seen["operator_kwargs"]["blend_px"] == 3
+    assert seen["operator_kwargs"]["register"] is False
+    win._stop_worker(); win.close()
+
+
 def test_a_decon_qc_result_opens_as_a_tab_in_pane_3(qapp, stub_detail, squid_dataset):
     """The seam with pane 3, driven: publish_qc_result must put the widget in the EXPLORE tab
     bar (pane 3), not in the pane-1 console, and re-publishing the same title must reuse it."""
@@ -3659,9 +3707,19 @@ def test_a_decon_qc_result_opens_as_a_tab_in_pane_3(qapp, stub_detail, squid_dat
     assert win._explore_tabs.indexOf(view) >= 0, "the QC result did not land in pane 3"
     assert win._left_tabs.indexOf(view) < 0, "the QC result landed in pane 1"
     before = win._explore_tabs.count()
-    win.publish_qc_result(view, "Decon QC · B2/0/c0")
+    # Publishing the SAME SUBJECT again must reuse its tab. Passing a DIFFERENT widget is the
+    # point: keying on anything unique-per-call (a uuid, an iteration number) would stack a new
+    # tab for every iteration of the QC loop, which is the loop's whole working rhythm. Passing
+    # the same object again could not detect that, because a widget already in a tab bar is
+    # merely moved rather than added twice.
+    win.publish_qc_result(DeconQCResultView("B2/0/c0"), "Decon QC · B2/0/c0")
     qapp.processEvents()
     assert win._explore_tabs.count() == before, "a second tab was stacked for the same subject"
+    assert win._explore_tabs.indexOf(view) >= 0, "the original tab was replaced, not reused"
+    # A DIFFERENT subject does get its own tab.
+    win.publish_qc_result(DeconQCResultView("B3/0/c0"), "Decon QC · B3/0/c0")
+    qapp.processEvents()
+    assert win._explore_tabs.count() == before + 1
     win.close()
 
 
