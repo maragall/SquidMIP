@@ -73,7 +73,7 @@ from squidmip.reader import (
 # at FULL depth, and ``_output._validate_image`` accepts only Z == 1. A plane-op therefore
 # streams correctly out of ``project_plate`` but fails LOUD at ``write_plate``. That is by
 # design for now — loud, not silently wrong — and it lifts the moment the writer learns Z > 1.
-from squidmip import _background, _decon, _flatfield  # noqa: E402,F401  (registration side effect)
+from squidmip import _background, _decon, _flatfield, _spots  # noqa: E402,F401  (registration side effect)
 from squidmip._background import BackgroundParams, bgsub_op, subtract_background
 from squidmip._decon import (
     OpticsParams,
@@ -85,6 +85,7 @@ from squidmip._decon import (
     set_optics,
 )
 from squidmip._flatfield import FlatfieldProfile, correct_flatfield, estimate_profile, flatfield_op
+from squidmip._spots import SpotParams, SpotResult, detect_spots, spots_op
 
 __all__ = [
     "open_reader",
@@ -141,5 +142,10 @@ __all__ = [
     "estimate_profile",
     "FlatfieldProfile",
     "flatfield_op",
+    # spot detection / nuclei counting (registered as "spots")
+    "SpotParams",
+    "SpotResult",
+    "detect_spots",
+    "spots_op",
 ]
 __version__ = "0.1.0"

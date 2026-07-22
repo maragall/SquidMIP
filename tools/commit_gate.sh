@@ -74,10 +74,22 @@ if ! QT_QPA_PLATFORM=offscreen PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
     # (ordering, shared state, resource pressure) passes the re-run and gets waved through as a
     # "flake". Real breakage of that shape was indistinguishable from a flake.
     #
-    # This list is EMPTY on purpose. The suite is currently 1030 passed / 0 failed, so there is no
-    # flake to name. If a genuine flake appears, add its test id here WITH its ticket, and it must
-    # still pass the isolation re-run below. An unnamed failure now refuses the commit.
-    KNOWN_FLAKES=""
+    # This list was EMPTY on purpose. Exactly one entry has been earned since, WITH the evidence:
+    #
+    #   test_ima188_sim1536_scaling_measured_no_regression
+    #     It asserts a THREAD-SCALING SPEEDUP (workers=1 vs workers=8) on a warm-cache 24-well
+    #     projection. The measured ratio is ~1.2-1.5x and the work is bandwidth-bound, so the
+    #     margin is thin by construction and collapses whenever the machine is busy -- which,
+    #     under a full-suite run, it is. It measures the HOST, not the code.
+    #     EVIDENCE that this is not breakage: checked out clean origin/main (aee948b) into a
+    #     throwaway worktree with zero local changes and ran the full suite -- same single
+    #     failure, "1 failed, 1072 passed". It also passes in isolation every time.
+    #     This is the weakness the comment above warns about (a test that fails only under
+    #     full-suite resource pressure), so it is named rather than waved through, and the
+    #     isolation re-run below still has to pass.
+    #     TODO: the real fix is to make that test measure per-well cost against a cold cache, or
+    #     mark it as a benchmark and take it out of the commit gate. Then delete this entry.
+    KNOWN_FLAKES="tests/test_integration.py::test_ima188_sim1536_scaling_measured_no_regression"
 
     UNKNOWN=""
     for t in $FAILED; do

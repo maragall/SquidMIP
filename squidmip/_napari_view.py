@@ -391,19 +391,8 @@ class MosaicLayers:
             layer = self._model.add_image(data, **kwargs)
 
             if bbox_um is not None:
-                # Trailing two axes are (y, x); a z-stack's leading axis is not placed by bbox_um.
                 shape = tuple(_first_level_shape(data, bool(multiscale)))[-2:]
-                scale, translate = scale_translate_from_bbox_um(bbox_um, shape)
-                # A z axis (from a lazy z-stack) is not placed by bbox_um, which describes the XY
-                # footprint only. Pad so scale/translate line up with the trailing spatial axes.
-                extra = max(0, int(getattr(layer, "ndim", len(shape))) - 2)
-                # The z axis carries the STEP in micrometres, not 1.0. With a unit z scale the
-                # 2-D slider still steps correctly but the 3-D toggle renders an isotropic block
-                # out of anisotropic data — IMA-255 exists precisely because dz/pixel has to
-                # reach the renderer. Same world units as x/y, so the ratio comes out right.
-                lead = (float(z_scale_um) if (extra and z_scale_um) else 1.0,) * extra
-                layer.scale = lead + tuple(scale)
-                layer.translate = (0.0,) * extra + tuple(translate)
+                self._place(layer, bbox_um, shape, z_scale_um)
 
             self._register_channel(key.channel, layer)
             # Point the camera at the data. add_image does NOT move the camera, so the first
@@ -418,6 +407,104 @@ class MosaicLayers:
             except Exception:                    # noqa: BLE001 - view convenience, never fatal
                 pass
         return layer
+
+    def _place(self, layer: Any, bbox_um: Sequence[float], shape: Sequence[int],
+               z_scale_um: Optional[float] = None) -> None:
+        """Put *layer* at its stage-micrometre footprint. THE one placement rule, shared.
+
+        Trailing two axes are (y, x); a z-stack's leading axis is not placed by bbox_um, which
+        describes the XY footprint only, so scale/translate are padded to line up with the
+        trailing spatial axes.
+
+        The z axis carries the STEP in micrometres, not 1.0. With a unit z scale the 2-D slider
+        still steps correctly but the 3-D toggle renders an isotropic block out of anisotropic
+        data — IMA-255 exists precisely because dz/pixel has to reach the renderer. Same world
+        units as x/y, so the ratio comes out right.
+
+        Shared by ``add_mosaic`` / ``add_labels`` / ``add_points`` on purpose: an analysis result
+        that is placed by a SECOND copy of this arithmetic is one edit away from sitting next to
+        the mosaic it claims to describe rather than on top of it.
+        """
+        scale, translate = scale_translate_from_bbox_um(bbox_um, shape)
+        extra = max(0, int(getattr(layer, "ndim", len(shape))) - 2)
+        lead = (float(z_scale_um) if (extra and z_scale_um) else 1.0,) * extra
+        layer.scale = lead + tuple(scale)
+        layer.translate = (0.0,) * extra + tuple(translate)
+
+    # -- analysis results: the NON-image layer types -------------------------------------
+    # add_mosaic makes Image layers. A segmentation operator's output is not an image, and
+    # rendering it as one is not a cosmetic mistake: a label image through add_image is a
+    # near-black gradient under an intensity colormap, with no label picking and no transparent
+    # background. Every napari segmentation surface returns Labels (napari-segment-blobs-
+    # and-things-with-membranes annotates `-> "napari.types.LabelsData"`; cellpose-napari calls
+    # viewer.add_labels(masks)), so this is the layer type the operators after this one need.
+    #
+    # These deliberately do NOT go through _register_channel. Contrast is linked per channel and
+    # a Labels/Points layer has no `contrast_limits` at all — registering one as a peer makes the
+    # next link_layers call raise. napari OWNS contrast; an analysis overlay has no part in it.
+
+    def _add_result(self, adder: str, op: str, channel: str, data: Any,
+                    kwargs: dict, bbox_um: Optional[Sequence[float]],
+                    shape: Optional[Sequence[int]]) -> Any:
+        """Shared body of :meth:`add_labels` / :meth:`add_points`."""
+        key = MosaicKey(str(op), str(channel))
+        if self.find(key.op, key.channel) is not None:
+            self.remove_op_channel(key.op, key.channel)   # a re-run REPLACES, never stacks up
+
+        kwargs = dict(kwargs)
+        kwargs["name"] = key.label()
+        kwargs["metadata"] = key.as_metadata()
+
+        with self.programmatic():
+            layer = getattr(self._model, adder)(data, **kwargs)
+            if bbox_um is not None:
+                if shape is None:
+                    raise ValueError(
+                        f"{adder} for {key.label()!r} was given bbox_um but no shape. A Points "
+                        "layer carries no array shape, so the micrometres-per-pixel scale cannot "
+                        "be derived from the data; pass shape=<the mask's (h, w)>. Leaving it "
+                        "unplaced would silently park every centroid at the world origin."
+                    )
+                self._place(layer, bbox_um, tuple(shape)[-2:])
+        return layer
+
+    def add_labels(self, op: str, channel: str, data: Any, *,
+                   bbox_um: Optional[Sequence[float]] = None, visible: bool = True,
+                   opacity: float = 0.5, blending: str = "translucent") -> Any:
+        """Add (or replace) a segmentation MASK as a napari ``Labels`` layer.
+
+        *data* must be an integer (or bool) array — napari's Labels layer rejects floats. Label
+        ``0`` is background and renders transparent, so the mosaic underneath stays visible.
+        """
+        return self._add_result(
+            "add_labels", op, channel, data,
+            {"visible": visible, "opacity": float(opacity), "blending": blending},
+            bbox_um, getattr(data, "shape", None),
+        )
+
+    def add_points(self, op: str, channel: str, data: Any, *,
+                   bbox_um: Optional[Sequence[float]] = None,
+                   shape: Optional[Sequence[int]] = None, visible: bool = True,
+                   size: float = 12.0, symbol: str = "ring",
+                   face_color: str = "transparent", border_color: str = "yellow",
+                   features: Optional[Any] = None) -> Any:
+        """Add (or replace) detection CENTROIDS as a napari ``Points`` layer.
+
+        *data* is ``(N, 2)`` in ``(row, col)`` — napari's own 2D world axis order, which is also
+        what ``skimage`` centroids and ``blob_log`` return, so no transpose happens anywhere.
+        An EMPTY ``(0, 2)`` array is legitimate and still produces a layer: "zero found" is an
+        answer, and skipping the layer would make it indistinguishable from "nothing ran".
+
+        *features* rides along as the per-object record (Fractal's feature-table contract: one
+        row per object, keyed by label value).
+        """
+        kwargs: dict[str, Any] = {
+            "visible": visible, "size": float(size), "symbol": symbol,
+            "face_color": face_color, "border_color": border_color,
+        }
+        if features is not None:
+            kwargs["features"] = features
+        return self._add_result("add_points", op, channel, data, kwargs, bbox_um, shape)
 
     def _register_channel(self, channel: str, layer: Any) -> None:
         peers = self._by_channel.setdefault(channel, [])

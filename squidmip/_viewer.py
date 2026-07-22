@@ -75,6 +75,7 @@ from squidmip._montage import _area_downsample, _hex_to_rgb01, _window, composit
 from squidmip._output import parse_well_id
 from squidmip._plate import PlateBuildError, build_plate
 from squidmip._plate_shape import PlateShapeError
+from squidmip._spots import LAYER_KEY as _SPOTS_LAYER_KEY
 
 # (`_SUPPORTED_PLATES` and `resolve_plate_format` used to live here. `build_plate` (IMA-214) is now
 #  the single format-resolution path — override > measured > declared > inferred — so both were dead
@@ -3277,6 +3278,115 @@ class _MosaicWorker(QThread):
         self.finished_count.emit(n)
 
 
+class _SpotWorker(QThread):
+    """Run spot detection on the plane pane 2 is CURRENTLY showing, off the GUI thread.
+
+    Spencer: *"responsiveness is important. And an indicator when its working."* Both halves are
+    structural here rather than cosmetic:
+
+    * **Responsive.** Same ``QThread`` shape as ``_MosaicWorker``/``_PreviewWorker``. The click
+      handler builds this and calls ``start()``, which returns immediately; every pixel is
+      touched on this thread. Measured on region ``manual0`` of the 10x tissue slide
+      (5731 x 4793 fused mosaic, 405 nm): ~7.3 s total, of which the watershed is ~4.8 s.
+    * **Indicator.** ``progress(done, total)`` counts STAGES of the recipe, matching the
+      ``pyqtSignal(int, int)`` convention every other worker here uses, so an existing indicator
+      binds to it unchanged. That signal has no text channel, so the stage NAME goes out
+      separately on ``stageChanged(str)`` rather than being smuggled into an int.
+    * **Cancellable.** ``stop()`` sets an Event that ``detect_spots`` polls between stages. The
+      cancel is honoured at the next stage boundary (worst case one watershed), and a cancelled
+      run emits ``cancelled`` and NO result — never a half-finished mask presented as an answer.
+
+    The plane is taken from the layer already on the canvas, not re-read from disk, so what was
+    counted is exactly what the user is looking at.
+    """
+
+    progress = pyqtSignal(int, int)                # (stages done, stages total) — the convention
+    stageChanged = pyqtSignal(str)                 # the TEXT channel progress(int,int) cannot carry
+    ready = pyqtSignal(str, str, object, object, object, int)
+    # ^ (region, channel, labels (H,W) int32, centroids (N,2) float, bbox_um|None, count)
+    problem = pyqtSignal(str)                      # a NAMED failure: "<region>/<channel>: ..."
+    cancelled = pyqtSignal()
+    finished_count = pyqtSignal(str, str, int)     # (region, channel, count) — the run's answer
+
+    def __init__(self, region, channel, data, z_index, bbox_um, params=None, parent=None):
+        super().__init__(parent)
+        self._region, self._channel = region, channel
+        self._data, self._z = data, z_index
+        self._bbox_um = bbox_um
+        self._params = params
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        from squidmip._spots import SpotDetectionCancelled, detect_spots
+
+        where = f"{self._region}/{self._channel}"
+        try:
+            plane = _full_res_plane(self._data, self._z)
+
+            res = detect_spots(
+                plane, self._params,
+                on_stage=lambda name, done, total: (self.stageChanged.emit(name),
+                                                    self.progress.emit(done, total)),
+                should_stop=self._stop.is_set,
+            )
+        except SpotDetectionCancelled:
+            self.cancelled.emit()
+            return
+        except Exception as exc:                   # noqa: BLE001 - NAMED, never swallowed
+            self.problem.emit(f"{where}: spot detection failed — {type(exc).__name__}: {exc}")
+            return
+
+        self.progress.emit(len(_spot_stages()), len(_spot_stages()))
+        self.stageChanged.emit("done")
+        self.ready.emit(self._region, self._channel, res.labels, res.centroids,
+                        self._bbox_um, res.count)
+        self.finished_count.emit(self._region, self._channel, res.count)
+
+
+def _spot_stages():
+    """The stage list, imported lazily so ``_viewer`` keeps no second copy of the denominator."""
+    from squidmip._spots import STAGES
+
+    return STAGES
+
+
+def _full_res_plane(data, z_index):
+    """The FULL-RESOLUTION 2-D plane behind a napari layer's ``data``, whatever shape it is in.
+
+    A napari layer's ``data`` is one of three things here, and counting cells on the wrong one
+    gives a wrong number that looks entirely plausible:
+
+    * a **list of pyramid levels** (a multiscale mosaic — level 0 is full resolution, and every
+      later level has fewer, larger-looking nuclei). ALWAYS level 0: counting a 4x-downsampled
+      level would merge touching nuclei and silently under-report.
+    * a **(z, y, x) stack** — take the z the user is actually looking at.
+    * a plain **(y, x)** plane.
+
+    Only the ONE plane asked for is ever materialised; a lazy pyramid stays lazy until the
+    ``np.asarray`` at the end.
+    """
+    # A pyramid arrives as a list/tuple of arrays. `ndim` is the discriminator, not `type`:
+    # a tuple, a list and a dask stack all have to work.
+    if isinstance(data, (list, tuple)):
+        if not data:
+            raise ValueError("the layer holds an EMPTY multiscale pyramid — nothing to count.")
+        data = data[0]                      # level 0 == full resolution
+    if getattr(data, "ndim", 2) == 3:
+        n_z = data.shape[0]
+        z = n_z // 2 if z_index is None else int(z_index)
+        data = data[min(max(z, 0), n_z - 1)]
+    plane = np.asarray(data)
+    if plane.ndim != 2:
+        raise ValueError(
+            f"expected a 2-D plane to count on, got shape {plane.shape!r}. The layer's data is "
+            "neither a pyramid level list, a (z, y, x) stack, nor a (y, x) plane."
+        )
+    return plane
+
+
 class _PreviewWorker(QThread):
     """Fast RAW preview so the plate shows imagery the moment it opens — before any operator runs
     (the "downsample the plate before opening" step). Reads ONE representative z-plane per channel
@@ -3503,6 +3613,8 @@ class PlateWindow(QMainWindow):
         self._meta = None
         self._mosaic_worker = None    # fuses a region's FOVs for pane 2, off the GUI thread
         self._mosaic_region = None    # region currently shown in the napari mosaic pane
+        self._spot_worker = None      # spot detection on the visible mosaic, off the GUI thread
+        self._spot_counts = {}        # (region, channel) -> nuclei counted. PER-REGION, not global.
         self._fov_index = {}
         self._selected_regions = []   # wells picked on the plate (IMA-221); scopes an operator run
         self._pushed = set()          # wells whose raw z-stack is already registered in the detail viewer
@@ -3664,6 +3776,12 @@ class PlateWindow(QMainWindow):
 
         if viewer_mode == "napari" and self._mosaic_pane is not None:
             self._right_widget = self._mosaic_pane
+            # The analysis-operator trigger. Connected ONCE here, like the FOV slider and the
+            # contrast signal above: the pane is a singleton that outlives every ingest, and a
+            # per-ingest connect would stack duplicate slots and run the operator N times.
+            btn = getattr(self._mosaic_pane, "detect_button", None)
+            if btn is not None:
+                btn.clicked.connect(self._on_detect_nuclei)
         elif self._detail is not None:
             self._right_widget = self._detail
             # A fallback the user cannot see is a silent failure. Say it in the status line.
@@ -5088,8 +5206,15 @@ class PlateWindow(QMainWindow):
             prior.stop()
             prior.wait(2000)
 
+        # A run in flight is counting the OLD region. Let it finish and you get a mask for B2
+        # drawn over B3's mosaic, with B2's number in the readout — a plausible-looking lie.
+        self._stop_spots()
+
         self._mosaic_region = region
         pane.mosaic.remove_op(op)
+        # Drop the previous region's overlays for the same reason. `remove_op` is a no-op when
+        # nothing has been counted yet.
+        pane.mosaic.remove_op(self.SPOTS_OP)
         channels = [c["name"] for c in self._meta["channels"]]
         w = _MosaicWorker(self._reader, self._meta, region, channels, parent=self)
         w.ready.connect(lambda r, ch, plane, bbox: self._on_mosaic_plane(op, r, ch, plane, bbox))
@@ -5133,16 +5258,140 @@ class PlateWindow(QMainWindow):
         pane = getattr(self, "_mosaic_pane", None)
         if pane is None or not getattr(pane, "ok", False):
             return
+        btn = getattr(pane, "detect_button", None)
         if n == 0:
             pane.say(f"{region}: no mosaic could be built (see the message above).")
+            if btn is not None:
+                btn.setEnabled(False)   # nothing to count; an enabled button here does nothing
             return
         pane.say("")
+        if btn is not None:
+            btn.setEnabled(True)        # there is now a region on the canvas to run the operator on
         try:
             pane.mosaic.show_op(op)
             pane.mosaic.model.reset_view()
         except Exception:                            # noqa: BLE001 - view framing is cosmetic
             pass
         self._bind_napari_contrast()
+
+    # -- the analysis operator: spot detection on what pane 2 is showing -------------------
+
+    #: Processing-layer key the spot-detection result layers are filed under. A DISTINCT op from
+    #: "raw"/"stitched" so the layer tree groups the analysis overlays on their own and
+    #: ``show_op`` never has to choose between the mosaic and the mask drawn over it.
+    #: Read off ``_spots.LAYER_KEY`` rather than restated, so the UI and the engine registry
+    #: cannot drift apart on the spelling.
+    SPOTS_OP = _SPOTS_LAYER_KEY
+
+    def _spot_source_layer(self):
+        """The (channel, layer) the count will be run on: the first VISIBLE mosaic channel.
+
+        Returns ``(None, None)`` when there is nothing to count. Deliberately reads the CANVAS
+        rather than the metadata: the number in the readout has to describe the picture the user
+        is looking at, or the two disagree and the readout is the one that lies.
+        """
+        pane = getattr(self, "_mosaic_pane", None)
+        if pane is None or not getattr(pane, "ok", False) or pane.mosaic is None:
+            return None, None
+        op = pane.mosaic.visible_op()
+        if op is None or op == self.SPOTS_OP:
+            return None, None
+        for channel in pane.mosaic.channels(op):
+            layer = pane.mosaic.find(op, channel)
+            if layer is not None and getattr(layer, "visible", False):
+                return channel, layer
+        return None, None
+
+    def _current_z_index(self):
+        """Which z napari is showing, or None for a 2-D layer. napari OWNS the z slider."""
+        pane = getattr(self, "_mosaic_pane", None)
+        try:
+            dims = pane.mosaic.model.dims
+            if dims.ndim < 3:
+                return None
+            return int(dims.current_step[0])
+        except Exception:                            # noqa: BLE001 - absence is not a failure
+            return None
+
+    def _on_detect_nuclei(self):
+        """Run spot detection on the visible channel. Returns IMMEDIATELY; the work is off-thread."""
+        pane = getattr(self, "_mosaic_pane", None)
+        region = getattr(self, "_mosaic_region", None)
+        channel, layer = self._spot_source_layer()
+        if pane is None or region is None or layer is None:
+            if pane is not None:
+                pane.say("nothing to count: no region mosaic is visible in this pane yet.")
+            return
+
+        prior = getattr(self, "_spot_worker", None)
+        if prior is not None and prior.isRunning():
+            # A second click CANCELS the run in flight rather than queueing another one. Two
+            # segmentations racing to write the same layer is the "two representations of one
+            # truth" defect with a thread attached.
+            prior.stop()
+            pane.say(f"{region}/{channel}: cancelling the run in flight…")
+            return
+
+        bbox_um = None
+        try:
+            from squidmip._mosaic_source import mosaic_bbox_um
+
+            bbox_um = mosaic_bbox_um(self._meta, region)
+        except Exception as exc:                     # noqa: BLE001 - said, not swallowed
+            pane.say(f"{region}: mosaic placement unavailable ({exc}); the overlay will be "
+                     "drawn in pixel coordinates and will NOT line up with the mosaic.")
+
+        w = _SpotWorker(region, channel, layer.data, self._current_z_index(), bbox_um,
+                        parent=self)
+        w.ready.connect(self._on_spots_ready)
+        w.problem.connect(lambda msg: pane.say(msg))
+        w.stageChanged.connect(
+            lambda name: pane.say(f"{region}/{channel}: counting nuclei — {name}…"))
+        w.cancelled.connect(lambda: pane.say(f"{region}/{channel}: spot detection cancelled."))
+        w.finished_count.connect(self._on_spots_done)
+        w.finished.connect(self._on_spot_worker_finished)
+        self._spot_worker = w
+        pane.say(f"{region}/{channel}: counting nuclei…")
+        w.start()
+
+    def _on_spot_worker_finished(self):
+        """Re-enable the button however the run ended — ok, failed, or cancelled."""
+        pane = getattr(self, "_mosaic_pane", None)
+        btn = getattr(pane, "detect_button", None) if pane is not None else None
+        if btn is not None:
+            btn.setEnabled(True)
+
+    def _on_spots_ready(self, region, channel, labels, centroids, bbox_um, count):
+        """The result landed. Put it ON THE CANVAS as real napari layers."""
+        pane = getattr(self, "_mosaic_pane", None)
+        if pane is None or not getattr(pane, "ok", False):
+            return
+        if getattr(self, "_mosaic_region", None) != region:
+            return                                   # the user moved on; drop a stale result
+        from squidmip._spots import centroid_layer_name, mask_layer_name
+
+        # The MASK: a real Labels layer, so napari gives it its own label colormap, transparent
+        # background and click-to-pick. add_image would render it as a near-black gradient.
+        pane.mosaic.add_labels(self.SPOTS_OP, mask_layer_name(channel), labels,
+                               bbox_um=bbox_um)
+        # The CENTROIDS: a Points layer, with the per-object record (Fractal's feature-table
+        # contract) riding on `features`, keyed by label value.
+        pane.mosaic.add_points(
+            self.SPOTS_OP, centroid_layer_name(channel), centroids,
+            bbox_um=bbox_um, shape=labels.shape,
+            features={"label": np.arange(1, len(centroids) + 1, dtype=np.int32)},
+        )
+
+    def _on_spots_done(self, region, channel, count):
+        """The NUMBER — per region, in the status readout, which is what Spencer asked for."""
+        pane = getattr(self, "_mosaic_pane", None)
+        if pane is not None:
+            pane.say(f"{region} · {channel}: {count} nuclei")
+        counts = getattr(self, "_spot_counts", None)
+        if counts is None:
+            counts = self._spot_counts = {}
+        counts[(region, channel)] = int(count)       # per-region tally, for the plate readout
+        self._readout.setText(f"{region} · {channel} · {count} nuclei detected")
 
     def _bind_napari_contrast(self):
         """Point the EXISTING contrast sink (IMA-261) at napari instead of ndviewer_light.
@@ -6023,9 +6272,14 @@ class PlateWindow(QMainWindow):
         self._retire(self._minerva)
         self._minerva = None
 
+    def _stop_spots(self):
+        self._retire(getattr(self, "_spot_worker", None))
+        self._spot_worker = None
+
     def closeEvent(self, e):
         self._stop_worker()          # stop the run cleanly; nothing on disk to clean up (no cache)
         self._stop_preview()
+        self._stop_spots()           # never leave the segmentation thread running at teardown
         self._stop_minerva()         # files already written stay; only the launch poll is abandoned
         for key in list(self._floating):   # floated tabs are top-levels of their own — Qt won't
             win = self._floating.pop(key)  # close them for us, and each may hold a live shell

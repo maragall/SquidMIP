@@ -18,7 +18,9 @@ import time
 from typing import Any, Callable, Optional
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import QLabel, QSizePolicy, QHBoxLayout, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import (
+    QLabel, QPushButton, QSizePolicy, QHBoxLayout, QVBoxLayout, QWidget,
+)
 
 from squidmip._napari_view import MosaicLayers, resolve_viewer
 
@@ -106,6 +108,10 @@ class MosaicPane(QWidget):
         self._viewer = None
         self._native_window = None
         self.ndisplay_button: Optional[QWidget] = None
+        #: "Detect nuclei" — the ANALYSIS OPERATOR trigger, in the same row as napari's 2D/3D
+        #: button. Built unconditionally (even when napari's button could not be mounted) so the
+        #: operator is never silently unreachable; PlateWindow enables it once a region is shown.
+        self.detect_button: Optional[QWidget] = None
         self.layer_tree: Optional[QWidget] = None
         self._button_source = None               # keeps napari's row alive; see _install_ndisplay
         self.canvas: Optional[QWidget] = None
@@ -195,33 +201,46 @@ class MosaicPane(QWidget):
         There is exactly one owner of 2D/3D — ``viewer.dims.ndisplay``. This button and the one
         napari docks read and write that same property, so they cannot disagree.
         """
-        try:
-            from napari._qt.widgets.qt_viewer_buttons import QtViewerButtons
-            from napari.qt import get_current_stylesheet
-        except Exception as exc:                 # noqa: BLE001 - said out loud, never swallowed
-            self.say(f"napari's 2D/3D button could not be mounted ({exc}); "
-                     "use the one at the bottom of napari's left column.")
-            return
-
-        self._button_source = QtViewerButtons(self._viewer)
-        btn = self._button_source.ndisplayButton
-
         row = QWidget(self)
         rl = QHBoxLayout(row)
         rl.setContentsMargins(6, 4, 6, 4)
         rl.setSpacing(6)
-        rl.addWidget(btn)
-        rl.addStretch(1)
-        # napari's icons live in napari's stylesheet, which is applied to napari's own window.
-        # Outside it the button would render as an empty square -- a control that is technically
-        # visible and reads as broken. get_current_stylesheet is public and in napari.qt.__all__.
+
         try:
-            row.setStyleSheet(get_current_stylesheet())
-        except Exception:                        # noqa: BLE001 - cosmetic only
-            pass
+            from napari._qt.widgets.qt_viewer_buttons import QtViewerButtons
+            from napari.qt import get_current_stylesheet
+
+            self._button_source = QtViewerButtons(self._viewer)
+            btn = self._button_source.ndisplayButton
+            rl.addWidget(btn)
+            # napari's icons live in napari's stylesheet, which is applied to napari's own window.
+            # Outside it the button would render as an empty square -- a control that is
+            # technically visible and reads as broken. get_current_stylesheet is public and in
+            # napari.qt.__all__.
+            try:
+                row.setStyleSheet(get_current_stylesheet())
+            except Exception:                    # noqa: BLE001 - cosmetic only
+                pass
+            self.ndisplay_button = btn
+        except Exception as exc:                 # noqa: BLE001 - said out loud, never swallowed
+            self.say(f"napari's 2D/3D button could not be mounted ({exc}); "
+                     "use the one at the bottom of napari's left column.")
+
+        # The ANALYSIS OPERATOR trigger. Built outside the try above on purpose: a napari
+        # upgrade that moves QtViewerButtons must not also take the operator off the screen.
+        # Disabled until PlateWindow has a region on the canvas to run it on -- a button that
+        # silently does nothing is the same defect as a silent failure.
+        self.detect_button = QPushButton("Detect nuclei", row)
+        self.detect_button.setToolTip(
+            "Count the nuclei in the channel currently shown, and overlay the mask and the "
+            "centroids on this canvas."
+        )
+        self.detect_button.setEnabled(False)
+        rl.addWidget(self.detect_button)
+
+        rl.addStretch(1)
         row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         lay.addWidget(row)
-        self.ndisplay_button = btn
 
     # -- the grouped layer tree ---------------------------------------------------------
     def _install_layer_tree(self) -> None:
