@@ -47,9 +47,14 @@ def _app():
     return _APP
 
 
+_ONLY = os.environ.get("WALKTHROUGH_ONLY", "")   # e.g. IMA-261 — for mutation-checking one ticket
+
+
 def check(ticket, title):
     """Decorator: run a check, catch everything, record one row."""
     def wrap(fn):
+        if _ONLY and _ONLY not in ticket:
+            return fn
         try:
             detail = fn()
             verdict = "PASS"
@@ -117,6 +122,24 @@ def drain_preview(win, timeout_s=120):
     for _ in range(20):                 # let the queued tileReady slots actually run
         _app().processEvents()
         time.sleep(0.01)
+
+
+def ndv_clims_slider(win, ch=0):
+    """The REAL contrast range-slider inside the embedded ndv viewer, for channel *ch*.
+
+    Tests must drive this widget, not the LUTModel and not set_channel_window: every defect this
+    project shipped passed a suite that called the handler instead of moving the control.
+    """
+    d = getattr(win, "_detail", None)
+    ctrls = getattr(getattr(d, "ndv_viewer", None), "_lut_controllers", None) or {}
+    ctrl = ctrls.get(ch)
+    if ctrl is None:
+        return None
+    for v in getattr(ctrl, "lut_views", []):
+        q = getattr(v, "_qwidget", None)
+        if q is not None and hasattr(q, "clims"):
+            return q.clims
+    return None
 
 
 def rendered(widget, w=900, h=700):
@@ -464,6 +487,174 @@ def run_all():
         ov.set_contrast_scope(SCOPE_PER_REGION); b = rendered(ov).mean()
         w.close()
         return f"mean brightness global={a:.2f} -> per-region={b:.2f}"
+
+    @check("IMA-261", "The plate view has NO contrast sliders (the duplicate control is GONE)")
+    def _():
+        """Not hidden, not disabled - absent. Walked over the REAL widget tree, because a control
+        that is merely `hide()`-den is still a second owner waiting to be un-hidden."""
+        from PyQt5.QtWidgets import QAbstractSlider, QPushButton
+        w = open_window(PLATE)
+        bar = w._channel_bar
+        if bar is None:
+            w.close(); raise SkipCheck("no channel bar")
+        sliders = bar.findChildren(QAbstractSlider)
+        autos = [b for b in bar.findChildren(QPushButton) if "auto" in b.text().lower()]
+        n_rows = len(bar._rows)
+        has_setter = hasattr(bar, "_push") or hasattr(bar, "_auto") or hasattr(bar, "_slider")
+        w.close()
+        assert not sliders, f"{len(sliders)} contrast slider(s) still in the plate's channel bar"
+        assert not autos, f"{len(autos)} 'auto' button(s) still in the plate's channel bar"
+        assert not has_setter, "the channel bar still has a contrast-SETTING method"
+        return (f"{n_rows} channel rows, 0 sliders, 0 auto buttons, no setter method - "
+                "the plate reports contrast, it does not set it")
+
+    @check("IMA-261", "DRAGGING the CENTRAL viewer's contrast slider repaints the PLATE")
+    def _():
+        """The user's actual complaint: what the array viewer shows was not reflected on the plate.
+        Drives the REAL QLabeledRangeSlider inside ndv - not set_channel_window, not the model -
+        and asserts on the plate's DISPLAYED PIXELS."""
+        w = open_window(PLATE)
+        drain_preview(w)
+        ov = w._overview
+        sl = ndv_clims_slider(w, 0)
+        if sl is None:
+            w.close(); raise SkipCheck("ndv has no clims slider for channel 0 yet")
+        dmax = ov._contrast.dmax
+        sl.setValue((0, int(dmax * 0.9)))
+        _app().processEvents()
+        base = rendered(ov)
+        sl.setValue((int(dmax * 0.45), int(dmax * 0.55)))     # a hard, visible re-window
+        _app().processEvents()
+        after = rendered(ov)
+        plate_win = ov.channel_windows()[0]
+        view_win = w._detail.channel_windows().get(0)
+        w.close()
+        h = min(base.shape[0], after.shape[0]); wd = min(base.shape[1], after.shape[1])
+        changed = int((np.abs(base[:h, :wd] - after[:h, :wd]) > 0).sum())
+        assert changed > 0, "the array viewer's contrast slider changed nothing on the plate"
+        assert plate_win == view_win, f"plate {plate_win} != array viewer {view_win}"
+        return (f"{changed} px changed on the plate; plate window == viewer window == "
+                f"({plate_win[0]:.0f}, {plate_win[1]:.0f})")
+
+    @check("IMA-261", "Plate PIXELS are the array viewer's window, not merely its numbers")
+    def _():
+        """Agreeing on a (lo, hi) pair proves nothing if the plate then renders something else.
+        Recomposite the plate's own store under the window READ BACK FROM THE ARRAY VIEWER and
+        require the result to be the very bytes the plate is showing."""
+        from squidmip._montage import composite
+        w = open_window(PLATE)
+        drain_preview(w)
+        ov = w._overview
+        sl = ndv_clims_slider(w, 0)
+        if sl is None:
+            w.close(); raise SkipCheck("ndv has no clims slider for channel 0 yet")
+        sl.setValue((321, 8765))
+        _app().processEvents()
+        ov.recomposite(quick=False)
+        shown = ov._final_arr.get(ov._active)
+        store = ov._store.get(ov._active)
+        viewer_wins = w._detail.channel_windows()
+        if shown is None or store is None:
+            w.close(); raise SkipCheck("plate has not composited yet")
+        # Build the expected image from the VIEWER's windows only - nothing from the plate's
+        # own contrast model gets a vote here.
+        wins = [viewer_wins.get(c, ov.channel_windows()[c]) for c in range(store.shape[0])]
+        expect = composite(store, ov._colors, wins, ov._mask)
+        ch0 = viewer_wins.get(0)
+        w.close()
+        assert ch0 == (321.0, 8765.0), f"viewer did not take the slider value: {ch0}"
+        assert shown.shape == expect.shape, f"{shown.shape} != {expect.shape}"
+        diff = int(np.abs(shown.astype(int) - expect.astype(int)).max())
+        assert diff == 0, f"plate pixels differ from the viewer's window by up to {diff}/255"
+        return (f"{shown.shape} plate pixels are BYTE-IDENTICAL to a recomposite under the array "
+                f"viewer's own windows {[(round(a), round(b)) for a, b in wins]}")
+
+    @check("IMA-261", "A contrast drag is under 16 ms/frame on all three datasets")
+    def _():
+        """'Buttery' with a number on it: the wall time from moving the array viewer's slider to
+        the plate having repainted, with the Qt event loop in between. Measured, not asserted.
+
+        EVERY TICK MUST ACTUALLY REPAINT THE PLATE, and that is asserted here rather than assumed.
+        Mutation-checked against parent 8859c52, where the plate did not follow the array viewer at
+        all: the identical loop reported 0.2 ms / 5000 fps on all three datasets and PASSED, because
+        it was timing a slider nothing was listening to. A latency budget over a disconnected
+        control is the "832 green tests, one wrong model" defect in miniature — the number was real,
+        the thing it measured was not. So each tick's composited buffer is fingerprinted, and a tick
+        that did not change the plate's pixels disqualifies the measurement instead of flattering
+        it.
+        """
+        import time
+        out, worst = [], 0.0
+        for label, ds in (("tissue", TISSUE), ("2x2", PLATE), ("1536wp", PLATE1536)):
+            if not os.path.exists(ds):
+                out.append(f"{label}: absent"); continue
+            w = open_window(ds, size=(2560, 1440))
+            drain_preview(w)
+            ov = w._overview
+            sl = ndv_clims_slider(w, 0)
+            if sl is None or ov._store.get(ov._active) is None:
+                w.close(); out.append(f"{label}: no slider/store"); continue
+            dmax = ov._contrast.dmax
+
+            def frame():
+                """A fingerprint of what the plate is CURRENTLY showing, or None if nothing is."""
+                a = ov._final_arr.get(ov._active)
+                return None if a is None else hash(a.tobytes())
+
+            sl.setValue((0, int(dmax * 0.5))); _app().processEvents()   # warm every cache
+            ts, frames = [], []
+            for i in range(30):
+                t0 = time.perf_counter()
+                sl.setValue((0, int(dmax * (0.25 + 0.5 * i / 30))))
+                _app().processEvents()
+                ts.append((time.perf_counter() - t0) * 1000)
+                frames.append(frame())
+            med = float(np.median(ts))
+            store = ov._store[ov._active]
+            w.close()
+            # 30 strictly increasing windows over real (non-flat) pixels must give 30 different
+            # images. Anything less means some ticks repainted nothing and their times are noise.
+            distinct = len(set(frames))
+            assert None not in frames, f"{label}: the plate composited nothing during the drag"
+            assert distinct == len(frames), (
+                f"{label}: {len(frames)} slider ticks produced only {distinct} distinct plate "
+                f"images — the plate is NOT following the array viewer, so this timing is of a "
+                f"disconnected control")
+            worst = max(worst, med)
+            out.append(f"{label} {tuple(store.shape)}: {med:.1f} ms ({1000 / med:.0f} fps), "
+                       f"{distinct}/{len(frames)} repaints")
+        assert worst < 16.0, f"slowest dataset {worst:.1f} ms/frame, over the 16 ms budget"
+        return " | ".join(out)
+
+    @check("IMA-242", "ONE contrast model: the loupe obeys the slider the plate obeys")
+    def _():
+        """The duplication this ticket collapsed: the loupe used to memoise its own window and its
+        own compositor, so a slider drag moved the plate and left the magnifier of that same plate
+        showing the pre-drag contrast."""
+        import squidmip._viewer as V
+        w = open_window(PLATE)
+        ov = w._overview
+        settle()
+        if ov._contrast is None:
+            w.close(); raise SkipCheck("no contrast model")
+        # The three renderers must agree about a LATCHED channel, whatever auto they each derive.
+        ov._contrast.set_manual(0, 123.0, 4567.0)
+        plate_win = ov.channel_windows()[0]
+        store = ov._store.get(ov._active)
+        cell_win = None
+        if store is not None and ov._tiles_by_layer.get(ov._active):
+            ri, ci = sorted(ov._tiles_by_layer[ov._active])[0]
+            cell_win = ov._cell_windows(store, ri, ci)[0]
+        loupe_win = ov._contrast.resolve(0, (0.0, 65535.0))   # the loupe's resolution path
+        w.close()
+        assert plate_win == (123.0, 4567.0), f"plate ignored the latch: {plate_win}"
+        assert loupe_win == (123.0, 4567.0), f"loupe ignored the latch: {loupe_win}"
+        if cell_win is not None:
+            assert cell_win == (123.0, 4567.0), f"per-region ignored the latch: {cell_win}"
+        assert not hasattr(V, "_composite_rgb") and not hasattr(V, "_percentile_window"), \
+            "a duplicate contrast implementation is back"
+        return (f"plate={plate_win} per-region={cell_win} loupe={loupe_win} — all one model; "
+                "both duplicate implementations gone")
 
     # ---------- operators ------------------------------------------------------------
     @check("IMA-210", "Operator registry exposes every shipped operator")

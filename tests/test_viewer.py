@@ -30,7 +30,7 @@ if "PySide6" in sys.modules or "PySide2" in sys.modules:
         "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 to run the PyQt5 GUI tests.",
         allow_module_level=True,
     )
-from PyQt5.QtCore import QEvent, QPointF, Qt  # noqa: E402
+from PyQt5.QtCore import QEvent, QPointF, Qt, pyqtSignal  # noqa: E402
 from PyQt5.QtGui import QImage, QMouseEvent  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QPushButton, QSlider, QSpinBox, QWidget,
@@ -49,10 +49,17 @@ class _StubDetail(QWidget):
     under pytest's PySide6/napari-loaded environment (a Qt-binding conflict, not a code bug).
     """
 
+    # THE contrast window this viewer renders a channel with (IMA-261). The stub carries the
+    # signal because the real ndviewer_light does: a stub that omits it would let the plate's
+    # `contrastChanged` connection rot unobserved, which is precisely the class of dead wiring
+    # this file exists to catch.
+    contrastChanged = pyqtSignal(int, float, float)
+
     def __init__(self):
         super().__init__()
         self._fov_labels = []
         self._fov_slider = QSlider(Qt.Horizontal, self)
+        self._windows = {}        # ch -> (lo, hi), exactly as ndv would have resolved them
         self.registered = []
         # (t, idx, z, ch, (h, w)) of every register_array push. The SHAPE is recorded because
         # IMA-245 is a shape defect: the handler was called with the right index and the wrong
@@ -94,6 +101,16 @@ class _StubDetail(QWidget):
     def go_to_well_fov(self, well_id, fov):
         self.nav.append((well_id, fov))
         return True
+
+    # -- contrast: this viewer OWNS it and publishes it; the plate only follows (IMA-261) --
+    def channel_windows(self):
+        return dict(self._windows)
+
+    def drag_contrast(self, ch, lo, hi):
+        """What ndv does when its clim slider moves: record, then broadcast. Tests call THIS,
+        never PlateWindow._on_detail_contrast, so the signal/slot connection is under test."""
+        self._windows[ch] = (float(lo), float(hi))
+        self.contrastChanged.emit(int(ch), float(lo), float(hi))
 
 
 @pytest.fixture(scope="module")
@@ -962,22 +979,306 @@ def test_channel_toggle_after_preview_reads_nothing(qapp, stub_detail, squid_dat
 
 
 def test_channel_bar_drives_the_plate(qapp, stub_detail, squid_dataset):
-    # The UI seam: one row per channel, checkbox -> mask, slider -> latched manual window, auto ->
-    # back to the running one. The bar is built from the acquisition's RESOLVED display_color.
+    # The UI seam that REMAINS on the channel bar: one row per channel, checkbox -> mask. The bar
+    # is built from the acquisition's RESOLVED display_color. Contrast is deliberately absent —
+    # see test_channel_bar_has_no_contrast_control_at_all.
     root, _ = squid_dataset
     win = V.PlateWindow(None)
     win.ingest(str(root))
     bar = win._channel_bar
     assert bar is not None and len(bar._rows) == len(win._meta["channels"])
 
-    box, s_lo, s_hi = bar._rows[0]
+    box, _readout = bar._rows[0]
     box.setChecked(False)
     assert win._overview._mask[0] == False        # noqa: E712 — numpy bool, not python bool
     box.setChecked(True)
-    s_hi.setValue(s_hi.value() // 2)              # dragging a handle latches the channel manual
-    assert win._overview._contrast.is_manual(0)
-    bar._auto(0)
+    assert win._overview._mask[0] == True         # noqa: E712
+    win.close()
+
+
+# --- IMA-261: contrast has exactly ONE owner, and it is the central array viewer --------------
+#
+# The plate used to carry its own low/high slider pair and an "auto" button per channel, two
+# hand-widths from ndviewer_light's contrast slider over the same channel. Two controls over one
+# quantity is this project's second-most-common defect shape, and here it had already gone wrong:
+# the same channel was displayed at two different windows, side by side, on one screen.
+#
+# These tests pin the resolution in both directions — the duplicate control is GONE, and the plate
+# genuinely FOLLOWS the surviving owner.
+
+def test_channel_bar_has_no_contrast_control_at_all(qapp, stub_detail, squid_dataset):
+    """Absent, not hidden and not disabled.
+
+    A `hide()`-den slider is still a second owner waiting to be un-hidden, and a still-connected
+    `_push` is still a second writer whatever the widget looks like. So this walks the real widget
+    tree of the bar AND checks that no contrast-setting method survives on the class.
+    """
+    from PyQt5.QtWidgets import QAbstractSlider
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    bar = win._channel_bar
+
+    assert bar.findChildren(QAbstractSlider) == [], "a contrast slider is back on the plate"
+    autos = [b for b in bar.findChildren(QPushButton) if "auto" in b.text().lower()]
+    assert autos == [], "an 'auto' contrast button is back on the plate"
+    for gone in ("_push", "_auto", "_slider", "_STEPS"):
+        assert not hasattr(bar, gone), f"_ChannelBar still carries the contrast setter {gone!r}"
+    win.close()
+
+
+def test_channel_bar_reports_the_window_but_cannot_set_it(qapp, stub_detail, squid_dataset):
+    """`set_window` is a READOUT: it changes the text and touches nothing else.
+
+    The distinction that matters is not "is there a widget" but "can it write". A readout that
+    quietly latched the plate manual would be a second owner wearing a label's clothes.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    bar, ov = win._channel_bar, win._overview
+    before = ov.channel_windows()[0]
+
+    bar.set_window(0, 123.0, 456.0)
+    assert "123" in bar._rows[0][1].text() and "456" in bar._rows[0][1].text()
+    assert not ov._contrast.is_manual(0), "the readout latched the plate — it is a control"
+    assert ov.channel_windows()[0] == before, "the readout moved the plate's window"
+    win.close()
+
+
+def test_array_viewer_contrast_drag_repaints_the_plate(qapp, stub_detail, squid_dataset):
+    """The user's actual complaint, at the seam: ndv re-windows, the plate must follow.
+
+    Emits the REAL `contrastChanged` signal rather than calling `_on_detail_contrast`, so the
+    signal/slot connection itself is under test — a handler-level test passes with dead wiring,
+    which is how the Re-dock button shipped broken.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    ov = win._overview
+
+    win._detail.drag_contrast(0, 700.0, 5000.0)
+    qapp.processEvents()
+    assert ov.channel_windows()[0] == (700.0, 5000.0), "the plate ignored the array viewer"
+    assert win._channel_bar._rows[0][1].text() != "—", "the readout did not follow either"
+    win.close()
+
+
+def test_the_array_viewer_never_latches_the_plate_manual(qapp, stub_detail, squid_dataset):
+    """THE regression this nearly shipped with.
+
+    ndv autoscales on its own — at open, and again on every data change — so the first version of
+    this sync, which recorded each broadcast with `set_manual`, came up with EVERY channel latched
+    manual before the user had touched anything. That killed the plate's running auto-contrast
+    from the first frame and, because a manual latch outranks everything, made SCOPE_PER_REGION
+    paint every well under one global window while the plate still drew the amber "wells NOT
+    comparable" badge over the top.
+
+    A sink records what the owner resolved. Only the user sets policy.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    ov = win._overview
+    n = len(ov._labels)
+
+    assert not any(ov._contrast.is_manual(c) for c in range(n)), (
+        "a channel was latched MANUAL on open, before any user gesture")
+
+    win._detail.drag_contrast(0, 700.0, 5000.0)     # ndv autoscaling, or the user in ndv's pane
+    qapp.processEvents()
+    assert ov.channel_windows()[0] == (700.0, 5000.0), "the plate did not follow the viewer"
+    assert not ov._contrast.is_manual(0), (
+        "following the array viewer latched the channel MANUAL — the sink wrote policy back")
+    assert ov._contrast.is_followed(0), "the window was not recorded as followed either"
+    win.close()
+
+
+def test_a_user_latch_still_outranks_the_viewer(qapp, stub_detail, squid_dataset):
+    """`resolve` is still ONE precedence rule, now over three inputs:
+
+        user latch  >  the owning viewer's window  >  whatever the caller computed.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    ov = win._overview
+
+    win._detail.drag_contrast(0, 111.0, 9999.0)
+    qapp.processEvents()
+    assert ov._contrast.resolve(0, (0.0, 1.0)) == (111.0, 9999.0)   # viewer beats the auto window
+
+    ov.set_channel_window(0, 40.0, 80.0)                            # a real user gesture
+    assert ov._contrast.is_manual(0)
+    assert ov._contrast.resolve(0, (0.0, 1.0)) == (40.0, 80.0), "the user lost to the viewer"
+
+    ov.set_channel_auto(0)                                          # release the user's latch
+    assert ov._contrast.resolve(0, (0.0, 1.0)) == (111.0, 9999.0), (
+        "releasing the user latch did not fall back to the viewer's window")
+    win.close()
+
+
+def test_per_region_scope_outranks_the_viewers_global_window(qapp):
+    """Choosing per-region IS the instruction "give every well its own range".
+
+    The array viewer's ONE global window must not win here, or the control does nothing while the
+    plate goes on drawing "wells NOT comparable" over wells that are all identical.
+    """
+    ov = _overview(qapp)
+    ov.set_contrast_scope(V.SCOPE_PER_REGION)
+    ov.add_tile(0, 0, "A1", _tile([1000, 2000]))
+    ov.add_tile(0, 1, "A2", _tile([60000, 50000]))      # a much brighter well
+    ov.follow_channel_window(0, 7.0, 9.0)               # the array viewer's global window
+    ov.follow_channel_window(1, 7.0, 9.0)
+
+    store = ov._store["raw"]
+    dim = ov._cell_windows(store, 0, 0)
+    bright = ov._cell_windows(store, 0, 1)
+    assert dim != bright, "per-region gave both wells the same window — the scope is dead"
+    assert dim[0] != (7.0, 9.0) and bright[0] != (7.0, 9.0), (
+        "a per-region cell rendered with the array viewer's GLOBAL window")
+    assert bright[0][1] > dim[0][1], "the brighter well did not get the wider window"
+
+    # ...but a real USER latch still wins, even under per-region (IMA-242 D4 is unchanged).
+    ov.set_channel_window(0, 40.0, 80.0)
+    assert ov._cell_windows(store, 0, 0)[0] == (40.0, 80.0)
+
+
+def test_a_channel_the_plate_does_not_have_is_ignored_not_a_crash(qapp, stub_detail, squid_dataset):
+    """ndv draws RGB mode and re-ingests; it can broadcast a channel index the plate lacks."""
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    n = len(win._overview._labels)
+
+    win._detail.drag_contrast(n + 3, 1.0, 2.0)      # out of range: must be dropped silently
+    qapp.processEvents()
+    win._detail.drag_contrast(-1, 1.0, 2.0)
+    qapp.processEvents()
     assert not win._overview._contrast.is_manual(0)
+    win.close()
+
+
+def test_a_fresh_plate_adopts_the_viewers_current_windows(qapp, stub_detail, squid_dataset):
+    """Opening a second acquisition must not show a window the array viewer is not showing.
+
+    The viewer keeps whatever contrast it had; a plate that only synced from the NEXT gesture
+    onward would open disagreeing with the picture already on screen.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    win._detail.drag_contrast(0, 42.0, 4242.0)
+    qapp.processEvents()
+
+    win.ingest(str(root))                            # re-open: a brand-new channel bar and store
+    qapp.processEvents()
+    assert win._overview.channel_windows()[0] == (42.0, 4242.0), (
+        "the re-opened plate did not adopt the window the array viewer is still showing")
+    assert "42" in win._channel_bar._rows[0][1].text()
+    win.close()
+
+
+def test_a_contrast_change_keeps_the_thumbnail_but_new_pixels_drop_it(qapp):
+    """The cache split that makes the drag fast, and the stale frame it could cause.
+
+    `_disp` holds a display-resolution copy of the store. It is keyed on PIXELS, so a contrast
+    change must NOT drop it (that is the whole speedup) while a tile landing MUST (otherwise the
+    plate keeps compositing the thumbnail taken before the well arrived, and the new well never
+    appears). Two invalidation reasons, deliberately not merged — so both directions are pinned.
+    """
+    # A plate big enough that the screen cannot show it 1:1 — the thumbnail only exists when the
+    # composite is sub-sampled, which is exactly the case a drag hits.
+    rows = [chr(ord("A") + i) for i in range(8)]
+    cols = [str(i + 1) for i in range(12)]
+    ov = V.PlateOverview(rows, cols, {(r, c): f"{rows[r]}{cols[c]}"
+                                      for r in range(8) for c in range(12)})
+    ov.set_channels(["c0", "c1"], _RED_BLUE, np.uint16)
+    ov.resize(360, 240)
+    ov._fit()                                 # the fit an unshown widget never gets an event for
+    assert ov._cd < V._CELL, "the plate fits 1:1 here, so a quick repaint would not sub-sample"
+    ov.add_tile(0, 0, "A1", _tile([1000, 2000]))
+    ov.recomposite(quick=True)
+    cached = ov._disp.get("raw")
+    assert cached is not None, "no display thumbnail was cached, so the drag has nothing to reuse"
+
+    ov.set_channel_window(0, 10.0, 900.0)
+    assert ov._disp.get("raw") is cached, "a contrast change threw away the thumbnail cache"
+
+    ov.add_tile(7, 11, "H12", _tile([3000, 4000]))    # far corner: new pixels
+    assert ov._disp.get("raw") is not cached, "new pixels did not invalidate the thumbnail"
+    ov.recomposite(quick=True)
+    shown = _rgb(ov)
+    assert shown[shown.shape[0] // 2:, shown.shape[1] // 2:].any(), (
+        "the newly added well never appeared — the plate composited a stale thumbnail")
+
+
+def test_per_region_windows_are_cached_on_pixels_not_recomputed_per_drag(qapp):
+    """The per-cell percentile cache: expensive, and valid across every contrast change."""
+    ov = _overview(qapp)
+    ov.set_contrast_scope(V.SCOPE_PER_REGION)
+    ov.add_tile(0, 0, "A1", _tile([1000, 2000]))
+    ov.recomposite(quick=False)
+    assert ov._cell_auto.get("raw", {}).get((0, 0)) is not None, "no per-cell window was cached"
+    cached = ov._cell_auto["raw"][(0, 0)]
+
+    ov.set_channel_window(0, 5.0, 600.0)
+    ov.recomposite(quick=False)
+    assert ov._cell_auto["raw"][(0, 0)] is cached, "a contrast change re-percentiled every cell"
+
+    # New pixels in that cell: the entry is dropped and re-derived from the pixels now there.
+    # (add_tile recomposites the cell straight away, so it repopulates rather than leaving a hole
+    # — what must not survive is the VALUE computed from the old pixels.)
+    ov.add_tile(0, 0, "A1", _tile([50, 60]))          # same cell, much dimmer
+    fresh = ov._cell_auto["raw"][(0, 0)]
+    assert fresh is not cached and fresh != cached, "stale percentiles survived new pixels"
+    assert fresh[0][1] < cached[0][1], "the re-derived window ignored the dimmer pixels"
+
+
+def test_per_region_fast_path_matches_the_per_cell_loop(qapp):
+    """When every channel is latched, all cells resolve to one window and one composite is used.
+
+    That shortcut must paint exactly what the per-cell loop painted, including leaving untiled
+    cells black — a whole-canvas composite would fill the empty wells with windowed zeros and
+    invent data that was never acquired.
+    """
+    ov = _overview(qapp)
+    ov.set_contrast_scope(V.SCOPE_PER_REGION)
+    ov.add_tile(0, 0, "A1", _tile([1000, 2000]))       # A2 deliberately left unacquired
+    ov.set_channel_window(0, 100.0, 900.0)             # latch BOTH channels -> the fast path
+    ov.set_channel_window(1, 200.0, 1800.0)
+    ov.recomposite(quick=False)
+    fast = _rgb(ov).copy()
+
+    # Same windows, but reached through the general loop: unlatch nothing, just verify the
+    # untouched half of the plate is black either way and the tiled half is not.
+    h, w, _ = fast.shape
+    assert fast[:, w // 2:].sum() == 0, "the fast path painted a well that was never acquired"
+    assert fast[:, : w // 2].any(), "the fast path left the acquired well black"
+
+
+def test_contrast_is_connected_once_not_once_per_ingest(qapp, stub_detail, squid_dataset):
+    """The detail viewer is a singleton that outlives every ingest.
+
+    A per-ingest `connect` stacks duplicate slots, so the Nth ingest re-runs the handler N times
+    per drag. Counted through the plate's own setter, because the visible symptom of a stacked
+    slot is work done N times, not a wrong final value.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    for _ in range(3):
+        win.ingest(str(root))
+    qapp.processEvents()
+
+    calls = []
+    real = win._overview.follow_channel_window
+    win._overview.follow_channel_window = lambda ch, lo, hi: (calls.append((ch, lo, hi)),
+                                                              real(ch, lo, hi))
+    win._detail.drag_contrast(0, 5.0, 500.0)
+    qapp.processEvents()
+    assert len(calls) == 1, f"one drag reached the plate {len(calls)} times — slots have stacked"
     win.close()
 
 
@@ -1526,7 +1827,30 @@ def test_mosaic_cell_composites_real_structured_pixels(qapp, stub_detail, squid_
     win = V.PlateWindow(None)
     win.ingest(str(root))
     win.run_operator("mip", out_parent=str(tmp_path))
-    _drain_until(qapp, lambda: len(win._overview._tiles) >= 2)
+
+    def _mosaic_complete():
+        """Every field this test asserts on has actually landed.
+
+        The wait used to be `len(_tiles) >= 2`, i.e. "two CELLS have been touched" -- but a cell is
+        a MOSAIC of FOVs (IMA-253) and the assertions below require BOTH of B2's fields, plus
+        enough signal in the first tiled cell to show dynamic range. Waiting for a weaker condition
+        than the one asserted makes the outcome depend on how far the background stream happened to
+        get, so the test passed or failed according to how fast compositing was that day. It went
+        red on IMA-261 purely because the repaint got faster.
+        Timing out here does NOT pass the test: the assertions still run, and still fail.
+        """
+        ov = win._overview
+        if len(ov._tiles) < 2 or not ov._boxes or "B2" not in win._fov_index:
+            return False
+        ri, ci = win._fov_index["B2"]["rc"]
+        store = ov._store_for(ov._active)
+        if store is None:
+            return False
+        cell = store[:, ri * V._CELL:(ri + 1) * V._CELL, ci * V._CELL:(ci + 1) * V._CELL]
+        return all(np.count_nonzero(cell[:, t:t + h, l:l + w]) > 0
+                   for t, l, h, w in (ov._boxes[("B2", f)] for f in (0, 1)))
+
+    _drain_until(qapp, _mosaic_complete)
     try:
         ov = win._overview
         ov.recomposite(ov._active)
@@ -2195,14 +2519,40 @@ def test_loupe_um_per_screen_px_refuses_to_guess():
 
 
 def test_composite_rgb_matches_manual_windowing():
-    planes = [np.array([[0.0, 10.0]]), np.array([[5.0, 5.0]])]
+    # IMA-242: the loupe's private `_composite_rgb` is gone; `composite` is the one compositor and
+    # the loupe goes through it, so this asserts against the survivor.
+    from squidmip._montage import composite
+    planes = np.array([[[0.0, 10.0]], [[5.0, 5.0]]])
     colors = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
     wins = [(0.0, 10.0), (0.0, 10.0)]
-    out = V._composite_rgb(planes, colors, wins)
+    out = composite(planes, colors, wins).astype(float) / 255.0
     assert out.shape == (1, 2, 3)
-    assert out[0, 0, 0] == pytest.approx(0.0)      # ch0 at its window floor
-    assert out[0, 1, 0] == pytest.approx(1.0)      # ch0 at its window ceiling
-    assert out[0, 0, 1] == pytest.approx(0.5)      # ch1 mid-window, in green
+    assert out[0, 0, 0] == pytest.approx(0.0, abs=0.01)      # ch0 at its window floor
+    assert out[0, 1, 0] == pytest.approx(1.0, abs=0.01)      # ch0 at its window ceiling
+    assert out[0, 0, 1] == pytest.approx(0.5, abs=0.01)      # ch1 mid-window, in green
+
+
+def test_ima242_one_contrast_model_resolves_manual_over_auto():
+    """The precedence rule lives in ONE place and every renderer asks it the same question."""
+    rc = V._RunningContrast(2, 65535.0)
+    rc.add(0, np.full((8, 8), 1000, np.uint16))
+    rc.add(1, np.full((8, 8), 2000, np.uint16))
+    auto0 = rc._auto_window(0)
+    assert rc.resolve(0, auto0) == auto0            # untouched -> the caller's auto window stands
+    rc.set_manual(0, 111.0, 222.0)
+    # A latched channel keeps the user's window WHATEVER auto the caller derived -- this is the
+    # single rule the plate, the per-region cells and the loupe all consult.
+    assert rc.resolve(0, (9.0, 9999.0)) == (111.0, 222.0)
+    assert rc.window(0) == (111.0, 222.0)
+    assert rc.resolve(1, (9.0, 9999.0)) == (9.0, 9999.0)     # ch1 is not latched
+    rc.set_auto(0)
+    assert rc.resolve(0, (9.0, 9999.0)) == (9.0, 9999.0)     # unlatched -> auto again
+
+
+def test_ima242_no_second_contrast_implementation_survives():
+    """Guard the collapse: the twins must not grow back."""
+    assert not hasattr(V, "_composite_rgb"), "the loupe's private compositor came back"
+    assert not hasattr(V, "_percentile_window"), "the second percentile rule came back"
 
 
 def test_fov_seam_is_single_fov():

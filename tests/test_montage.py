@@ -15,7 +15,9 @@ import numpy as np
 import pytest
 
 from squidmip import build_montage
-from squidmip._montage import _area_downsample, _channel_slug, _hex_to_rgb01, _window, composite
+from squidmip._montage import (
+    _area_downsample, _channel_slug, _hex_to_rgb01, _window, _window_lut, composite,
+)
 from squidmip._output import write_from_stream
 
 # Two channels: red (638) and blue (405), so composite color is unambiguous per channel.
@@ -113,6 +115,113 @@ def test_composite_applies_a_distinct_window_per_channel():
     out = composite(store, colors, [(0.0, 50.0), (0.0, 500.0)])
     assert out[0, 0, 0] == 255                 # channel 0 saturates at its window
     assert 0 < out[0, 0, 2] < 255              # channel 1 sits low in its much wider window
+
+
+# --- IMA-261: the fast contrast path must be the SAME function, not merely a close one --------
+#
+# Making a contrast drag interactive rested on three equalities. Each one is an opportunity to
+# ship a subtly different picture at 100 fps, so each is pinned here rather than argued in a
+# docstring. The project has already shipped two compositors whose percentile rules had drifted
+# apart, one of them clipping a blank channel to full white so it read as signal — "it looks the
+# same" is exactly the evidence that failed then.
+
+def test_window_lut_is_the_window_function_over_the_ENTIRE_uint16_alphabet():
+    """Not a sample of values: all 65536. The table IS `_window` memoised, or it is a bug."""
+    alphabet = np.arange(1 << 16, dtype=np.uint16)
+    for lo, hi in [(0.0, 65535.0), (321.0, 8765.0), (1000.0, 1001.0), (60000.0, 65535.0)]:
+        table = _window_lut(np.dtype(np.uint16), lo, hi)
+        assert table is not None and table.shape == (1 << 16,)
+        np.testing.assert_array_equal(table, _window(alphabet, lo, hi))
+
+
+def test_window_lut_covers_uint8_and_declines_the_dtypes_it_cannot_tabulate():
+    # uint8's domain is finite too. float/int32 are not (or are 4 G entries) — None means
+    # "fall back to elementwise", which is the same function evaluated a different way.
+    assert _window_lut(np.dtype(np.uint8), 0.0, 255.0).shape == (256,)
+    for dt in (np.float32, np.float64, np.int16, np.uint32, np.int32):
+        assert _window_lut(np.dtype(dt), 0.0, 100.0) is None
+
+
+def test_window_lut_handles_the_degenerate_window_like_window_does():
+    # lo == hi is the blank-channel case that has bitten this codebase before: it must go to
+    # zero (black), never to a divide-by-zero or a saturated white.
+    table = _window_lut(np.dtype(np.uint16), 500.0, 500.0)
+    assert table is not None and np.all(table == 0.0)
+
+
+def test_composite_lut_path_is_byte_identical_to_the_elementwise_path():
+    """A uint16 store takes the table; the identical values as float32 do not. Same picture."""
+    rng = np.random.default_rng(261)
+    vals = rng.integers(0, 65535, size=(3, 37, 53))
+    colors = np.stack([_hex_to_rgb01(c) for c in ("#FF0000", "#00FF00", "#0000FF")])
+    windows = [(120.0, 40000.0), (0.0, 65535.0), (900.0, 3000.0)]
+    lut_path = composite(vals.astype(np.uint16), colors, windows)          # table lookup
+    elementwise = composite(vals.astype(np.float32), colors, windows)      # per pixel
+    np.testing.assert_array_equal(lut_path, elementwise)
+
+
+def test_composite_commutes_with_subsampling():
+    """The claim that lets a drag composite a thumbnail instead of the whole plate.
+
+    A contrast window is a POINT transform, so windowing the subsampled store must be bit-identical
+    to windowing the whole store and subsampling afterwards. If this ever stops holding, the plate
+    shows one picture while it is being dragged and a different one when it settles.
+    """
+    rng = np.random.default_rng(7)
+    store = rng.integers(0, 65535, size=(2, 64, 96)).astype(np.uint16)
+    colors = np.stack([_hex_to_rgb01("#FF0000"), _hex_to_rgb01("#0000FF")])
+    windows = [(100.0, 50000.0), (0.0, 20000.0)]
+    full = composite(store, colors, windows)
+    for step in (2, 3, 4, 5):
+        sub = composite(np.ascontiguousarray(store[:, ::step, ::step]), colors, windows)
+        np.testing.assert_array_equal(sub, full[::step, ::step])
+
+
+def test_composite_banding_does_not_change_a_single_pixel(monkeypatch):
+    """Banded (threaded) compositing must be a pure optimisation.
+
+    Bands write disjoint row slices, so the result must equal the single-band result exactly —
+    including at the band seams, which is where an off-by-one in the row split would show and
+    where a visual check would never look.
+    """
+    import squidmip._montage as M
+    rng = np.random.default_rng(99)
+    store = rng.integers(0, 65535, size=(4, 101, 67)).astype(np.uint16)   # prime-ish, uneven split
+    colors = np.stack([_hex_to_rgb01(c) for c in ("#FF0000", "#00FF00", "#0000FF", "#FFFFFF")])
+    windows = [(0.0, 65535.0), (10.0, 30000.0), (5.0, 60000.0), (1.0, 2.0)]
+
+    monkeypatch.setattr(M, "_COMPOSITE_MIN_PX_PER_BAND", 10 ** 12)        # force exactly one band
+    one = M.composite(store, colors, windows)
+    monkeypatch.setattr(M, "_COMPOSITE_MIN_PX_PER_BAND", 1)               # force as many as allowed
+    many = M.composite(store, colors, windows)
+    np.testing.assert_array_equal(one, many)
+
+
+def test_composite_banding_still_honours_the_channel_mask(monkeypatch):
+    # A masked channel contributes nothing in EVERY band — a band that forgot the mask would
+    # paint a stripe of an off channel back in.
+    import squidmip._montage as M
+    store = np.full((2, 80, 40), 40000, np.uint16)
+    colors = np.stack([_hex_to_rgb01("#FF0000"), _hex_to_rgb01("#0000FF")])
+    monkeypatch.setattr(M, "_COMPOSITE_MIN_PX_PER_BAND", 1)
+    out = M.composite(store, colors, [(0.0, 65535.0)] * 2, mask=np.array([True, False]))
+    assert (out[:, :, 2] == 0).all() and (out[:, :, 0] > 0).all()
+
+
+def test_composite_of_an_empty_store_is_empty_not_a_crash():
+    # A layer allocated before any tile has landed has a zero dimension; banding divides by the
+    # row count, so this is the shape that would raise rather than render.
+    colors = np.stack([_hex_to_rgb01("#FF0000")])
+    out = composite(np.zeros((1, 0, 5), np.uint16), colors, [(0.0, 1.0)])
+    assert out.shape == (0, 5, 3) and out.dtype == np.uint8
+
+
+def test_window_lut_cache_is_bounded():
+    """A continuous drag mints a new (lo, hi) every tick; an unbounded cache is a slow leak."""
+    import squidmip._montage as M
+    for i in range(M._LUT_CACHE_MAX * 3):
+        _window_lut(np.dtype(np.uint16), float(i), float(i + 1000))
+    assert len(M._LUT_CACHE) <= M._LUT_CACHE_MAX
 
 
 def test_channel_slug_is_filename_safe():

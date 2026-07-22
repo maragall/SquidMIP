@@ -821,7 +821,10 @@ class _RunningContrast:
     def __init__(self, n_ch: int, dmax: float, pct=(1.0, 99.8), bins=512):
         self._bins, self._dmax, self._pct = bins, max(1.0, float(dmax)), pct
         self._hist = [np.zeros(bins, dtype=np.int64) for _ in range(n_ch)]
-        self._manual: dict[int, tuple[float, float]] = {}   # ch -> the window the user latched
+        self._manual: dict[int, tuple[float, float]] = {}   # ch -> the window the USER latched
+        # ch -> the window the OWNING VIEWER (ndviewer_light) resolved and is rendering with.
+        # Deliberately NOT the same dict as _manual: see set_followed.
+        self._followed: dict[int, tuple[float, float]] = {}
 
     @property
     def dmax(self) -> float:
@@ -840,15 +843,72 @@ class _RunningContrast:
         self._manual.pop(ch, None)
 
     def is_manual(self, ch: int) -> bool:
+        """Did the USER latch this channel? Never true merely because the viewer autoscaled."""
         return ch in self._manual
 
-    def window(self, ch: int) -> tuple[float, float]:
-        """(lo, hi) for this channel. A DEGENERATE window (hi <= lo) is returned DELIBERATELY when
-        both percentiles land in the same bin — ``_window``'s ``span <= 0`` guard renders that
-        black, which is the honest answer when there is no contrast.
+    def set_followed(self, ch: int, lo: float, hi: float):
+        """Record the window the OWNING VIEWER resolved for *ch* (IMA-261).
+
+        THIS IS NOT A LATCH, AND THE DISTINCTION IS THE WHOLE POINT
+        ------------------------------------------------------------
+        The first version of this recorded ndv's window by calling ``set_manual``, which read as
+        "the user has taken manual control of this channel". It was wrong twice over, and both
+        showed on screen:
+
+          * ndv autoscales on its own, at open, before the user has touched anything — so every
+            channel came up latched MANUAL and the plate's running histogram was permanently
+            overridden. Auto-contrast was dead from the first frame.
+          * ``resolve`` puts a manual latch above everything, so under SCOPE_PER_REGION every cell
+            resolved to ndv's one global window. All 1536 wells were painted identically while the
+            plate still drew the amber "wells NOT comparable" badge over the top. The control did
+            nothing and the caveat was a lie.
+
+        A followed window is a SINK recording what the owner is showing. A manual latch is a
+        POLICY decision, and only the user makes it — the sink never writes policy back into the
+        model. Same numbers, different authority, and the authority is what ``resolve`` reads.
         """
-        if ch in self._manual:      # latched: the user owns this channel's window (D4)
+        self._followed[ch] = (float(lo), float(max(hi, lo + 1)))
+
+    def clear_followed(self, ch: int):
+        self._followed.pop(ch, None)
+
+    def is_followed(self, ch: int) -> bool:
+        return ch in self._followed
+
+    def resolve(self, ch: int, auto: tuple[float, float],
+                follow: bool = True) -> tuple[float, float]:
+        """THE precedence rule, in one place (IMA-242, extended by IMA-261).
+
+            user latch  >  the owning viewer's window  >  whatever the caller computed
+
+        Every renderer derives its own *auto* window legitimately — the plate from the running
+        histogram, a per-region cell from exact percentiles over that cell, the loupe from a
+        well's coarse plane. What they must NOT each decide for themselves is whether the user's
+        gesture outranks that, because a renderer that forgets to ask is a renderer where the
+        control silently does nothing. One rule, one place, three callers.
+
+        *follow* is how a caller says "I am not rendering the viewer's global view". Only
+        SCOPE_PER_REGION passes False, and it means exactly what the user asked for by choosing
+        per-region: derive this cell's window from this cell's pixels. A user's explicit latch
+        still wins even then — that is a decision about the channel, not about the scope.
+        """
+        if ch in self._manual:
             return self._manual[ch]
+        if follow and ch in self._followed:
+            return self._followed[ch]
+        return auto
+
+    def window(self, ch: int) -> tuple[float, float]:
+        """(lo, hi) for this channel: user latch, else the viewer's, else the running histogram."""
+        return self.resolve(ch, self._auto_window(ch))
+
+    def _auto_window(self, ch: int) -> tuple[float, float]:
+        """The running histogram's window for *ch*, ignoring any latch.
+
+        A DEGENERATE window (hi <= lo) is returned DELIBERATELY when both percentiles land in the
+        same bin — ``_window``'s ``span <= 0`` guard renders that black, which is the honest
+        answer when there is no contrast.
+        """
         h = self._hist[ch]
         tot = h.sum()
         if tot == 0:
@@ -1059,27 +1119,20 @@ def _fmt_um(v: float) -> str:
     return f"{v:g} µm" if v >= 1 else f"{v * 1000:g} nm"
 
 
-def _composite_rgb(planes, colors, windows) -> np.ndarray:
-    """(C, y, x) planes -> (y, x, 3) float RGB in [0, 1], one window per channel.
-
-    The single definition of "channels to colour" for the viewer. Windowing stays with the
-    caller: the plate's three renderers legitimately source their window differently (streaming
-    running-contrast, per-well percentiles, the loupe mirroring a tile's window), and folding
-    that in here would force a policy where there isn't one."""
-    out = None
-    for c_i, plane in enumerate(planes):
-        lo, hi = windows[c_i]
-        contrib = _window(plane, lo, hi if hi > lo else lo + 1)[:, :, None] * colors[c_i][None, None, :]
-        out = contrib if out is None else out + contrib
-    if out is None:
-        return np.zeros((1, 1, 3), np.float32)
-    return np.clip(out, 0, 1)
-
-
-def _percentile_window(plane, pct=(1.0, 99.8)) -> tuple[float, float]:
-    """The plate's per-well contrast rule, in one place (mirrors _ComputedPlateWorker)."""
-    lo, hi = float(np.percentile(plane, pct[0])), float(np.percentile(plane, pct[1]))
-    return lo, hi if hi > lo else lo + 1
+# IMA-242: `_composite_rgb` and `_percentile_window` used to live here — a second compositor and a
+# second percentile rule, each a hand-synced twin of `composite` and `_pct_window`. They had drifted
+# apart in exactly the way that shape always drifts:
+#
+#   * `_percentile_window` widened a degenerate window to (lo, lo + 1); `_pct_window` deliberately
+#     does NOT, because +1 is one DATA unit and (v - lo)/1 clips to 1.0 — a blank or saturated
+#     channel rendered FULL WHITE and read as signal. The loupe had the bug the plate had fixed.
+#   * `_composite_rgb` took no channel mask, so unticking a channel removed it from the plate and
+#     left it in the loupe.
+#   * Neither consulted the manual latch, so dragging a contrast slider moved the plate and left
+#     the loupe showing the old window forever.
+#
+# Both are now gone. `composite` is the one compositor, `_pct_window` the one percentile rule, and
+# `_RunningContrast.resolve` the one place the manual-outranks-auto precedence is decided.
 
 
 _LOUPE_WIN_LOCK = threading.Lock()   # guards the per-source window memo (worker thread writes)
@@ -1124,7 +1177,7 @@ class _LoupeSource:
         if hit is not None:
             return hit
         coarse = self.coarse(well_id)
-        win = [_percentile_window(coarse[c]) for c in range(coarse.shape[0])]
+        win = [_pct_window(coarse[c]) for c in range(coarse.shape[0])]
         with _LOUPE_WIN_LOCK:
             cache[well_id] = win
         return win
@@ -1416,6 +1469,16 @@ class PlateOverview(QWidget):
         self._colors = None               # (C, 3) float RGB, the RESOLVED display_color per channel
         self._dtype = np.uint16           # store dtype: the acquisition's native dtype (half the RAM)
         self._store: dict[str, np.ndarray] = {}   # layer -> (C, nr*_CELL, nc*_CELL), allocated lazily
+        # --- what a contrast change is allowed to touch (IMA-261) ------------------------------
+        # A contrast window is a POINT transform, so it commutes with subsampling: windowing the
+        # display-sized thumbnail is bit-identical to windowing the whole plate and subsampling
+        # afterwards (see squidmip._montage._window_lut). The only thing that must be re-derived
+        # per tick is therefore the composite of the DISPLAY-SIZED buffer. These two caches hold
+        # everything upstream of that, so a drag re-reads no store and re-percentiles nothing:
+        self._disp: dict[str, tuple] = {}      # layer -> (step, contiguous (C, h, w) thumbnail)
+        self._cell_auto: dict[str, dict] = {}  # layer -> {(ri, ci): [per-channel AUTO window]}
+        #                                        SCOPE_PER_REGION's exact percentiles, which depend
+        #                                        on the PIXELS only — never on the contrast.
         self._mask = None                 # (C,) bool: which channels composite into the plate
         self._contrast = None             # _RunningContrast: global per-channel window + auto/manual
         self._scope = SCOPE_GLOBAL        # contrast scope (IMA-207): a DISPLAY control. A flip
@@ -1565,15 +1628,26 @@ class PlateOverview(QWidget):
         # Mirror the TILE's contrast rule on the WELL's pixels (computed by the source, per well)
         # — never percentiles of the crop under the cursor, which would make brightness lurch as
         # the cursor moves and make the inset look like different data.
-        win = window if window is not None else self._loupe_win.get(well_id)
-        if win is None:
-            win = [(0.0, 1.0)] * crop.shape[0]
-        self._loupe_win[well_id] = win
+        #
+        # That AUTO window is then resolved through the plate's one contrast model (IMA-242), so a
+        # channel the user latched with the slider shows the user's window here too. Before, the
+        # loupe kept its own memo and the inset went on displaying the pre-drag contrast — two
+        # representations of one truth, never synced.
+        auto = window if window is not None else self._loupe_win.get(well_id)
+        if auto is None:
+            auto = [(0.0, 1.0)] * crop.shape[0]
+        self._loupe_win[well_id] = auto              # memo the AUTO window, never the resolved one
+        win = ([self._contrast.resolve(c, auto[c]) for c in range(len(auto))]
+               if self._contrast is not None else list(auto))
         colors = self._loupe_colors
         if colors is None:
             colors = np.ones((crop.shape[0], 3), np.float32)
-        rgb = (_composite_rgb([crop[c].astype(np.float32) for c in range(crop.shape[0])],
-                              colors, win) * 255).astype(np.uint8)
+        # The same compositor the plate uses, with the same channel mask: unticking a channel must
+        # remove it from the inset as well, or the loupe contradicts the plate it sits on top of.
+        planes = np.stack([crop[c].astype(np.float32) for c in range(crop.shape[0])])
+        mask = self._mask if (self._mask is not None
+                              and len(self._mask) == crop.shape[0]) else None
+        rgb = composite(planes, colors, win, mask)
         rgb = np.ascontiguousarray(rgb)
         h, w = rgb.shape[:2]
         img = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()   # copy: rgb is transient
@@ -1658,22 +1732,84 @@ class PlateOverview(QWidget):
         self.recomposite(self._active)
         return True
 
-    def _cell_windows(self, store: np.ndarray, ri: int, ci: int) -> list:
+    def _invalidate_pixels(self, layer: str, rc=None):
+        """The layer's STORE changed. Drop everything derived from its pixels.
+
+        Called from the one place that writes pixels (``add_tile``) and from ``reset_layer``.
+        These caches are keyed on PIXELS alone, so a contrast change must never come through
+        here — keeping the two invalidations apart is what lets a drag re-read nothing.
+
+        *rc* narrows the per-cell percentile drop to the one cell that was written; the display
+        thumbnail is a whole-plate copy, so it always goes.
+        """
+        self._disp.pop(layer, None)
+        if rc is None:
+            self._cell_auto.pop(layer, None)
+        else:
+            self._cell_auto.get(layer, {}).pop(rc, None)
+
+    def _disp_store(self, layer: str, store: np.ndarray, step: int) -> np.ndarray:
+        """A C-CONTIGUOUS (C, h, w) thumbnail of *store* at subsampling *step*, cached.
+
+        This is the "precompute once at ingest, remap cheaply per tick" half of IMA-261. Building
+        it costs one strided copy of the whole store (~2.6 ms on a 1536-well plate); it is
+        rebuilt only when the pixels change or the zoom changes, so a continuous contrast drag
+        pays for it ZERO times and every tick composites straight out of it.
+
+        Contiguity is not a detail: ``store[:, ::4, ::4]`` is a strided VIEW, and both the table
+        lookup and the BLAS reduce in ``composite`` would silently materialise their own copy of
+        it on every single tick.
+        """
+        if step <= 1:
+            return store          # already the thing itself; caching it would just double the RAM
+        hit = self._disp.get(layer)
+        if hit is not None and hit[0] == step:
+            return hit[1]
+        thumb = np.ascontiguousarray(store[:, ::step, ::step])
+        self._disp[layer] = (step, thumb)
+        return thumb
+
+    def _cell_auto_windows(self, layer: str, store: np.ndarray, ri: int, ci: int) -> list:
+        """The AUTO (exact-percentile) window per channel for ONE cell, cached on the pixels.
+
+        ``np.percentile`` over a cell is the expensive half of SCOPE_PER_REGION — on a 1536-well
+        plate it is 1536 cells x C channels of sorting per repaint, which measured ~268 ms and is
+        why per-region contrast was unusable under a drag. It depends on the cell's PIXELS only,
+        so it survives every contrast change and is recomputed only when a tile lands there.
+        """
+        cache = self._cell_auto.setdefault(layer, {})
+        hit = cache.get((ri, ci))
+        if hit is not None:
+            return hit
+        y0, x0 = ri * _CELL, ci * _CELL
+        cell = store[:, y0:y0 + _CELL, x0:x0 + _CELL]
+        wins = [_pct_window(cell[ch]) for ch in range(cell.shape[0])]
+        cache[(ri, ci)] = wins
+        return wins
+
+    def _cell_windows(self, store: np.ndarray, ri: int, ci: int, layer: Optional[str] = None) -> list:
         """Per-channel windows for ONE cell, computed exactly over that cell's own pixels.
 
         A latched channel (D4) keeps the user's manual window even under per-region: the user
-        setting a window explicitly outranks any automatic scoping, and silently overriding it
-        would make the channel bar's slider lie about what is on screen.
+        setting a window explicitly outranks any automatic scoping.
+
+        THE VIEWER'S GLOBAL WINDOW DOES NOT OUTRANK PER-REGION (``follow=False``). Choosing
+        per-region IS the instruction "give every well its own range"; letting the array viewer's
+        one global window win here made all 1536 cells identical while the plate went on drawing
+        the amber "wells NOT comparable" badge — the control did nothing and the caveat lied.
         """
-        y0, x0 = ri * _CELL, ci * _CELL
-        cell = store[:, y0:y0 + _CELL, x0:x0 + _CELL]
-        out = []
-        for ch in range(cell.shape[0]):
-            if self._contrast is not None and self._contrast.is_manual(ch):
-                out.append(self._contrast.window(ch))
-            else:
-                out.append(_pct_window(cell[ch]))
-        return out
+        n_ch = store.shape[0]
+        c = self._contrast
+        if c is not None and all(c.is_manual(ch) for ch in range(n_ch)):
+            # Every channel carries a USER latch, so `resolve` will discard every auto window it
+            # is handed. Don't compute 1536 x C percentiles to throw all of them away. Note this
+            # tests is_manual, not is_followed: a followed window is exactly what per-region must
+            # ignore, so it can never license skipping the percentiles.
+            return [c.resolve(ch, (0.0, 0.0)) for ch in range(n_ch)]
+        auto = self._cell_auto_windows(layer or self._active, store, ri, ci)
+        if c is None:
+            return auto
+        return [c.resolve(ch, auto[ch], follow=False) for ch in range(len(auto))]
 
     def _composite_per_region(self, store: np.ndarray, step: int) -> np.ndarray:
         """Composite the plate one CELL at a time, each under its own window (SCOPE_PER_REGION).
@@ -1685,20 +1821,38 @@ class PlateOverview(QWidget):
         *step* is the same sub-sampling stride the global path uses for a quick repaint. Cell
         bounds are converted into the strided frame by ceil-division rather than by dividing the
         cell size, so a stride that does not divide _CELL cannot drift cells apart by a pixel.
+        Cells are cut out of the SAME cached thumbnail the global path composites, and
+        ``thumb[:, ys:ye]`` is by construction ``store[:, ys*step:ye*step:step]`` — the same
+        pixels the old per-cell re-stride produced, without re-striding 1536 times.
         """
-        n_ch = store.shape[0]
-        h = len(range(0, store.shape[1], step))
-        w = len(range(0, store.shape[2], step))
+        thumb = self._disp_store(self._active, store, step)
+        h, w = thumb.shape[1], thumb.shape[2]
+        cells = sorted(self._tiles_by_layer.get(self._active, set()))
+        per_cell = [(rc, self._cell_windows(store, rc[0], rc[1])) for rc in cells]
+        # EVERY CHANNEL LATCHED == EVERY CELL THE SAME WINDOW == ONE COMPOSITE (IMA-261).
+        # `_RunningContrast.resolve` returns the manual window whatever the caller computed, so
+        # once the array viewer owns all C channels the per-cell percentiles are all overridden
+        # and every cell resolves to the identical window. Compositing 1536 cells separately then
+        # costs 1536 numpy dispatches to paint pixels that one call would paint identically --
+        # measured 46 ms vs 4 ms. This is not a special case in the CONTRAST rule (there is still
+        # exactly one, `resolve`); it is only a refusal to do the same arithmetic 1536 times.
+        if per_cell and all(w2 == per_cell[0][1] for _, w2 in per_cell):
+            full = composite(thumb, self._colors, per_cell[0][1], self._mask)
+            rgb = np.zeros_like(full)                     # untiled cells are NOT data: they stay
+            for (ri, ci), _ in per_cell:                  # black, exactly as the loop below does
+                ys, ye = -(-ri * _CELL // step), -(-(ri + 1) * _CELL // step)
+                xs, xe = -(-ci * _CELL // step), -(-(ci + 1) * _CELL // step)
+                ye, xe = min(ye, h), min(xe, w)
+                rgb[ys:ye, xs:xe] = full[ys:ye, xs:xe]    # rect copies; a boolean mask over the
+            return rgb                                    # whole canvas measured 10x slower
         rgb = np.zeros((h, w, 3), np.uint8)
-        for ri, ci in self._tiles_by_layer.get(self._active, set()):
+        for (ri, ci), wins in per_cell:
             ys, ye = -(-ri * _CELL // step), -(-(ri + 1) * _CELL // step)     # ceil-div bounds
             xs, xe = -(-ci * _CELL // step), -(-(ci + 1) * _CELL // step)
             ye, xe = min(ye, h), min(xe, w)
             if ys >= ye or xs >= xe:
                 continue
-            cell = store[:, ys * step:ye * step:step, xs * step:xe * step:step]
-            rgb[ys:ye, xs:xe] = composite(cell, self._colors,
-                                          self._cell_windows(store, ri, ci), self._mask)
+            rgb[ys:ye, xs:xe] = composite(thumb[:, ys:ye, xs:xe], self._colors, wins, self._mask)
         return rgb
 
     def set_channel_visible(self, ch: int, on: bool):
@@ -1717,6 +1871,20 @@ class PlateOverview(QWidget):
         self._contrast.set_manual(ch, lo, hi)
         self._refresh()
 
+    def follow_channel_window(self, ch: int, lo: float, hi: float):
+        """Render *ch* with the window the OWNING ARRAY VIEWER resolved, and repaint (IMA-261).
+
+        The sink half of the one-owner contract. It does NOT latch the channel manual: ndv
+        autoscales on its own, at open and on every data change, so recording that as a user
+        gesture would kill the plate's own auto-contrast before the user had touched anything,
+        and would outrank the per-region scope the user explicitly selected. See
+        ``_RunningContrast.set_followed``.
+        """
+        if self._contrast is None or not (0 <= ch < len(self._mask)):
+            return
+        self._contrast.set_followed(ch, lo, hi)
+        self._refresh()
+
     def set_channel_auto(self, ch: int):
         """Unlatch a channel: it goes back to auto-scaling off the running histogram."""
         if self._contrast is None or not (0 <= ch < len(self._mask)):
@@ -1733,6 +1901,22 @@ class PlateOverview(QWidget):
         """
         self.recomposite(quick=True)
         self._full.start(150)
+        self._refresh_loupe()
+
+    def _refresh_loupe(self):
+        """Re-render the loupe inset under the contrast that just changed (IMA-242).
+
+        The inset holds a rendered QImage, so repainting the plate alone would leave it showing
+        the PRE-drag contrast until the cursor happened to move — the plate and the magnifier of
+        the plate disagreeing about the same pixels. Re-issuing the request is cheap: the worker
+        memoises crops, so this re-colours the bytes it already has and re-reads nothing.
+        """
+        if self._loupe is None or self._loupe_worker is None:
+            return
+        try:
+            self._request_loupe(self._loupe["x"], self._loupe["y"])
+        except Exception:
+            pass          # a contrast drag must never fail because the loupe could not re-render
 
     def _on_full_timeout(self):
         """The coalescing timer fired. Guarded: a pending recomposite must not outlive the widget
@@ -1756,7 +1940,8 @@ class PlateOverview(QWidget):
         if self._scope == SCOPE_PER_REGION:
             rgb = self._composite_per_region(store, step)
         else:
-            rgb = composite(store[:, ::step, ::step], self._colors, self.channel_windows(), self._mask)
+            rgb = composite(self._disp_store(layer, store, step), self._colors,
+                            self.channel_windows(), self._mask)
         self._final_arr[layer] = rgb          # hold the buffer: the QImage below only wraps it
         h, w, _ = rgb.shape
         self.set_final(QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888), layer)
@@ -1774,6 +1959,7 @@ class PlateOverview(QWidget):
         which — and the ~95 MB store would never be freed either.
         """
         self._store.pop(layer, None)
+        self._invalidate_pixels(layer)
         self._final_arr.pop(layer, None)
         self._op_final.pop(layer, None)
         self._tiles_by_layer.pop(layer, None)
@@ -1813,9 +1999,10 @@ class PlateOverview(QWidget):
         th, tw = tile.shape[1], tile.shape[2]      # place by ACTUAL shape: a field smaller than
         store[:, y0 + top:y0 + top + th,           # the cell must not broadcast-crash
               x0 + left:x0 + left + tw] = tile
+        self._invalidate_pixels(layer, (ri, ci))   # these pixels are new: nothing derived survives
         for c_i in range(tile.shape[0]):
             self._contrast.add(c_i, tile[c_i])     # real FOV pixels only — see the docstring
-        wins = (self._cell_windows(store, ri, ci) if self._scope == SCOPE_PER_REGION
+        wins = (self._cell_windows(store, ri, ci, layer) if self._scope == SCOPE_PER_REGION
                 else self.channel_windows())      # per-region windows THIS cell, not the plate
         cell = composite(store[:, y0:y0 + _CELL, x0:x0 + _CELL], self._colors, wins, self._mask)
         img = QImage(cell.data, _CELL, _CELL, 3 * _CELL, QImage.Format_RGB888)
@@ -1873,6 +2060,7 @@ class PlateOverview(QWidget):
         self._op_canvas.pop(layer, None)
         self._op_final.pop(layer, None)
         self._store.pop(layer, None)
+        self._invalidate_pixels(layer)
         self._final_arr.pop(layer, None)
         self._tiles_by_layer.pop(layer, None)
         self._tiles = set().union(*self._tiles_by_layer.values()) if self._tiles_by_layer else set()
@@ -2686,27 +2874,36 @@ def _fit_letterboxed(a: np.ndarray, h: int, w: int, dtype) -> np.ndarray:
 # --- channel bar: one row per channel, under the plate overview -----------------------------
 
 class _ChannelBar(QWidget):
-    """Per-channel visibility + contrast for the plate, one compact row per channel.
+    """Per-channel VISIBILITY for the plate, one compact row per channel, plus a contrast READOUT.
 
-    A row is <color dot> [x] <name>  [low]-[high]  (auto). The checkbox masks that channel out of
-    the plate composite; the two sliders re-window it (which latches it manual, so a still-running
-    acquisition can't stomp it); "auto" hands it back to the running global window. Every control
-    drives PlateOverview, which recomposites from its retained per-channel store — nothing is
-    re-read and nothing is re-projected.
+    A row is  <color dot> [x] <name>  …  <lo – hi>.  The checkbox masks that channel out of the
+    plate composite; PlateOverview recomposites from its retained per-channel store, so nothing
+    is re-read and nothing is re-projected.
+
+    THERE ARE NO CONTRAST SLIDERS HERE, AND THERE MUST NOT BE (IMA-261)
+    -------------------------------------------------------------------
+    This strip used to carry a low/high QSlider pair and an "auto" button per channel —
+    duplicating the contrast control the embedded ndviewer_light array viewer already has, two
+    hand-widths apart on the same screen. Two controls over one quantity is the shape this
+    project has now shipped a defect in four times, and it had already gone wrong here: the plate
+    followed these sliders, the array viewer followed its own, and the SAME channel was displayed
+    at two different windows side by side.
+
+    Contrast therefore has exactly ONE owner — the central array viewer — and this strip only
+    REPORTS the window that owner resolved (``set_window``, driven by
+    ``LightweightViewer.contrastChanged`` → ``PlateWindow._on_detail_contrast``). A readout is not
+    a second control surface: it cannot be dragged, it cannot disagree, and it is what makes the
+    sync visible on screen instead of merely asserted in a commit message.
     """
-
-    _STEPS = 1000                 # slider resolution; mapped onto [0, dmax] of the store dtype
 
     def __init__(self, labels, colors: np.ndarray, overview: PlateOverview):
         super().__init__()
         self._overview = overview
-        self._dmax = overview._contrast.dmax if overview._contrast is not None else 65535.0
-        self._rows = []           # per channel: (checkbox, low slider, high slider)
+        self._rows = []           # per channel: (checkbox, contrast readout label)
         self.setStyleSheet(f"background:{_BG};")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 5, 12, 6)
         lay.setSpacing(3)
-        wins = overview.channel_windows()
         for c_i, label in enumerate(labels):
             row = QHBoxLayout()
             row.setSpacing(8)
@@ -2716,46 +2913,20 @@ class _ChannelBar(QWidget):
             box.setChecked(True)
             box.setStyleSheet(_CHECK_QSS)
             box.toggled.connect(lambda on, i=c_i: self._overview.set_channel_visible(i, on))
-            lo, hi = wins[c_i] if wins else (0.0, self._dmax)
-            s_lo, s_hi = self._slider(lo), self._slider(hi)
-            s_lo.valueChanged.connect(lambda _v, i=c_i: self._push(i))
-            s_hi.valueChanged.connect(lambda _v, i=c_i: self._push(i))
-            auto = QPushButton("auto")
-            auto.setStyleSheet(_BTN_QSS)
-            auto.setToolTip("drop this channel's manual window and follow the running global one")
-            auto.clicked.connect(lambda _=False, i=c_i: self._auto(i))
+            win = QLabel("\u2014")
+            win.setStyleSheet("color:#8b949e;")   # dimmer than a control: this REPORTS, never sets
+            win.setToolTip("contrast window, owned by the array viewer on the right \u2014 set it there")
             row.addWidget(dot)
             row.addWidget(box)
             row.addStretch(1)
-            row.addWidget(s_lo)
-            row.addWidget(s_hi)
-            row.addWidget(auto)
+            row.addWidget(win)
             lay.addLayout(row)
-            self._rows.append((box, s_lo, s_hi))
+            self._rows.append((box, win))
 
-    def _slider(self, value: float) -> QSlider:
-        s = QSlider(Qt.Horizontal)
-        s.setRange(0, self._STEPS)
-        s.setFixedWidth(90)
-        s.setValue(int(np.clip(value / self._dmax * self._STEPS, 0, self._STEPS)))
-        return s
-
-    def _push(self, ch: int):
-        """A slider moved -> re-window that channel (and latch it manual)."""
-        _, s_lo, s_hi = self._rows[ch]
-        lo, hi = sorted((s_lo.value(), s_hi.value()))   # either handle may be dragged past the other
-        self._overview.set_channel_window(ch, lo / self._STEPS * self._dmax,
-                                          hi / self._STEPS * self._dmax)
-
-    def _auto(self, ch: int):
-        """Unlatch the channel and snap its sliders back onto the running window."""
-        self._overview.set_channel_auto(ch)
-        lo, hi = self._overview.channel_windows()[ch]
-        _, s_lo, s_hi = self._rows[ch]
-        for s, v in ((s_lo, lo), (s_hi, hi)):
-            s.blockSignals(True)                        # a snap-back must not re-latch it manual
-            s.setValue(int(np.clip(v / self._dmax * self._STEPS, 0, self._STEPS)))
-            s.blockSignals(False)
+    def set_window(self, ch: int, lo: float, hi: float):
+        """Show the window the CENTRAL VIEWER resolved for *ch*. Display only — it sets nothing."""
+        if 0 <= ch < len(self._rows):
+            self._rows[ch][1].setText(f"{lo:g} \u2013 {hi:g}")
 
 
 # --- operator worker: stream a projection over the plate, fill row-major -------------------
@@ -3389,6 +3560,16 @@ class PlateWindow(QMainWindow):
             slider = getattr(self._detail, "_fov_slider", None)
             if slider is not None:
                 slider.valueChanged.connect(self._on_fov_slider)
+            # CONTRAST HAS ONE OWNER, AND IT IS THIS VIEWER (IMA-261). Connected ONCE here, for
+            # the same reason the FOV slider is: the detail viewer is a singleton that outlives
+            # every ingest, and a per-ingest connect would stack duplicate slots.
+            sig = getattr(self._detail, "contrastChanged", None)
+            if sig is not None:
+                sig.connect(self._on_detail_contrast)
+            else:                        # fail LOUD, in the readout: a silent no-sync is the bug
+                self._readout.setText(
+                    "this ndviewer_light has no contrastChanged signal — the plate cannot follow "
+                    "the array viewer's contrast (needs the IMA-261 build of ndviewer_light)")
             self._right_widget = self._detail
         else:
             ph = QLabel("ndviewer_light unavailable — pip install ndviewer_light")
@@ -5378,6 +5559,18 @@ class PlateWindow(QMainWindow):
             self._channel_bar.deleteLater()
         self._channel_bar = _ChannelBar(self._overview._labels, colors, self._overview)
         self._left_l.addWidget(self._channel_bar)   # sits UNDER the plate, in the same pane
+        # A fresh plate must ALREADY agree with the array viewer, not merely agree from the next
+        # gesture on: the viewer keeps whatever window it had, and a plate that waited for the
+        # user to touch the slider would open showing a different window from the one on screen.
+        self._adopt_detail_contrast()
+
+    def _adopt_detail_contrast(self):
+        """Pull the array viewer's CURRENT per-channel windows onto the plate (IMA-261)."""
+        get = getattr(self._detail, "channel_windows", None) if self._detail is not None else None
+        if get is None:
+            return
+        for ch, (lo, hi) in get().items():
+            self._on_detail_contrast(ch, lo, hi)
 
     # -- navigation links --
     # -- selection (IMA-221): the widget picks wells, THIS window knows what a well contains ----
@@ -5499,6 +5692,32 @@ class PlateWindow(QMainWindow):
         info = self._fov_index.get(labels[flat_idx].split(":")[0])
         if info:
             self._overview.select(*info["rc"])
+
+    def _on_detail_contrast(self, ch: int, lo: float, hi: float):
+        """The CENTRAL ARRAY VIEWER re-windowed channel *ch*. Make the plate show that window.
+
+        This is the whole of the cross-repo sync (IMA-261), and it is deliberately one-way:
+        ndviewer_light owns contrast, the plate follows. `(lo, hi)` are the numbers ndv handed its
+        own canvas — not a re-derivation from a slider position, not a percentile recomputed here
+        — so "the plate and the viewer show the same window" is true by construction rather than
+        by two rules being kept in step.
+
+        It lands in the plate's FOLLOW path, NOT in its manual latch. ndv autoscales by itself —
+        at open, and again whenever the displayed data changes — so treating each broadcast as a
+        user gesture latched every channel MANUAL before anyone had touched anything: the plate's
+        running auto-contrast was dead from the first frame, and SCOPE_PER_REGION painted every
+        well under ndv's one global window while the plate still drew the amber "wells NOT
+        comparable" badge over the top. A sink records what the owner resolved; only the user sets
+        policy. `_RunningContrast.resolve` is still the single precedence rule.
+        """
+        if self._overview is None:
+            return
+        n_ch = len(self._overview._labels)
+        if not (0 <= ch < n_ch):
+            return          # ndv drew a channel the plate does not have (RGB mode, or a re-ingest)
+        self._overview.follow_channel_window(ch, float(lo), float(hi))
+        if self._channel_bar is not None:
+            self._channel_bar.set_window(ch, float(lo), float(hi))
 
     def _focus_reference_plane(self):
         """Jump the detail viewer's z-slider to the CURRENT FOV's sharpest plane (Tenengrad autofocus).
