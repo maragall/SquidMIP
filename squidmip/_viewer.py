@@ -3049,6 +3049,57 @@ class _MinervaWorker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class _MosaicWorker(QThread):
+    """Fuse one region's FOVs into a mosaic per channel, OFF the GUI thread.
+
+    A 28-FOV tissue region is ~940 MB of TIFF to read. Doing that in ``ingest`` would freeze the
+    window for seconds on open, which is precisely the "opens instantly" property IMA-260 bought.
+    Results arrive per channel so the first channel paints while the rest are still being read.
+    """
+
+    ready = pyqtSignal(str, str, object, object)   # region, channel, plane, bbox_um|None
+    problem = pyqtSignal(str)
+    finished_count = pyqtSignal(int)
+
+    def __init__(self, reader, meta, region, channels, parent=None):
+        super().__init__(parent)
+        self._reader, self._meta = reader, meta
+        self._region = region
+        self._channels = list(channels)
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        from squidmip._mosaic_source import fuse_region_mosaic, mosaic_bbox_um
+
+        try:
+            bbox = mosaic_bbox_um(self._meta, self._region)
+        except Exception as exc:                    # noqa: BLE001
+            self.problem.emit(f"mosaic placement failed: {exc}")
+            bbox = None
+
+        n = 0
+        for ch in self._channels:
+            if self._stop.is_set():
+                break
+            try:
+                res = fuse_region_mosaic(self._reader, self._meta, self._region, ch)
+            except Exception as exc:                # noqa: BLE001 - reported, never swallowed
+                self.problem.emit(f"{self._region}/{ch}: {type(exc).__name__}: {exc}")
+                continue
+            if res is None:
+                self.problem.emit(
+                    f"{self._region}: no stage positions / pixel size — mosaic not derivable."
+                )
+                continue
+            plane, _step = res
+            self.ready.emit(self._region, ch, plane, bbox)
+            n += 1
+        self.finished_count.emit(n)
+
+
 class _PreviewWorker(QThread):
     """Fast RAW preview so the plate shows imagery the moment it opens — before any operator runs
     (the "downsample the plate before opening" step). Reads ONE representative z-plane per channel
@@ -3246,6 +3297,21 @@ class _ExplorationTab(QWidget):
         return
 
 
+def _make_mosaic_pane():
+    """Build pane 2's napari mosaic viewer, or report why it could not be built.
+
+    Returns ``(pane_or_None, mode, message)``. Import failures are caught here rather than at
+    module import so that a machine without napari still opens the window with ndviewer_light —
+    and with a VISIBLE sentence saying so, never a silent downgrade.
+    """
+    try:
+        from squidmip._napari_pane import make_pane
+
+        return make_pane()
+    except Exception as exc:                     # noqa: BLE001 - surfaced, not swallowed
+        return None, "ndv", f"napari viewer unavailable ({type(exc).__name__}: {exc}) — using ndviewer_light."
+
+
 class PlateWindow(QMainWindow):
     def __init__(self, initial_path: Optional[str] = None):
         super().__init__()
@@ -3258,6 +3324,8 @@ class PlateWindow(QMainWindow):
         self._overview = None
         self._reader = None
         self._meta = None
+        self._mosaic_worker = None    # fuses a region's FOVs for pane 2, off the GUI thread
+        self._mosaic_region = None    # region currently shown in the napari mosaic pane
         self._fov_index = {}
         self._selected_regions = []   # wells picked on the plate (IMA-221); scopes an operator run
         self._pushed = set()          # wells whose raw z-stack is already registered in the detail viewer
@@ -3383,16 +3451,31 @@ class PlateWindow(QMainWindow):
         # on the TEXT, and text you have to read a syllable at a time is not legible either.
         self._explore_pane.setMinimumWidth(360)
 
-        # right: the ndviewer array viewer directly (a singleton — no tab)
+        # right (pane 2): the central viewer. napari renders the region MOSAIC as a multiscale
+        # pyramid — the reason for the move, and the unit the user actually looks at (IMA-265).
+        # ndviewer_light remains the per-FOV z-stack detail viewer and the fallback; it is what
+        # `self._detail` still refers to, so every push path below is unchanged.
+        self._mosaic_pane, viewer_mode, viewer_msg = _make_mosaic_pane()
         self._detail = self._make_detail_viewer()
         if self._detail is not None:   # connect the FOV slider -> red box ONCE (not per ingest)
             slider = getattr(self._detail, "_fov_slider", None)
             if slider is not None:
                 slider.valueChanged.connect(self._on_fov_slider)
+
+        if viewer_mode == "napari" and self._mosaic_pane is not None:
+            self._right_widget = self._mosaic_pane
+        elif self._detail is not None:
             self._right_widget = self._detail
+            # A fallback the user cannot see is a silent failure. Say it in the status line.
+            if viewer_msg:
+                self._readout.setText(viewer_msg)
         else:
-            ph = QLabel("ndviewer_light unavailable — pip install ndviewer_light")
+            ph = QLabel(
+                (viewer_msg + "\n" if viewer_msg else "")
+                + "ndviewer_light unavailable — pip install ndviewer_light"
+            )
             ph.setAlignment(Qt.AlignCenter)
+            ph.setWordWrap(True)
             ph.setStyleSheet("color:#8b98ad;")
             self._right_widget = ph
 
@@ -4738,6 +4821,7 @@ class PlateWindow(QMainWindow):
         self._install_channel_bar(meta["channels"], meta["dtype"])
 
         self._setup_raw_detail()
+        self._load_mosaic()          # pane 2 shows the region MOSAIC from the moment it opens
 
         self._enable_operators(True)
 
@@ -4769,6 +4853,73 @@ class PlateWindow(QMainWindow):
         multi = sum(1 for r in order if len(meta["fovs_per_region"][r]) > 1)
         note = (f" · {multi} multi-FOV region(s), previewing as mosaics" if multi else "")
         self._readout.setText(f"live · {len(self._fov_index)} wells · double-click to open{note}")
+
+    def _load_mosaic(self, region: Optional[str] = None, op: str = "raw"):
+        """Show one region's fused MOSAIC in pane 2, one napari layer per channel.
+
+        The unit displayed is a mosaic, never a single FOV (IMA-265). This runs on OPEN, before
+        any operator: a raw acquisition has no pyramid on disk, so the region's FOVs are fused
+        by stage position. Once an operator has written an OME-Zarr, ``_load_mosaic_zarr`` shows
+        that pyramid lazily instead, as a SECOND processing layer, so the before/after toggle is
+        just a visibility flip.
+        """
+        pane = getattr(self, "_mosaic_pane", None)
+        if pane is None or not getattr(pane, "ok", False):
+            return
+        if self._reader is None or self._meta is None:
+            return
+        region = region or (self._order[0] if getattr(self, "_order", None) else None)
+        if region is None:
+            return
+
+        prior = getattr(self, "_mosaic_worker", None)
+        if prior is not None and prior.isRunning():
+            prior.stop()
+            prior.wait(2000)
+
+        self._mosaic_region = region
+        pane.mosaic.remove_op(op)
+        channels = [c["name"] for c in self._meta["channels"]]
+        w = _MosaicWorker(self._reader, self._meta, region, channels, parent=self)
+        w.ready.connect(lambda r, ch, plane, bbox: self._on_mosaic_plane(op, r, ch, plane, bbox))
+        w.problem.connect(lambda msg: pane.say(msg))
+        w.finished_count.connect(lambda n: self._on_mosaic_done(op, region, n))
+        self._mosaic_worker = w
+        w.start()
+
+    def _on_mosaic_plane(self, op: str, region: str, channel: str, plane, bbox_um):
+        """One channel of the mosaic arrived. Add it as a layer in the napari pane."""
+        pane = getattr(self, "_mosaic_pane", None)
+        if pane is None or not getattr(pane, "ok", False):
+            return
+        if getattr(self, "_mosaic_region", None) != region:
+            return                                  # a later region won the race; drop this one
+        from squidmip._napari_pane import _colormap_for
+
+        # _pct_window is the ONE percentile rule (it deliberately does not widen a degenerate
+        # window — that refusal is why a blank channel does not clip to full white and read as
+        # signal). No second contrast model is created here.
+        lo, hi = _pct_window(plane)
+        pane.mosaic.add_mosaic(
+            op, channel, plane,
+            contrast_limits=(lo, hi),
+            colormap=_colormap_for(channel),
+            bbox_um=bbox_um,
+        )
+
+    def _on_mosaic_done(self, op: str, region: str, n: int):
+        pane = getattr(self, "_mosaic_pane", None)
+        if pane is None or not getattr(pane, "ok", False):
+            return
+        if n == 0:
+            pane.say(f"{region}: no mosaic could be built (see the message above).")
+            return
+        pane.say("")
+        try:
+            pane.mosaic.show_op(op)
+            pane.mosaic.model.reset_view()
+        except Exception:                            # noqa: BLE001 - view framing is cosmetic
+            pass
 
     def _setup_raw_detail(self, order: Optional[list] = None):
         """Point the detail viewer at the RAW acquisition: full z-stack, full frame, FOV slider.
@@ -5454,7 +5605,14 @@ class PlateWindow(QMainWindow):
         """Double-click -> show the well in the ndviewer. In RAW mode (no operator run yet) push the
         well's raw z-stack lazily (the true z-stack, zero bytes copied). In PROCESSED mode (an operator
         has run, the slider already holds the results) just navigate the slider to that well."""
-        if self._detail is None or well_id not in self._fov_index:
+        if well_id not in self._fov_index:
+            return
+        # Re-point pane 2's mosaic FIRST, and independently of the detail viewer: with napari as
+        # the viewer ndviewer_light may not be installed at all, and an early return on
+        # `_detail is None` would silently make double-click do nothing.
+        if well_id != getattr(self, "_mosaic_region", None):
+            self._load_mosaic(region=well_id)
+        if self._detail is None:
             return
         # Resolve the slider position BEFORE moving the red box. The box says "this is the well you
         # are looking at"; if the detail's slider does not contain the well (an exploration tab

@@ -85,15 +85,30 @@ _NAPARI = "napari"
 META_KEY = "squidmip"
 
 
-def napari_enabled(env: Optional[dict] = None) -> bool:
-    """True when the napari view is switched on.
+#: Spellings of the ndviewer_light fallback accepted in SQUIDMIP_VIEWER.
+_NDV_NAMES = ("ndv", "ndviewer", "ndviewer_light")
 
-    Default is OFF. ndviewer_light stays the viewer until this is flipped deliberately, so a
-    failed napari path can never leave the GUI with no viewer at all — Julio is reviewing
-    functionality commit by commit and must always have something that runs.
+
+def resolve_viewer(env: Optional[dict] = None) -> str:
+    """Which viewer to build: ``"napari"`` (default) or ``"ndv"``.
+
+    THE single place this is decided. ``_napari_pane.make_pane`` asks this rather than parsing
+    the variable itself — two readers of one environment variable is exactly the knowledge
+    duplication that produces controls disagreeing about what is on screen.
+
+    napari is the default now that the gate passed (docs/napari-gate.md). The ndviewer_light
+    fallback stays reachable by name so a bad napari path never leaves the window without a
+    viewer during a visual-feedback round. An UNRECOGNISED value resolves to napari rather than
+    silently disabling the viewer: a typo must not cost you the pane.
     """
     src = os.environ if env is None else env
-    return str(src.get(VIEWER_ENV, "")).strip().lower() == _NAPARI
+    want = str(src.get(VIEWER_ENV, "")).strip().lower()
+    return "ndv" if want in _NDV_NAMES else _NAPARI
+
+
+def napari_enabled(env: Optional[dict] = None) -> bool:
+    """True when the napari view is the selected viewer."""
+    return resolve_viewer(env) == _NAPARI
 
 
 # --------------------------------------------------------------------------------------

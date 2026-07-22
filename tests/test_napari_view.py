@@ -18,6 +18,7 @@ from squidmip._napari_view import (
     REQUIRED_NAPARI_BINDINGS,
     key_of,
     napari_enabled,
+    resolve_viewer,
     scale_translate_from_bbox_um,
     verify_napari_bindings,
 )
@@ -39,15 +40,36 @@ def _img(seed=0, shape=(32, 32)):
 # ---------------------------------------------------------------- the flag
 
 
-def test_napari_is_off_by_default_so_a_failed_path_never_leaves_no_viewer():
-    assert napari_enabled({}) is False
-    assert napari_enabled({"SQUIDMIP_VIEWER": ""}) is False
+def test_napari_is_the_default_viewer_now_that_the_gate_passed():
+    assert resolve_viewer({}) == "napari"
+    assert resolve_viewer({"SQUIDMIP_VIEWER": ""}) == "napari"
+    assert napari_enabled({}) is True
+
+
+def test_the_ndviewer_fallback_stays_reachable_by_name():
+    """A bad napari path must never leave the window with no viewer during a feedback round."""
+    for spelling in ("ndv", "ndviewer", "ndviewer_light", "  NDV  "):
+        assert resolve_viewer({"SQUIDMIP_VIEWER": spelling}) == "ndv", spelling
     assert napari_enabled({"SQUIDMIP_VIEWER": "ndv"}) is False
 
 
-def test_napari_switches_on_only_when_asked_for_by_name():
-    assert napari_enabled({"SQUIDMIP_VIEWER": "napari"}) is True
-    assert napari_enabled({"SQUIDMIP_VIEWER": "  NAPARI  "}) is True
+def test_a_typo_does_not_silently_cost_you_the_viewer():
+    assert resolve_viewer({"SQUIDMIP_VIEWER": "napri"}) == "napari"
+
+
+def test_one_resolver_decides_so_the_pane_cannot_disagree_with_the_model():
+    """Two readers of one environment variable is how controls end up disagreeing about what is
+    on screen. _napari_pane.make_pane asks resolve_viewer rather than parsing it again."""
+    import inspect
+
+    from squidmip import _napari_pane
+
+    src = inspect.getsource(_napari_pane.make_pane)
+    assert "resolve_viewer" in src, "make_pane does not ask the one resolver"
+    assert "os.environ" not in src, (
+        "make_pane reads the environment itself instead of asking resolve_viewer — "
+        "two readers of one variable is how controls end up disagreeing"
+    )
 
 
 # ------------------------------------------------- identity lives in metadata

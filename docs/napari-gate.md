@@ -159,14 +159,54 @@ contrast model.
   512` already equals the OME-Zarr chunk size IMA-217 writes, so one tile read is one chunk
   read — keep those equal or read amplification comes back.
 
+## Wired in — verified on the real datasets
+
+napari is now pane 2, the central viewer, and `SQUIDMIP_VIEWER` defaults to `napari`.
+Verified with a real GL context (`tools/verify_napari_mosaic.py`, which deliberately refuses the
+offscreen platform):
+
+| | tissue (`test_10x_laser_af_z_stack…`) | 2x2 plate |
+|---|---|---|
+| pane 2 is the napari canvas | yes | yes |
+| regions found | `manual0`, `manual1` | `A1 A2 B1 B2` |
+| mosaic shown on open | `manual0` | `A1` |
+| channels as layers | 4 | 4 |
+| frame shape | 2084 x 2084 | 2084 x 2084 |
+| **mosaic extent** | **5731 x 4793** | **5771 x 5771** |
+| placed in stage µm | yes (1.504 µm/px) | yes (0.746 µm/px) |
+| canvas actually painted | yes, 230 distinct values | yes, 256 distinct values |
+| ingest -> mosaic on screen | 3.8 s | 5.0 s |
+
+The mosaic extent exceeding the frame shape is the check that it is a **mosaic and not one
+FOV** — the thing IMA-265 is about. No operator was run first.
+
+**The one step no headless gate can cover**: the offscreen Qt platform ships no OpenGL, so a
+vispy canvas under it does not raise — it **segfaults** (`QOpenGLWidget is not supported on this
+platform`). `_napari_pane.gl_available()` therefore checks the platform BEFORE construction and
+falls back to ndviewer_light with a stated reason. Without that check, wiring napari into
+`PlateWindow` takes the whole test suite down with signal 11 instead of a test failure. Every
+headless gate here runs offscreen, so on those gates the napari canvas is never built; the table
+above is the evidence that it works where there is a GL context.
+
 ## Still open — honestly
 
-- The pane is **not yet wired into the three-pane window**. `SQUIDMIP_VIEWER=napari` exists and
-  defaults OFF; ndviewer_light remains the viewer until it is flipped.
-- Fused-mosaic loading via `napari-ome-zarr` (ian-stitcher's proven path) is not implemented
-  here; `add_mosaic` takes arrays/pyramids directly.
-- Camera-settle coalescing is not implemented. Fetching per camera event is how #1942 happens;
-  the measured numbers above are per settled move, not per event.
+- **Fused-mosaic loading does NOT use `napari-ome-zarr`**, which is what ian-stitcher does. That
+  plugin is not installed, disk is too tight to add it plus `ome-zarr`/npe2 right now, it would
+  reintroduce the plugin surface the bare-`QtViewer` embedding exists to avoid, and — the real
+  reason — it only names layers, so channel identity would have to be recovered by parsing
+  `layer.name`, the exact bug class this design refuses. `_mosaic_source.open_pyramid` reads the
+  multiscale directly with dask-over-zarr, which is what the plugin does internally.
+- **The raw path fuses by placement, it does not stitch.** Overlaps are overwritten, not blended
+  or registered. `stitch_plate()` remains what produces a mosaic of record; its OME-Zarr output
+  comes back through `open_pyramid` as a second processing layer.
+- **A written pyramid is not yet shown as a second processing layer**, so the before/after
+  stitching toggle has the machinery (`show_op`, linked contrast) but nothing to toggle *to*
+  until that is wired.
+- **The plate keeps its own `_RunningContrast`.** The napari pane owns contrast for what it
+  displays, via linked layers, and adds no new contrast UI. Unifying the plate's contrast model
+  with the layer property was NOT attempted: another agent is editing `_viewer.py` for IMA-261
+  and the GUI duplication gate right now, and colliding there would be worse than the remaining
+  duplication. This is the next thing to do, not a thing that was done.
 - The installer (`installer/ndviewer_light.spec`) is tuned to ndv+vispy. napari is a much
   heavier PyInstaller target. **No packaging experiment exists.** This is the largest unknown.
 - True cold-disk numbers remain impossible (`purge` needs root); none are estimated.
