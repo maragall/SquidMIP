@@ -2872,6 +2872,11 @@ class _OperatorWorker(QThread):
     writtenReady = pyqtSignal(str)                  # path of the written plate.ome.zarr
     wellFailed = pyqtSignal(int, int)               # (ri, ci) of a well SKIPPED on a read error
     pushReady = pyqtSignal(int, object)             # (fov_idx, [per-channel ~512px plane]) for the slider
+    # FULL-RESOLUTION result pixels, per FOV, for the napari layer group (Defect 3). Separate
+    # from pushReady because that one is the ~512px ndviewer slider feed: a downsampled,
+    # letterboxed preview. A processing LAYER has to be the operator's actual output, in the
+    # raw mosaic's frame, or the before/after toggle compares a thumbnail against a pyramid.
+    resultReady = pyqtSignal(str, int, object)      # (region, fov, (C, Y, X) native dtype)
     failed = pyqtSignal(str)                        # whole-run failure (not a per-well skip)
     finished_ok = pyqtSignal()
 
@@ -3015,6 +3020,9 @@ class _OperatorWorker(QThread):
         push = [_fit_letterboxed(well[c_i], ph, pw, self._dtype)
                 for c_i in range(len(self._channels))]
         self.pushReady.emit(info["idx"], push)
+        # The operator's own pixels, undownsampled. `well` is a view into `image`; the slot
+        # copies what it keeps and drops the rest, so a plate-wide run does not accumulate.
+        self.resultReady.emit(region, fov, well)
 
     def _on_error(self, region, fov, exc):
         """A well's projection failed (corrupt/missing plane): SKIP it, mark its dot failed, keep the
@@ -3514,6 +3522,12 @@ def _make_mosaic_pane(show_docks: bool = True):
 
 
 class PlateWindow(QMainWindow):
+    #: The in-flight operator result for the region pane 2 is showing (Defect 3), or None.
+    #: A CLASS default rather than an __init__ assignment so ``_on_result`` can use plain
+    #: attribute access: a bare ``getattr(self, ..., None)`` on a QObject whose __init__ has
+    #: not run raises out of Qt's own attribute machinery instead of returning the default.
+    _result_acc = None
+
     def __init__(self, initial_path: Optional[str] = None):
         super().__init__()
         self.setWindowTitle("MIP tool")
@@ -6176,6 +6190,15 @@ class PlateWindow(QMainWindow):
             scope = f"{len(regions)} selected well(s)"
         else:
             scope = f"{len(regions)} well" + ("s" if len(regions) != 1 else "")
+
+        # CONFIRM THE RESOLVED TARGET SET, by name, before the QThread starts (Defect 2).
+        # The selector names the RULE ("selected wells"); this names the ANSWER. They differ
+        # whenever the live state the rule reads is not what the user pictures, which is the
+        # entire failure mode -- and the one the deleted per-panel scope combo made worse by
+        # showing a THIRD, stale answer.
+        self._resolved_target = _explore.describe_run_target(regions, total=len(self._order))
+        if self._resolved_target:
+            self._readout.setText(self._resolved_target)
         # A PREVIEW RUN OPENS A TAB IN THE SIDE PANE. Julio: "the exploration pane can obviously
         # visualize preliminary results as the user processes... preview runs can open a TAB on
         # the exploration pane so that they look at how it is behaving, a.k.a. look at the
@@ -6298,6 +6321,7 @@ class PlateWindow(QMainWindow):
         self._run_label, self._run_dest = label, dest
         self._worker.tileReady.connect(self._on_tile)
         self._worker.pushReady.connect(self._on_push)
+        self._worker.resultReady.connect(self._on_result)
         self._worker.progress.connect(self._on_progress)
         self._worker.streamEnded.connect(lambda k=layer_key: self._recomposite(k))
         self._worker.writtenReady.connect(self._on_written)
@@ -6387,6 +6411,83 @@ class PlateWindow(QMainWindow):
         src = self._loupe_sources.get(layer)                 # this well is now on disk -> loupe-able
         if isinstance(src, _ZarrLoupeSource):
             src.mark_written(well_id)
+
+    def _on_result(self, region, fov, planes):
+        """An operator's FULL-RESOLUTION pixels -> a toggleable napari LAYER GROUP (Defect 3).
+
+        Julio: "what if we want to see stitched AND deconvolved AND background subed. That's
+        why we need the toggles." Before this, no operator's output reached pane 2's napari at
+        all: every result went to ``_on_push`` -> ``register_array``, the ndviewer slider, and
+        that was the whole of "the result is visible". The group toggle UI (``_layer_tree``)
+        was already built and mounted; it had nothing to show.
+
+        ONE REGION AT A TIME, deliberately. Pane 2 shows the open region (``_mosaic_region``),
+        and the raw path already drops planes for any other region (see ``_on_mosaic_plane``).
+        Holding full-resolution mosaics for every well of a plate run would be gigabytes of
+        layers the user cannot look at, so a result for a region that is not on screen is
+        dropped here rather than accumulated -- the same rule as raw, for the same reason.
+
+        The accumulator is per (operator, region): a plane-op emits one result per FOV and the
+        layer cannot be drawn until the region is whole, while a region operator emits the
+        fused region in one go. ``_op_result`` owns that difference so this slot does not.
+        """
+        pane = getattr(self, "_mosaic_pane", None)
+        if pane is None or not getattr(pane, "ok", False):
+            return                              # no napari in this window; ndviewer path stands
+        if region != getattr(self, "_mosaic_region", None):
+            return                              # not the region on screen -- see the docstring
+        op = self._active_op_key
+        if not op:
+            return
+        acc = self._result_acc
+        if acc is None or (acc.op, acc.region) != (op, region):
+            from squidmip import available_region_operators
+            from squidmip._op_result import RegionResultAccumulator
+
+            acc = RegionResultAccumulator(
+                op, region, self._meta, [c["name"] for c in self._meta["channels"]],
+                region_operator=(op in available_region_operators()),
+            )
+            self._result_acc = acc
+        try:
+            acc.add(int(fov), np.asarray(planes))
+        except ValueError as exc:
+            # NO SILENT FAILURES: a result that cannot be placed is said out loud. It must not
+            # abort the run -- the pixels are still written and still on the slider.
+            self._readout.setText(f"result not shown as a layer: {exc}")
+            self._result_acc = None
+            return
+        if not acc.complete():
+            return
+        self._result_acc = None
+        try:
+            result = acc.result()
+        except ValueError as exc:
+            self._readout.setText(f"result not shown as a layer: {exc}")
+            return
+        self._add_result_layers(result)
+
+    def _add_result_layers(self, result):
+        """One layer per channel, all under the operator's group, over the raw mosaic.
+
+        ``add_mosaic`` keys the group off ``result.op`` and ``_register_channel`` links
+        contrast per CHANNEL across every group, so flipping between raw and this operator
+        preserves the window -- which is the difference between a comparison and two unrelated
+        pictures. ``bbox_um`` is the raw mosaic's own bbox, so the layers land in register.
+        """
+        from squidmip._napari_pane import _colormap_for
+
+        pane = self._mosaic_pane
+        for channel in result.channels:
+            pane.mosaic.add_mosaic(
+                result.op, channel, result.plane(channel),
+                colormap=_colormap_for(channel),
+                bbox_um=result.bbox_um,
+                z_scale_um=(self._meta or {}).get("dz_um"),
+            )
+        self._readout.setText(
+            f"{result.op} — {len(result.channels)} layer(s) added; toggle it against raw in "
+            f"the mosaic layers panel")
 
     def _on_push(self, fov_idx, planes):
         """A computed result's bounded planes -> the array viewer (in-memory register_array, LRU

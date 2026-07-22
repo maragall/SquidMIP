@@ -11,7 +11,7 @@ WHERE THINGS LIVE, AND WHY
   operator registries (``_OPERATIONS`` and ``runnable_operators()``) launching the same
   operators from panes 1 and 3 with different labels and different ``save`` defaults, and a
   comment in ``_viewer.py`` records that they diverged in production. So "run this on the
-  subset parked in pane 3" is a SCOPE VALUE on the pane-1 panel (:func:`scope_options`),
+  subset parked in pane 3" is a SCOPE VALUE on pane 1's run selector,
   not a second set of buttons. This module adds no third caller to either registry.
 * The deconvolution RESULT - the 2-D image in turbo with the x-z and y-z strips concatenated
   to it - is a TAB IN PANE 3 (:class:`DeconQCResultView`). That is where a preview result is
@@ -114,6 +114,9 @@ STITCH_DEFAULTS = {
     "blend_px": _BLEND_PX,
     "outlier_rel_pct": int(round(_REL_THRESH * 100)),
     "outlier_abs_px": int(round(_ABS_THRESH)),
+    "auto_blend": False,
+    "correct_distortion": False,
+    "registration_t": 0,
 }
 
 
@@ -121,32 +124,11 @@ STITCH_DEFAULTS = {
 # policy (no Qt) — the decisions, separated from the pixels
 # ---------------------------------------------------------------------------------------
 
-def scope_options(order, selected, explore_scopes):
-    """``[(label, regions_or_None), ...]`` for the panel's scope selector.
-
-    ``regions=None`` is ``run_operator``'s "the whole plate", so it is offered first and
-    always. A plate selection and each subset parked in pane 3 follow, as VALUES rather
-    than as separate launchers.
-
-    Region lists are COPIED: the selector holds a scope for as long as the panel is open,
-    and a later click on the plate must not retroactively change what a pending run covers.
-    An empty subset is not offered at all - choosing it would only produce "empty selection
-    - nothing to run" at the far end of the click.
-    """
-    order = list(order)
-    options = [(f"Whole dataset — {len(order)} well" + ("s" if len(order) != 1 else ""), None)]
-    selected = list(selected or [])
-    if selected:
-        options.append((f"Selected wells — {len(selected)}", selected))
-    for label, regions in (explore_scopes or []):
-        regions = list(regions or [])
-        if regions:
-            options.append((f"Pane 3 subset · {label} — {len(regions)}", regions))
-    return options
-
-
 def stitch_operator_kwargs(*, register, registration_channel, channels, blend_px,
                            outlier_rel_pct, outlier_abs_px,
+                           auto_blend: bool = False,
+                           correct_distortion: bool = False,
+                           registration_t: int = 0,
                            n_channels: Optional[int] = None,
                            tile_px: Optional[int] = None) -> dict:
     """Turn the panel's widget values into ``stitch_region`` keyword arguments.
@@ -173,8 +155,14 @@ def stitch_operator_kwargs(*, register, registration_channel, channels, blend_px
                 "smaller result, it is no result.")
         if n_channels is not None and len(channels) == int(n_channels):
             channels = None
-    blend_px = int(blend_px)
-    if tile_px is not None and blend_px >= int(tile_px):
+    # "Auto" is spelled blend_px=None all the way down to stitch_region, which measures the
+    # acquisition's real overlap (auto_blend_px). The spin's value is IGNORED, not clamped:
+    # showing a number that had no effect is the accepted-and-ignored shape.
+    if auto_blend:
+        blend_px = None
+    else:
+        blend_px = int(blend_px)
+    if blend_px is not None and tile_px is not None and blend_px >= int(tile_px):
         raise ValueError(
             f"blend width {blend_px} px is not smaller than the {int(tile_px)} px tile. The "
             "Hann feather has to fit INSIDE the real overlap; a ramp that never reaches full "
@@ -186,6 +174,12 @@ def stitch_operator_kwargs(*, register, registration_channel, channels, blend_px
         kwargs["registration_channel"] = registration_channel
         kwargs["rel_thresh"] = float(outlier_rel_pct) / 100.0
         kwargs["abs_thresh"] = float(outlier_abs_px)
+        kwargs["registration_t"] = int(registration_t)
+        # Distortion correction fits the residual left AFTER the global solve, so it is
+        # registration-only; stitch_region refuses the combination outright. Dropping it here
+        # rather than forwarding a False keeps "what the panel sends" equal to "what the run
+        # does" for the disabled case too.
+        kwargs["correct_distortion"] = bool(correct_distortion)
     return kwargs
 
 
@@ -345,18 +339,22 @@ class StitcherPanel(_Panel):
             "mosaic. A region is a MOSAIC of FOVs, so one region produces one image.")
         names = _channel_names(host)
 
-        # -- what to run it on ---------------------------------------------------------
-        self.v.addWidget(_head("SCOPE"))
-        self.scope_combo = QComboBox()
-        self._scopes = scope_options(getattr(host, "_order", []),
-                                     getattr(host, "_selected_regions", []),
-                                     host.explore_scopes() if hasattr(host, "explore_scopes") else [])
-        for label, _regions in self._scopes:
-            self.scope_combo.addItem(label)
-        self.scope_combo.setToolTip(
-            "Every operator control lives here in pane 1. 'Run it on the subset parked in "
-            "pane 3' is one of these values, not a second button over there.")
-        self.v.addLayout(_row(self.scope_combo))
+        # SCOPE IS NOT HERE, DELIBERATELY (Defect 2). It belongs to the RUN, not to the
+        # operator, and pane 1's "run on" selector owns it. This panel used to carry a second
+        # scope combo, and it was wrong in both of its states:
+        #
+        #   * it was built ONCE and cached by _open_op_tab, from a selection read at build
+        #     time. The user opens the stitcher tab BEFORE picking wells, so the selection was
+        #     always empty and the combo always collapsed to its single "Whole dataset" entry
+        #     -- which is the whole of "Only scope available for the stitcher is the whole
+        #     dataset". It was never a capability limit; it was a stale read.
+        #   * and that entry sent regions=None, which run_operator treats as "unscoped" and
+        #     hands to the run selector anyway. So the control the user was looking at said
+        #     "Whole dataset" while the run actually went wherever the OTHER control pointed.
+        #     A mislabeled control is worse than a missing one.
+        #
+        # Two representations of one truth, which is this project's dominant defect shape. The
+        # run selector is the owner because it is the one that reads the selection LIVE.
 
         # -- what to reduce z with before fusing ---------------------------------------
         self.v.addWidget(_head("Z REDUCTION"))
@@ -392,6 +390,22 @@ class StitcherPanel(_Panel):
             "placements.")
         self.v.addLayout(_row(QLabel("Registration channel:"), self.reg_channel_combo))
 
+        # maragall/stitcher's Timepoint spin (app.py:1428). Not cosmetics: the geometry is
+        # solved at ONE timepoint, and that timepoint used to be a hardcoded 0 with no way to
+        # see or set it -- the same defect CLASS as the registration-channel substitution bug
+        # (a solve running somewhere the user cannot name). Hidden on a single-timepoint
+        # acquisition, where the only legal value is 0 and a spin would be furniture.
+        n_t = int(((getattr(host, "_meta", None) or {}).get("n_t")) or 1)
+        self.reg_t_spin = QSpinBox()
+        self.reg_t_spin.setRange(0, max(n_t - 1, 0))
+        self.reg_t_spin.setToolTip(
+            "Which timepoint the pose graph is solved on. Every timepoint is then fused with "
+            "that ONE solution, so a drifting stage does not give t=0 and t=9 different "
+            "placements.")
+        self.reg_t_row = _row(QLabel("Registration timepoint:"), self.reg_t_spin)
+        if n_t > 1:
+            self.v.addLayout(self.reg_t_row)
+
         self.rel_spin = QSpinBox()
         self.rel_spin.setRange(1, 200)
         self.rel_spin.setValue(STITCH_DEFAULTS["outlier_rel_pct"])
@@ -410,6 +424,22 @@ class StitcherPanel(_Panel):
         self.v.addLayout(_row(QLabel("Outlier rel:"), self.rel_spin,
                               QLabel("abs:"), self.abs_spin))
 
+        # "Correct lens distortion (per-seam elastic)" -- maragall/stitcher app.py:1472, the
+        # control Julio asked about by name.
+        #
+        # In the reference tool this checkbox is DEAD: `distortion_checkbox` is created and
+        # never read, so FusionWorker's enable_distortion default (True) always wins and
+        # unchecking it changes nothing. Here it decides, and tests pin both directions.
+        self.distortion_cb = QCheckBox("Correct lens distortion (per-seam elastic)")
+        self.distortion_cb.setChecked(STITCH_DEFAULTS["correct_distortion"])
+        self.distortion_cb.setToolTip(
+            "Fit a per-tile elastic warp from the REGISTERED seams and apply it during fusion "
+            "(tilefusion.distortion). It corrects what a rigid solve cannot: field curvature "
+            "and lens distortion bending each tile, which shows up as seams that are sharp in "
+            "the middle and doubled at the ends.\n\n"
+            "Needs registration -- it corrects the residual left after the global solve.")
+        self.v.addWidget(self.distortion_cb)
+
         # -- fusion --------------------------------------------------------------------
         self.v.addWidget(_head("FUSION"))
         self.blend_spin = QSpinBox()
@@ -421,7 +451,14 @@ class StitcherPanel(_Panel):
             "set the measured overlap is ~208 px, which is what the 128 px default was sized "
             "against. A ramp wider than the overlap never reaches full weight and dims the "
             "seam.")
-        self.v.addLayout(_row(QLabel("Blend width:"), self.blend_spin))
+        self.blend_auto_cb = QCheckBox("Auto (measure the real overlap)")
+        self.blend_auto_cb.setChecked(STITCH_DEFAULTS["auto_blend"])
+        self.blend_auto_cb.setToolTip(
+            "Measure this acquisition's actual seam overlap and size the ramp to it (median "
+            "overlap x 2), instead of the fixed default -- which is sized to ONE acquisition "
+            "(~208 px on the 10x tissue set) and is wrong on a denser grid.")
+        self.blend_auto_cb.toggled.connect(lambda on: self.blend_spin.setEnabled(not on))
+        self.v.addLayout(_row(QLabel("Blend width:"), self.blend_spin, self.blend_auto_cb))
 
         self.channel_boxes = []
         if names:
@@ -470,7 +507,8 @@ class StitcherPanel(_Panel):
     # -- behaviour ---------------------------------------------------------------------
     def _on_register_toggled(self, on: bool) -> None:
         """Grey out the knobs that provably do nothing with registration off."""
-        for w in (self.reg_channel_combo, self.rel_spin, self.abs_spin):
+        for w in (self.reg_channel_combo, self.rel_spin, self.abs_spin,
+                  self.reg_t_spin, self.distortion_cb):
             w.setEnabled(bool(on))
 
     def _check_projector(self, name: str) -> None:
@@ -489,6 +527,9 @@ class StitcherPanel(_Panel):
                                   if self.register_cb.isChecked() else None),
             channels=selected if self.channel_boxes else None,
             blend_px=self.blend_spin.value(),
+            auto_blend=self.blend_auto_cb.isChecked(),
+            correct_distortion=self.distortion_cb.isChecked(),
+            registration_t=self.reg_t_spin.value(),
             outlier_rel_pct=self.rel_spin.value(),
             outlier_abs_px=self.abs_spin.value(),
             n_channels=len(self.channel_boxes) or None,
@@ -506,9 +547,10 @@ class StitcherPanel(_Panel):
             self.say(str(exc))
             return
         kwargs["projector"] = self.projector_combo.currentText()
-        _label, regions = self._scopes[max(self.scope_combo.currentIndex(), 0)]
         self.say("")
-        self.host.run_operator("stitch", regions=regions,
+        # regions=None means UNSCOPED, not "the whole plate": run_operator resolves it against
+        # the run selector and the live selection. See the SCOPE note in __init__.
+        self.host.run_operator("stitch", regions=None,
                                save=self.save_cb.isChecked(), operator_kwargs=kwargs)
 
 
