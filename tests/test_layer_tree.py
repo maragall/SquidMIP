@@ -154,3 +154,180 @@ def test_the_3d_button_is_naparis_own_and_sits_where_a_short_pane_shows_it(tmp_p
     # One owner: dims. The button READS it, it does not keep a second copy.
     assert got["follows_model_write"] is True
     assert got["unchecks_on_model_write"] is False
+
+
+# ---------------------------------------------------------------- the grouped tree
+#
+# 5 processing layers x 4 channels + 4 raw = 24 rows in a FLAT LayerList. napari 0.6.6 has no
+# layer groups (zero LayerGroup symbols; upstream #2229 open since Feb 2021), and
+# `channel_axis=` provably splits into one layer per channel, so 4-layers-per-operator is
+# idiomatic napari rather than our mistake. Both shipped precedents -- brainglobe's
+# napari-experimental and PartSeg -- answer this by REPLACING THE LAYER-LIST UI, not by capping
+# the layer count. This is that: a two-level view over the same layers.
+
+from PyQt5.QtCore import Qt                                          # noqa: E402
+from PyQt5.QtWidgets import QApplication                             # noqa: E402
+
+import numpy as np                                                   # noqa: E402
+
+from squidmip._napari_view import MosaicLayers                       # noqa: E402
+from squidmip._layer_tree import MosaicTree                          # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    return QApplication.instance() or QApplication([])
+
+
+def _img(seed=0, shape=(8, 8)):
+    return np.random.default_rng(seed).integers(0, 4000, shape, dtype="uint16")
+
+
+@pytest.fixture
+def mosaic():
+    from napari.components import ViewerModel
+
+    m = MosaicLayers(ViewerModel())
+    for i, op in enumerate(("raw", "stitched")):
+        for j, ch in enumerate(("405", "488", "561", "638")):
+            m.add_mosaic(op, ch, _img(i * 10 + j))
+    return m
+
+
+@pytest.fixture
+def tree(qapp, mosaic):
+    return MosaicTree(mosaic)
+
+
+def _op_index(tree, row):
+    return tree.model().index(row, 0)
+
+
+def _ch_index(tree, op_row, ch_row):
+    return tree.model().index(ch_row, 0, _op_index(tree, op_row))
+
+
+def test_the_tree_is_two_levels_processing_layer_then_channels(tree, mosaic):
+    """24 flat rows become 5 collapsible ones. That is the whole point."""
+    m = tree.model()
+    assert m.rowCount() == 2, "processing layers are the top level"
+    assert [m.data(_op_index(tree, r), Qt.DisplayRole) for r in range(2)] == ["raw", "stitched"]
+    for r in range(2):
+        op = mosaic.ops()[r]
+        assert m.rowCount(_op_index(tree, r)) == 4
+        assert [
+            m.data(_ch_index(tree, r, c), Qt.DisplayRole) for c in range(4)
+        ] == mosaic.channels(op)
+
+
+def test_the_tree_reads_visibility_off_the_layer_and_keeps_no_copy(tree, mosaic):
+    """THE constraint. Two representations of one truth, hand-synced, is this project's
+    dominant defect shape (4+ confirmed, most recently the contrast sync silently killed by
+    layer recreation). The tree is a VIEW: napari's Image layer owns ``visible``."""
+    m = tree.model()
+    assert m.data(_ch_index(tree, 0, 0), Qt.CheckStateRole) == Qt.Checked
+
+    # Change it BEHIND the tree's back, the way napari's own layer list does.
+    mosaic.find("raw", "405").visible = False
+    assert m.data(_ch_index(tree, 0, 0), Qt.CheckStateRole) == Qt.Unchecked, (
+        "the tree is holding its own copy of visibility instead of reading the layer"
+    )
+
+
+def test_an_external_visibility_change_repaints_the_row(tree, mosaic, qapp):
+    """Reading the truth is not enough if nothing tells Qt to re-read it. Without this the
+    checkbox is correct only until someone touches napari's own list."""
+    m = tree.model()
+    seen = []
+    m.dataChanged.connect(lambda tl, br, roles=None: seen.append(tl))
+    mosaic.find("raw", "488").visible = False
+    qapp.processEvents()
+    assert seen, "changing layer.visible elsewhere left the tree's checkbox stale"
+
+
+def test_toggling_a_processing_layer_toggles_its_four_channels(tree, mosaic):
+    """The before/after-stitching gesture, at group level."""
+    m = tree.model()
+    assert m.setData(_op_index(tree, 1), Qt.Unchecked, Qt.CheckStateRole) is True
+    assert [ly.visible for ly in mosaic.group("stitched")] == [False] * 4
+    assert [ly.visible for ly in mosaic.group("raw")] == [True] * 4, "it toggled the wrong group"
+
+    m.setData(_op_index(tree, 1), Qt.Checked, Qt.CheckStateRole)
+    assert [ly.visible for ly in mosaic.group("stitched")] == [True] * 4
+
+
+def test_a_group_check_state_is_derived_from_its_channels_not_stored(tree, mosaic):
+    """napari-experimental keeps ``GroupLayer._visible`` and documents the consequence: nothing
+    syncs it upward, so a group checkbox drifts out of step with its own contents. We derive it
+    instead -- there is no group state to drift."""
+    m = tree.model()
+    assert m.data(_op_index(tree, 0), Qt.CheckStateRole) == Qt.Checked
+
+    mosaic.find("raw", "561").visible = False
+    assert m.data(_op_index(tree, 0), Qt.CheckStateRole) == Qt.PartiallyChecked, (
+        "one hidden channel out of four is neither on nor off"
+    )
+    for ly in mosaic.group("raw"):
+        ly.visible = False
+    assert m.data(_op_index(tree, 0), Qt.CheckStateRole) == Qt.Unchecked
+
+
+def test_toggling_one_channel_writes_that_layer_only(tree, mosaic):
+    m = tree.model()
+    m.setData(_ch_index(tree, 0, 2), Qt.Unchecked, Qt.CheckStateRole)
+    assert [ly.visible for ly in mosaic.group("raw")] == [True, True, False, True]
+
+
+def test_the_tree_survives_layers_being_destroyed_and_recreated(tree, mosaic, qapp):
+    """_load_mosaic (_viewer.py:5092) destroys and recreates every layer on each region change.
+    That already killed the contrast sync silently, because the subscription was bound to layer
+    OBJECTS that no longer existed. Identity here is (op, channel) out of layer.metadata, so a
+    rebuilt layer is the same row -- and the checkbox drives the NEW object."""
+    m = tree.model()
+    for op in list(mosaic.ops()):
+        mosaic.remove_op(op)
+    qapp.processEvents()
+    assert m.rowCount() == 0, "the tree kept rows for layers that no longer exist"
+
+    for i, op in enumerate(("raw", "stitched")):
+        for j, ch in enumerate(("405", "488", "561", "638")):
+            mosaic.add_mosaic(op, ch, _img(100 + i * 10 + j))
+    qapp.processEvents()
+
+    assert m.rowCount() == 2
+    assert m.rowCount(_op_index(tree, 0)) == 4
+    m.setData(_ch_index(tree, 0, 0), Qt.Unchecked, Qt.CheckStateRole)
+    assert mosaic.find("raw", "405").visible is False, (
+        "the tree is still driving the DESTROYED layer object -- the contrast-sync bug again"
+    )
+
+    # And the SUBSCRIPTION has to be rebuilt too, not just the rows. Subscribing once at
+    # construction is exactly what killed on_user_contrast: it kept listening to layers that
+    # no longer existed and reported nothing, forever, without an error.
+    seen = []
+    m.dataChanged.connect(lambda tl, br, roles=None: seen.append(tl))
+    mosaic.find("stitched", "638").visible = False
+    qapp.processEvents()
+    assert seen, (
+        "after layers were recreated the tree stopped hearing visibility changes -- it is "
+        "still subscribed to the destroyed objects"
+    )
+
+
+def test_foreign_layers_never_appear_in_the_tree(tree, mosaic, qapp):
+    """A points layer a plugin added is not one of our mosaics. Tolerated, not shown, and above
+    all not crashed on -- key_of returns None for anything without our metadata."""
+    m = tree.model()
+    mosaic.model.add_image(_img(7), name="somebody else's layer")
+    qapp.processEvents()
+    assert m.rowCount() == 2
+    assert [m.data(_op_index(tree, r), Qt.DisplayRole) for r in range(2)] == ["raw", "stitched"]
+
+
+def test_checkboxes_are_actually_offered_to_the_user(tree):
+    """A model that answers CheckStateRole but does not set ItemIsUserCheckable renders a tree
+    with no checkboxes at all -- readable, unclickable, and green under every test above."""
+    m = tree.model()
+    for idx in (_op_index(tree, 0), _ch_index(tree, 0, 0)):
+        assert m.flags(idx) & Qt.ItemIsUserCheckable
+        assert m.flags(idx) & Qt.ItemIsEnabled
