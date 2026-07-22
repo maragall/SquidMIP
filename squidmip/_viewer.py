@@ -5655,8 +5655,8 @@ class PlateWindow(QMainWindow):
         if self._pending_dims_step and self._napari_z_axis() is not None:
             z_now = int(self._pending_dims_step[self._napari_z_axis()])
         w = _MosaicWorker(self._reader, self._meta, region, channels, z_index=z_now, parent=self)
-        w.ready.connect(lambda r, ch, plane, bbox, win:
-                        self._on_mosaic_plane(op, r, ch, plane, bbox, win))
+        w.ready.connect(lambda r, ch, levels, bbox:
+                        self._on_mosaic_plane(op, r, ch, levels, bbox))
         w.problem.connect(lambda msg: pane.say(msg))
         w.finished_count.connect(lambda n: self._on_mosaic_done(op, region, n))
         self._mosaic_worker = w

@@ -4841,3 +4841,80 @@ def test_operator_label_falls_back_to_the_key_for_a_cardless_operator():
     # than raising a bare KeyError out of the event loop.
     assert V.operator_label("reference") == "reference"
     assert V.operator_label("mip") == V._OPERATIONS_BY_KEY["mip"].label
+
+
+
+
+# -------------------------------- the mosaic worker's signal must reach the slot it is wired to
+#
+# This bit TWICE in one day and the suite never saw it, because every other test calls
+# `_on_mosaic_plane` DIRECTLY. `_MosaicWorker.ready` lost an argument, the lambda in
+# `_load_mosaic` kept five parameters, and nothing failed until the GUI ran -- PyQt raises
+# inside emit(), the region never loads, and the only symptom is a black pane. A test that
+# bypasses the CONNECTION cannot see a connection that is wrong, so this one goes through it.
+
+def test_the_mosaic_workers_signal_actually_reaches_on_mosaic_plane(qapp, monkeypatch):
+    """Drive the real `_load_mosaic` wiring, then emit the real signal down it.
+
+    MUTATION: give the lambda in `_load_mosaic` a parameter the signal does not emit (which is
+    exactly what the pyramid merge left behind) and this stops passing -- verified. It goes
+    down as an ABORT rather than an assertion, because that is literally what PyQt does with an
+    exception raised inside emit(); the point is that it is no longer green.
+    """
+    landed = []
+
+    class _Mosaic:
+        model = None            # no napari model here; `_napari_dims` reads through it
+
+        def add_mosaic(self, *a, **kw):
+            pass
+
+        def remove_op(self, op):
+            return []
+
+    class _Pane:
+        ok = True
+        mosaic = _Mosaic()
+
+        def say(self, msg):
+            pass
+
+    # _MosaicWorker is constructed with `parent=self`, and a QObject parent must be a live
+    # QObject -- which the __new__ shell is not. Build a REAL window and this test passes, but
+    # it also leaves a napari/GL window behind that segfaults a later test in the same process.
+    # So: keep the shell, and drop only the Qt parentage. Everything under test -- the signal,
+    # the lambda, the slot -- is untouched by that.
+    class _NoParentWorker(V._MosaicWorker):
+        def __init__(self, *a, parent=None, **k):
+            super().__init__(*a, parent=None, **k)
+
+    monkeypatch.setattr(V, "_MosaicWorker", _NoParentWorker)
+
+    win = V.PlateWindow.__new__(V.PlateWindow)
+    win._mosaic_pane = _Pane()
+    win._reader = _PyrReader()
+    win._meta = _pyr_meta()
+    win._mosaic_worker = None
+    win._pending_dims_step = None
+    from squidmip._region_nav import RegionCursor
+    win._cursor = RegionCursor()
+    win._cursor.set_order(["A1"])
+    win._cursor.activate("A1")
+    monkeypatch.setattr(V.PlateWindow, "_napari_z_axis", lambda self: None)
+    monkeypatch.setattr(V.PlateWindow, "_on_mosaic_plane",
+                        lambda self, *a: landed.append(a))
+    monkeypatch.setattr(V._MosaicWorker, "start", lambda self: None)   # no thread; wiring only
+
+    V.PlateWindow._load_mosaic(win, region="A1")
+    worker = win._mosaic_worker
+    assert worker is not None, "_load_mosaic built no worker"
+
+    # Emit exactly what the worker emits in `run()`. A lambda that does not match this
+    # raises inside PyQt's emit and the mosaic silently never arrives.
+    levels = [np.zeros((4, 8, 8), "uint16")]
+    worker.ready.emit("A1", "488", levels, (0.0, 0.0, 8.0, 8.0))
+
+    assert landed, "the ready signal never reached _on_mosaic_plane"
+    op, region, channel, got_levels, bbox = landed[0]
+    assert (op, region, channel) == ("raw", "A1", "488")
+    assert got_levels is levels
