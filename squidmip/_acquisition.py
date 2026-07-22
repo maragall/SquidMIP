@@ -122,19 +122,21 @@ class Channel(BaseModel):
     """Excitation wavelength (nm) when the channel YAML records one."""
 
     # -- Mapping shim: `c["name"]` is written at many call sites; keep it working. -------
+    # Membership is tested against the module-level _CHANNEL_KEYS, never against
+    # `model_fields` — see the note above _ACQ_KEYS.
     def __getitem__(self, key: str):
-        if key not in type(self).model_fields:
+        if key not in _CHANNEL_FIELDSET:
             raise KeyError(key)
         return getattr(self, key)
 
     def get(self, key: str, default=None):
-        return getattr(self, key, default) if key in type(self).model_fields else default
+        return getattr(self, key) if key in _CHANNEL_FIELDSET else default
 
     def __contains__(self, key: object) -> bool:
-        return key in type(self).model_fields
+        return key in _CHANNEL_FIELDSET
 
     def keys(self):
-        return type(self).model_fields.keys()
+        return _CHANNEL_KEYS
 
 
 class Acquisition(BaseModel):
@@ -169,8 +171,12 @@ class Acquisition(BaseModel):
     z_levels: list[int]
     """The z level values themselves; ``len`` must equal *n_z*."""
 
-    dz_um: Optional[float] = Field(default=None, gt=0)
-    """Z step in micrometres. Optional; use :meth:`require_dz_um` where it is load-bearing."""
+    dz_um: Optional[float] = Field(default=None, ge=0)
+    """Z step in micrometres. Optional, and legitimately **0.0** on a single-plane acquisition
+    (``delta_z_mm: 0`` with ``nz: 1``), which is why the bound here is ``ge=0`` and not ``gt=0``
+    — an early draft used ``gt=0`` and correctly refused four of this repo's own fixtures.
+    A zero step is only meaningless once it is used as a z SCALE, so that is where it is
+    refused: :meth:`require_dz_um`."""
 
     pixel_size_um: Optional[float] = Field(default=None, gt=0)
     """Object-space pixel size (µm), binning-aware, straight from ``acquisition.yaml``.
@@ -243,10 +249,13 @@ class Acquisition(BaseModel):
         A missing z step rendered as 1.0 makes an anisotropic stack look isotropic — on the
         tissue set, dz 1.5µm against pixel 0.752µm, i.e. 2x squashed in z, with nothing said.
         """
-        if self.dz_um is None:
+        if not self.dz_um:
             raise ValueError(
-                "dz_um is required here, but this acquisition has none. Defaulting it to 1.0 "
-                "would render an anisotropic z-stack as an isotropic volume. Add "
+                f"dz_um is required here, but this acquisition has dz_um={self.dz_um!r}. "
+                "Defaulting it to 1.0 would render an anisotropic z-stack as an isotropic "
+                "volume — on the tissue set, dz 1.5um against pixel 0.752um, i.e. 2x squashed "
+                "in z, with nothing said. A 0.0 step is stored honestly on a single-plane "
+                "acquisition but cannot be used as a scale either. Add a real "
                 "z_stack.delta_z_mm to acquisition.yaml."
             )
         return float(self.dz_um)
@@ -278,29 +287,45 @@ class Acquisition(BaseModel):
     # block once the last subscript is gone.
 
     def __getitem__(self, key: str) -> Any:
-        if key not in type(self).model_fields:
+        if key not in _ACQ_FIELDSET:
             raise KeyError(key)
         return getattr(self, key)
 
     def get(self, key: str, default: Any = None) -> Any:
-        return getattr(self, key) if key in type(self).model_fields else default
+        return getattr(self, key) if key in _ACQ_FIELDSET else default
 
     def __contains__(self, key: object) -> bool:
-        return key in type(self).model_fields
+        return key in _ACQ_FIELDSET
 
     def keys(self):
-        return type(self).model_fields.keys()
+        return _ACQ_KEYS
 
     def values(self):
-        return [getattr(self, k) for k in type(self).model_fields]
+        return [getattr(self, k) for k in _ACQ_KEYS]
 
     def items(self):
-        return [(k, getattr(self, k)) for k in type(self).model_fields]
+        return [(k, getattr(self, k)) for k in _ACQ_KEYS]
 
     def __iter__(self) -> Iterator[str]:      # type: ignore[override]
         # Mapping iteration (so `dict(meta)` works). BaseModel.__iter__ yields (k, v) pairs;
         # a dict built from THAT is right by accident and wrong for `for k in meta`.
-        return iter(type(self).model_fields)
+        return iter(_ACQ_KEYS)
 
     def __len__(self) -> int:
-        return len(type(self).model_fields)
+        return len(_ACQ_KEYS)
+
+
+# The field names, resolved ONCE at import.
+#
+# This is not a micro-optimisation, it is a bug fix. `model_fields` is a pydantic
+# CLASSPROPERTY that does real work on every access, so the first draft of the Mapping shim
+# above — which consulted it on every `meta["..."]` — was ~18x slower than the plain dict it
+# replaced (measured: 0.42us vs 0.023us per lookup). `reader.metadata` is read in the viewer's
+# paint and ingest paths, and that was enough to push Qt tests past their _drain_until
+# timeouts: test_viewer.py went from ~60s to ~110s and failed a DIFFERENT test on 2 of 3 runs,
+# which reads exactly like flakiness and was not. Membership is a frozenset, order comes from
+# the tuple, and neither touches pydantic at lookup time.
+_ACQ_KEYS: tuple[str, ...] = tuple(Acquisition.model_fields)
+_ACQ_FIELDSET = frozenset(_ACQ_KEYS)
+_CHANNEL_KEYS: tuple[str, ...] = tuple(Channel.model_fields)
+_CHANNEL_FIELDSET = frozenset(_CHANNEL_KEYS)
