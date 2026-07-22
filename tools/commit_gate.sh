@@ -62,13 +62,50 @@ if ! QT_QPA_PLATFORM=offscreen PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   fi
   FAILED=$(grep -E "^FAILED " /tmp/squidhcs_gate.$$ | sed 's/^FAILED //; s/ .*//' || true)
   if [ -n "$FAILED" ]; then
-    echo "commit-gate: re-running failures in isolation to separate flakes from breakage ..."
+    # ALWAYS say what failed. The previous version printed only "known flakes (IMA-258)" and then
+    # deleted the log, so nobody could tell WHICH tests failed or whether they were the known set.
+    echo "commit-gate: these tests failed in the full run:"
+    echo "$FAILED" | sed 's/^/    /'
+
+    # A flake is tolerated only if it is NAMED here. The previous version re-ran whatever failed
+    # and, if the re-run passed, announced "known flakes (IMA-258)" -- a claim it never checked,
+    # against a set that is defined NOWHERE in this repo. Worse, re-running a SUBSET is a strictly
+    # WEAKER condition than the full run: any test that fails only under full-suite conditions
+    # (ordering, shared state, resource pressure) passes the re-run and gets waved through as a
+    # "flake". Real breakage of that shape was indistinguishable from a flake.
+    #
+    # This list is EMPTY on purpose. The suite is currently 1030 passed / 0 failed, so there is no
+    # flake to name. If a genuine flake appears, add its test id here WITH its ticket, and it must
+    # still pass the isolation re-run below. An unnamed failure now refuses the commit.
+    KNOWN_FLAKES=""
+
+    UNKNOWN=""
+    for t in $FAILED; do
+      case " $KNOWN_FLAKES " in
+        *" $t "*) ;;
+        *) UNKNOWN="$UNKNOWN $t" ;;
+      esac
+    done
+
+    if [ -n "$UNKNOWN" ]; then
+      echo ""
+      echo "commit-gate: REFUSED. These failures are NOT named known flakes:"
+      echo "$UNKNOWN" | tr ' ' '\n' | sed '/^$/d; s/^/    /'
+      echo ""
+      echo "  a failure is only tolerated if it is listed in KNOWN_FLAKES with its ticket."
+      echo "  fix it, or name it there and say why it races."
+      rm -f /tmp/squidhcs_gate.$$
+      exit 1
+    fi
+
+    echo "commit-gate: re-running the named flakes in isolation ..."
     if QT_QPA_PLATFORM=offscreen PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
        python -m pytest -q $FAILED >/dev/null 2>&1; then
-      echo "commit-gate: all failures passed in isolation - known flakes (IMA-258). Allowing."
+      echo "commit-gate: named flakes passed in isolation. Allowing."
       rm -f /tmp/squidhcs_gate.$$
       exit 0
     fi
+    echo "commit-gate: a NAMED flake failed even in isolation - that is breakage, not a race."
   fi
   echo ""
   tail -30 /tmp/squidhcs_gate.$$
