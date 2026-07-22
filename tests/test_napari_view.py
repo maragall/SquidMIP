@@ -304,42 +304,90 @@ def test_every_required_binding_is_individually_load_bearing():
 # a test failure rather than a dead test session.
 
 _EMBED_SCRIPT = r"""
-import json, os, sys
+import json, os, sys, traceback
 # Deliberately NOT forcing QT_QPA_PLATFORM=offscreen: the offscreen plugin ships no GL
 # ("QOpenGLWidget is not supported on this platform", "does not support
 # createPlatformOpenGLContext"), so a vispy canvas segfaults under it. On a machine with a
 # display this runs for real; on a headless box it fails cleanly and the test skips with the
 # reason attached rather than pretending to have verified something.
 import numpy as np
-from qtpy.QtWidgets import QApplication, QHBoxLayout, QWidget
+# PyQt5 explicitly, and QT_API pinned before any qtpy import. squidmip imports PyQt5 directly,
+# while qtpy defaults to PySide6 here; loading both aborts the process with "Class QMacAutoRelease
+# PoolTracker is implemented in both ... QtCore" long before any assertion runs. Test the binding
+# production actually uses.
+os.environ.setdefault("QT_API", "pyqt5")
+from PyQt5.QtWidgets import QApplication, QHBoxLayout, QWidget
 app = QApplication.instance() or QApplication([])
-from squidmip._napari_view import build_pane
 
-host = QWidget()
-lay = QHBoxLayout(host)
-widget, mosaic = build_pane()
-lay.addWidget(widget)
-app.processEvents()
+# Report OUR OWN errors as EMBEDFAIL, distinct from "this box has no GL". The previous version
+# of this script destructured `widget, mosaic = build_pane()` after build_pane grew a third
+# return value; it raised, printed no EMBED line, and the test SKIPPED -- so it read green for
+# its whole life while asserting nothing. A skip and a bug must not look the same.
+try:
+    from squidmip._napari_pane import MosaicPane
 
-mosaic.add_mosaic("raw", "488", np.zeros((32, 32), dtype="uint16"))
-out = {
-    "is_qwidget": isinstance(widget, QWidget),
-    "parented_into_ours": widget.parent() is host,
-    "dock_widgets": len([c for c in widget.findChildren(QWidget)
-                         if type(c).__name__.endswith("DockWidget")]),
-    "layer_controls": len([c for c in widget.findChildren(QWidget)
-                           if "QtLayerControlsContainer" in type(c).__name__]),
-    "ops": mosaic.ops(),
-}
-print("EMBED " + json.dumps(out))
+    host = QWidget()
+    lay = QHBoxLayout(host)
+    pane = MosaicPane()
+    lay.addWidget(pane)
+    app.processEvents()
+
+    pane.mosaic.add_mosaic("raw", "488", np.zeros((32, 32), dtype="uint16"))
+    app.processEvents()
+
+    win = pane._native_window
+    central = win.centralWidget() if win is not None else None
+    canvas = pane.canvas
+
+    def descends_from(child, ancestor):
+        node = child
+        while node is not None:
+            if node is ancestor:
+                return True
+            node = node.parent()
+        return False
+
+    out = {
+        "native_window_embedded": win is not None,
+        "window_is_in_our_pane": descends_from(win, pane) if win is not None else False,
+        # THE INVARIANT THIS FILE EXISTS FOR: the canvas must still live inside napari's own
+        # QMainWindow. Reparenting it out left the window gutted -- docks and layer controls
+        # still showed, so the pane looked alive while the mosaic had nowhere to paint.
+        "canvas_still_inside_napari_window": (
+            descends_from(canvas, win) if (win is not None and canvas is not None) else False
+        ),
+        "central_is_not_empty": (
+            len(central.findChildren(QWidget)) > 0 if central is not None else False
+        ),
+        # napari's real chrome SHOULD be present now -- that is the whole point of embedding the
+        # real window instead of rebuilding its parts by hand.
+        "layer_controls": len([c for c in win.findChildren(QWidget)
+                               if "QtLayerControlsContainer" in type(c).__name__])
+                          if win is not None else 0,
+        "ops": pane.mosaic.ops(),
+    }
+    print("EMBED " + json.dumps(out))
+except BaseException:
+    print("EMBEDFAIL " + json.dumps(traceback.format_exc()))
 sys.stdout.flush()
 os._exit(0)
 """
 
 
-def test_the_canvas_embeds_with_no_window_menus_or_docks(tmp_path):
-    """The public embedding path: ViewerModel + napari.qt.QtViewer, no napari Window at all,
-    so the menu bar / docks / plugin surface are never constructed in the first place."""
+def test_the_canvas_stays_inside_the_embedded_napari_window(tmp_path):
+    """napari's canvas must remain its QMainWindow's central widget after we embed that window.
+
+    ``MosaicPane`` used to call ``canvas.setParent(self)``, which RIPS the QtViewer out of
+    napari's own window. ``_embed_native_window`` then embedded the gutted window: the docks and
+    layer controls came along, so the pane looked alive and populated, while the canvas sat
+    parented to the pane and added to no layout at all. Every mosaic layer was present and
+    correct in the layer list and nothing painted -- reported as "canvas is still showing blank
+    for the array, so I can't test the central viewer".
+
+    This is the project's silent-failure shape again: the failure surfaced as absence (a black
+    rectangle), and every readable signal -- layer list, contrast controls, blending -- said the
+    viewer was fine. So assert the STRUCTURE, not the appearance.
+    """
     import json
     import subprocess
     import sys
@@ -360,11 +408,19 @@ def test_the_canvas_embeds_with_no_window_menus_or_docks(tmp_path):
     # let Qt pick the real platform: on a machine with a display this actually verifies, and on
     # a headless one it fails cleanly into the skip below with the reason attached.
     env.pop("QT_QPA_PLATFORM", None)
+    # Both PyQt5 and PySide6 are installed here. squidmip imports PyQt5, so qtpy (and napari
+    # through it) must resolve to the same binding or the process aborts before asserting.
+    env["QT_API"] = "pyqt5"
 
     proc = subprocess.run(
         [sys.executable, str(script)],
         capture_output=True, text=True, timeout=300, cwd=str(repo), env=env,
     )
+    # An exception in OUR code is a FAILURE, not a skip. Only a genuinely GL-less box skips.
+    failed = [ln for ln in proc.stdout.splitlines() if ln.startswith("EMBEDFAIL ")]
+    if failed:
+        pytest.fail("embedding raised:\n" + json.loads(failed[0][len("EMBEDFAIL "):]))
+
     line = [ln for ln in proc.stdout.splitlines() if ln.startswith("EMBED ")]
     if not line:
         pytest.skip(
@@ -373,11 +429,14 @@ def test_the_canvas_embeds_with_no_window_menus_or_docks(tmp_path):
         )
 
     got = json.loads(line[0][len("EMBED "):])
-    assert got["is_qwidget"] is True
-    assert got["parented_into_ours"] is True
-    # no napari chrome came along for the ride
-    assert got["dock_widgets"] == 0
-    assert got["layer_controls"] == 0
+    assert got["native_window_embedded"] is True
+    assert got["window_is_in_our_pane"] is True
+    # THE regression: rip the canvas out of napari's window and the mosaic has nowhere to paint.
+    assert got["canvas_still_inside_napari_window"] is True
+    assert got["central_is_not_empty"] is True
+    # napari's real controls are the reason we embed the real window; their absence means we are
+    # back to hand-rebuilding them.
+    assert got["layer_controls"] >= 1
     assert got["ops"] == ["raw"]
 
 

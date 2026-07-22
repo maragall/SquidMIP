@@ -129,8 +129,13 @@ class MosaicPane(QWidget):
 
             canvas, mosaic, viewer = build_pane()
             self._viewer = viewer
-            canvas.setParent(self)
-            canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            # DO NOT reparent the canvas here. It is the QMainWindow's CENTRAL WIDGET, and
+            # setParent() on it rips it out of napari's own window -- which _embed_native_window
+            # then embeds, gutted. The docks and layer controls still came along, so the pane
+            # looked alive while the mosaic had nowhere to paint: reported as "canvas is still
+            # showing blank for the array, so I can't test the central viewer". The canvas is
+            # kept only as a HANDLE (and for the bare-canvas fallback, which is the one path
+            # allowed to reparent it, because there the QMainWindow is unusable anyway).
             self.canvas = canvas
             self.mosaic = mosaic
 
