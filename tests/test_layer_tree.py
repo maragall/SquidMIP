@@ -331,3 +331,92 @@ def test_checkboxes_are_actually_offered_to_the_user(tree):
     for idx in (_op_index(tree, 0), _ch_index(tree, 0, 0)):
         assert m.flags(idx) & Qt.ItemIsUserCheckable
         assert m.flags(idx) & Qt.ItemIsEnabled
+
+
+# ------------------------------------------------- the tree, mounted in the real pane
+#
+# ALONGSIDE napari's own controls, not instead of them. napari-experimental's ethos is that the
+# main layer list should only add/remove layers; PartSeg goes further and deletes napari's docks
+# outright (dockLayerList.deleteLater()). We do neither: dc0f288 embeds the REAL napari window
+# precisely because hand-rebuilt controls were rejected as "not napari", and the two surfaces
+# cannot conflict here because both write the same layer.visible. Mounting through napari's own
+# public Window.add_dock_widget puts the tree where napari puts its own panels.
+
+_MOUNT_SCRIPT = r"""
+    host = QWidget()
+    host.resize(1440, 900)
+    lay = QVBoxLayout(host)
+    pane = MosaicPane()
+    lay.addWidget(pane)
+    host.show()
+    app.processEvents()
+
+    for op in ("raw", "stitched"):
+        for ch in ("405", "488", "561", "638"):
+            pane.mosaic.add_mosaic(op, ch, np.zeros((16, 16), dtype="uint16"))
+    app.processEvents()
+
+    from PyQt5.QtCore import Qt as _Qt
+    tree = pane.layer_tree
+
+    def descends_from(child, ancestor):
+        node = child
+        while node is not None:
+            if node is ancestor:
+                return True
+            node = node.parent()
+        return False
+
+    out["tree_exists"] = tree is not None
+    out["tree_visible"] = bool(tree.isVisible())
+    out["tree_is_in_our_pane"] = descends_from(tree, pane)
+    out["rows"] = tree.model().rowCount()
+    out["children_of_first"] = tree.model().rowCount(tree.model().index(0, 0))
+
+    # napari's own layer list must SURVIVE, and its canvas must still be its window's central
+    # widget -- adding a dock must not repeat 506c813.
+    win = pane._native_window
+    out["napari_layer_list_still_there"] = len([
+        w for w in win.findChildren(QWidget) if "QtLayerList" in type(w).__name__
+    ]) if win is not None else 0
+    out["canvas_still_inside_napari_window"] = descends_from(pane.canvas, win)
+
+    # The gesture: hide a whole processing layer from the tree.
+    idx = tree.model().index(1, 0)
+    tree.model().setData(idx, _Qt.Unchecked, _Qt.CheckStateRole)
+    app.processEvents()
+    out["group_hidden"] = [bool(l.visible) for l in pane.mosaic.group("stitched")]
+    out["other_group_untouched"] = [bool(l.visible) for l in pane.mosaic.group("raw")]
+
+    # ... and the reverse direction: napari's own list is still an owner, and the tree follows.
+    pane.mosaic.find("raw", "405").visible = False
+    app.processEvents()
+    out["leaf_state_after_external_change"] = int(
+        tree.model().data(tree.model().index(0, 0, tree.model().index(0, 0)), _Qt.CheckStateRole)
+    )
+    out["group_state_after_external_change"] = int(
+        tree.model().data(tree.model().index(0, 0), _Qt.CheckStateRole)
+    )
+"""
+
+
+def test_the_tree_is_mounted_beside_naparis_own_controls(tmp_path):
+    """The tree ships inside the real pane, and napari's own list survives next to it."""
+    got = _run_qt(_MOUNT_SCRIPT, tmp_path, "MOUNT")
+
+    assert got["tree_exists"] is True
+    assert got["tree_visible"] is True
+    assert got["tree_is_in_our_pane"] is True, "the tree was mounted somewhere the user cannot see"
+    assert got["rows"] == 2
+    assert got["children_of_first"] == 4
+    # NOT PartSeg: napari's docks stay. Rebuilding them by hand is what Julio rejected.
+    assert got["napari_layer_list_still_there"] >= 1, (
+        "napari's own layer list disappeared -- we replaced napari's controls instead of "
+        "adding to them"
+    )
+    # 506c813, again: adding a dock must never move the canvas out of napari's window.
+    assert got["canvas_still_inside_napari_window"] is True
+    assert got["group_hidden"] == [False] * 4
+    assert got["other_group_untouched"] == [True] * 4
+    assert got["leaf_state_after_external_change"] == 0        # Qt.Unchecked
+    assert got["group_state_after_external_change"] == 1       # Qt.PartiallyChecked

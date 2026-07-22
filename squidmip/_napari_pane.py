@@ -106,6 +106,7 @@ class MosaicPane(QWidget):
         self._viewer = None
         self._native_window = None
         self.ndisplay_button: Optional[QWidget] = None
+        self.layer_tree: Optional[QWidget] = None
         self._button_source = None               # keeps napari's row alive; see _install_ndisplay
         self.canvas: Optional[QWidget] = None
         self.failure: Optional[str] = None
@@ -159,6 +160,7 @@ class MosaicPane(QWidget):
             # behaviour, blending, the dims sliders, the ndisplay (2D/3D) button, the layer
             # controls AND the stylesheet all live. Use it.
             self._install_ndisplay_button(lay)
+            self._install_layer_tree()
             self._embed_native_window(lay)
             self._install_camera_settle()
         except Exception as exc:                 # noqa: BLE001 - reported, never swallowed
@@ -220,6 +222,44 @@ class MosaicPane(QWidget):
         row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         lay.addWidget(row)
         self.ndisplay_button = btn
+
+    # -- the grouped layer tree ---------------------------------------------------------
+    def _install_layer_tree(self) -> None:
+        """Dock the PROCESSING LAYER -> CHANNELS tree next to napari's own layer list.
+
+        24 flat rows (5 operators x 4 channels + 4 raw) is unusable, and napari 0.6.6 has no
+        groups to fix it with. ``squidmip._layer_tree`` explains that in full; this is only the
+        mounting.
+
+        ALONGSIDE napari's controls, not instead of them. PartSeg deletes napari's docks
+        outright (``dockLayerList.deleteLater()``) and rebuilds the surface; we do not, because
+        dc0f288 embeds the real napari window precisely after hand-rebuilt controls were
+        rejected as "not napari". The two surfaces cannot conflict: both write ``layer.visible``,
+        so toggling either repaints the other. napari-experimental's ethos ("the main layer list
+        should only be used to add/remove layers") is guidance for a plugin that owns ordering
+        too; ours does not.
+
+        Mounted through ``Window.add_dock_widget``, napari's own public API, so the tree is a
+        napari dock in napari's dock area with napari's styling -- rather than a panel of mine
+        bolted to the side, which is the shape that got rejected. ``tabify`` puts it in the same
+        tab group as the layer list instead of stealing vertical space on a small monitor.
+        """
+        if self.mosaic is None:
+            return
+        try:
+            from squidmip._layer_tree import MosaicTree
+
+            tree = MosaicTree(self.mosaic)
+            self._viewer.window.add_dock_widget(
+                tree, name="mosaic layers", area="left", tabify=True,
+            )
+        except Exception as exc:                 # noqa: BLE001 - said out loud, never swallowed
+            self.say(
+                f"the grouped layer tree could not be mounted ({type(exc).__name__}: {exc}); "
+                "napari's flat layer list is still there."
+            )
+            return
+        self.layer_tree = tree
 
     # -- the native napari window -------------------------------------------------------
     def _embed_native_window(self, lay) -> None:
