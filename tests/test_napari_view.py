@@ -379,3 +379,31 @@ def test_the_canvas_embeds_with_no_window_menus_or_docks(tmp_path):
     assert got["dock_widgets"] == 0
     assert got["layer_controls"] == 0
     assert got["ops"] == ["raw"]
+
+
+def test_channels_composite_additively_not_occluding_each_other():
+    """Fluorescence channels must SUM, not stack opaquely.
+
+    napari defaults every layer to blending='translucent', so the last-added layer occludes the
+    rest. On the 10x tissue set the channel order ends at 638 nm, whose palette colour is
+    #FF0000, so the whole mosaic rendered flat RED and read as a single-channel bug. Reported
+    from the live GUI: "Mosaic showing red, so like single collor".
+
+    _montage.py already states the intended model for the browser path: "the per-channel PNGs
+    with screen blending, which is the same additive composite". The canvas must match it.
+    """
+    import numpy as np
+
+    from napari.components import ViewerModel
+
+    from squidmip._napari_view import MosaicLayers
+
+    m = MosaicLayers(ViewerModel())
+    for ch in ("Fluorescence_405_nm_Ex", "Fluorescence_638_nm_Ex"):
+        m.add_mosaic("raw", ch, np.zeros((4, 4), dtype="uint16"))
+
+    blendings = {str(layer.blending) for layer in m.ours()}
+    assert blendings == {"additive"}, (
+        f"channels must composite additively; got {blendings}. With 'translucent' the last "
+        f"channel added hides every earlier one."
+    )

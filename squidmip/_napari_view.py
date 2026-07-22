@@ -307,6 +307,14 @@ class MosaicLayers:
             "name": key.label(),
             "metadata": key.as_metadata(),
             "visible": visible,
+            # ADDITIVE, not napari's default 'translucent'. Fluorescence channels are a COMPOSITE:
+            # each carries independent signal and they must sum, exactly as _montage.py already
+            # does in the browser ("screen blending, which is the same additive composite").
+            # With the default, the last-added layer simply OCCLUDES the rest — on the 10x tissue
+            # set the channel order ends 638 nm, whose palette colour is #FF0000, so the whole
+            # mosaic rendered flat RED and looked like a single-channel bug. Reported from the
+            # live GUI as "mosaic showing red, so like single collor".
+            "blending": "additive",
         }
         if contrast_limits is not None:
             lo, hi = float(contrast_limits[0]), float(contrast_limits[1])
