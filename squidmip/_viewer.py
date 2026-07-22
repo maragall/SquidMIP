@@ -4363,7 +4363,14 @@ class PlateWindow(QMainWindow):
         real imagery rather than black. Re-run the operator in the tab to recompute its frames."""
         if self._reader is None or self._overview is None or self._tabs_muted:
             return
-        if self._busy():
+        if _explore.operator_busy(self._worker, self._retired):
+            # Defer for an OPERATOR RUN only. Never for the raw preview: `_setup_raw_detail`
+            # re-scopes and restarts the preview itself, so a streaming preview is not a reason
+            # to postpone -- and postponing on it is what stranded the restore. Closing a tab
+            # while the preview streamed (which is most of the time on a real plate) left the
+            # viewer scoped to a subset whose tab no longer existed, until some unrelated thread
+            # happened to exit. See _explore.operator_busy: this is the third gate that was
+            # asking "is any producer alive" when the question is "is a RUN alive".
             self._request_resync()   # never retarget the slider a live run is pushing into — LATER
             return
         w = self._current_exploration()      # pane 3 owns scope now — not the index we were handed
@@ -4410,6 +4417,31 @@ class PlateWindow(QMainWindow):
             # say so IN THE TAB rather than in _readout: the run's progress writes _readout on every
             # well, so a note there would be gone before the user could read it.
             w.set_sync_pending(True)
+        if not _explore.operator_busy(self._worker, self._retired):
+            # NOTHING IS RUNNING, SO NOTHING WILL EVER DELIVER THIS. `_on_run_drained` is the only
+            # other caller, and it fires on QThread.finished -- so with no live thread the flag was
+            # set and then sat there forever. Closing an exploration tab on an idle window left the
+            # viewer scoped to the subset of a tab that no longer exists: the plate came back with
+            # ['B3:0'] instead of ['B2:0', 'B3:0'], one well silently missing.
+            #
+            # It looked like a flake (~50% in isolation) because the RAW PREVIEW worker is usually
+            # still streaming when a tab is closed by hand. When it was, its finish delivered the
+            # resync and everything worked; when it had already finished, the restore was lost.
+            # The bug was never in the timing -- deferral is simply only correct while something is
+            # running.
+            #
+            # Delivered on the event loop rather than inline: this is called from the middle of tab
+            # DISPOSAL, and re-entering _on_tab_changed there would rescope against a half-torn-down
+            # tab. A zero timer runs after the current stack unwinds, and processEvents() delivers
+            # it, so it stays deterministic for the tests too.
+            QTimer.singleShot(0, self._deliver_pending_resync)
+
+    def _deliver_pending_resync(self):
+        """Deliver a deferred tab switch. Idempotent, and re-defers if a run started meanwhile."""
+        if not self._pending_resync or _explore.operator_busy(self._worker, self._retired):
+            return
+        self._pending_resync = False
+        self._on_tab_changed(force=True)
 
     def _on_run_drained(self):
         """A worker thread has exited. Deliver any tab switch that was deferred while it ran.
@@ -4417,8 +4449,8 @@ class PlateWindow(QMainWindow):
         Fires on QThread.finished, so it also covers a run that was STOPPED (closing a tab mid-run)
         — ``_stop_worker`` returns immediately but the thread keeps going until its current well is
         done, and ``_busy()`` stays True for all of that window."""
-        if self._busy():
-            return                       # another (retired) worker is still draining — wait for it
+        if _explore.operator_busy(self._worker, self._retired):
+            return                       # another operator run is still draining — wait for it
         self._run_tab_key = self._run_view_tab_key = None
         if not self._pending_resync:
             return

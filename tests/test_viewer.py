@@ -4778,3 +4778,50 @@ def test_the_plate_adopts_napari_s_window_the_moment_a_region_lands(qapp, monkey
         f"the plate did not adopt napari's windows on arrival: {followed}")
     assert tinted == [(0, (0.0, 1.0, 0.0)), (1, (1.0, 1.0, 0.0))], (
         f"the plate did not adopt napari's colours on arrival: {tinted}")
+
+
+def test_closing_a_tab_restores_the_plate_even_while_the_raw_preview_streams(qapp, stub_detail,
+                                                                             squid_dataset):
+    """THE root cause of a ~50% flake, pinned as behaviour rather than as timing.
+
+    Three gates asked `self._busy()` — "is ANY producer thread alive" — when the question they
+    needed was "is an OPERATOR RUN alive". `_busy()` counts the raw plate preview, which is
+    streaming almost all the time on a real plate. So closing an exploration tab deferred the
+    restore, and the only thing that ever delivers a deferred restore is a worker thread exiting.
+    The viewer stayed scoped to the subset of a tab that no longer existed until some unrelated
+    thread happened to finish — the plate came back as ['B3:0'] instead of ['B2:0', 'B3:0'],
+    one well silently missing.
+
+    It read as a flake because it depended on whether the preview happened to still be running.
+    It is not a flake: deferring on the preview is simply wrong. `_setup_raw_detail` re-scopes
+    and restarts the preview itself, so a streaming preview is never a reason to postpone.
+
+    MUTATION: change any of the three gates back to `self._busy()` and this goes red.
+    """
+    root, _ = squid_dataset
+    win = V.PlateWindow(None)
+    win.ingest(str(root))
+    key = win.open_exploration_tab(["B3"])
+    qapp.processEvents()
+    assert win._detail._fov_labels == ["B3:0"]
+
+    # Force the condition the flake depended on: a live raw preview at the moment of the close.
+    class _StillStreaming:
+        IS_PREVIEW = True
+
+        def isRunning(self):
+            return True
+
+    win._retired.append(_StillStreaming())
+    assert win._busy() is True, "fixture is wrong: the window must look busy for this to bite"
+
+    win._close_op_tab(win._explore_tabs.indexOf(win._op_tabs[key]), win._explore_tabs)
+    qapp.processEvents()
+
+    assert win._detail._fov_labels == ["B2:0", "B3:0"], (
+        "the plate was not restored while the raw preview was streaming — the restore is waiting "
+        "on a thread that has nothing to do with it"
+    )
+    assert win._active_exploration is None
+    win._retired.clear()
+    win.close()
