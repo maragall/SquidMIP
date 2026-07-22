@@ -97,6 +97,40 @@ def _colormap_for(channel_name: str):
         return "gray"
 
 
+#: The tooltip on NAPARI'S OWN 2D/3D button. The button keeps doing napari 3D — it is napari's
+#: control and its meaning must not change. This only tells the user where a better render lives.
+#:
+#: WHY napari's 3D looks blocky on our data, which is the honest thing to say rather than
+#: implying napari is deficient: **napari does not support multiscale in 3D**. In
+#: ``napari/layers/_scalar_field/_slice.py`` (0.6.6, verified in the installed copy)::
+#:
+#:     def _call_multi_scale(self):
+#:         if self.slice_input.ndisplay == 3:
+#:             level = len(self.data) - 1      # the COARSEST level, unconditionally
+#:         else:
+#:             level = self.data_level         # the zoom-appropriate level in 2D
+#:
+#: The moment ndisplay flips to 3 the layer drops to the LAST pyramid level regardless of zoom.
+#: On the owner's 10x set that is a ~128x107 thumbnail — the blocky render he screenshotted. The
+#: very pyramid that makes 2D navigation fast is what makes 3D ugly; they fight inside one layer.
+#: That is why AGAVE is a separate renderer and not a nice-to-have, and it is why ALIASING this
+#: button to AGAVE would be the wrong fix: it would hide a real limit behind a relabelled control.
+NDISPLAY_TOOLTIP = (
+    "3D view (napari).\n"
+    "napari renders 3D from the COARSEST pyramid level only, so a large mosaic looks blocky "
+    "here.\n"
+    "For a higher-quality volume rendering of this region, open it in AGAVE — the "
+    "\"3D view (AGAVE)…\" button, which opens in the exploration pane."
+)
+
+
+def apply_ndisplay_tooltip(btn) -> None:
+    """Put :data:`NDISPLAY_TOOLTIP` on napari's 2D/3D button. Sets a tooltip and NOTHING else —
+    the button's signal, its check-state sync and what it toggles all stay napari's."""
+    if btn is not None:
+        btn.setToolTip(NDISPLAY_TOOLTIP)
+
+
 class MosaicPane(QWidget):
     """Pane 2. Hosts the napari canvas, or a message saying why it could not be built."""
 
@@ -221,6 +255,7 @@ class MosaicPane(QWidget):
             pass
         row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         lay.addWidget(row)
+        apply_ndisplay_tooltip(btn)      # a tooltip only: this stays NAPARI's 3D button
         self.ndisplay_button = btn
 
     # -- the grouped layer tree ---------------------------------------------------------

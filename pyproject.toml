@@ -61,4 +61,5 @@ packages = ["squidmip"]
 [tool.pytest.ini_options]
 markers = [
     "integration: requires the real hongquan dataset on disk (deselect with -m 'not integration')",
+    "agave: talks to a REAL AGAVE server; skips with a named reason when AGAVE is not installed",
 ]
