@@ -6850,6 +6850,39 @@ class PlateWindow(QMainWindow):
         if self._overview is not None:
             self._overview.highlight_regions(regions)
 
+    def available_views(self) -> list:
+        """Every View an operator could target, UNIFIED (Spencer's operate-on-views UI binds here).
+
+        A View is just a named region-set (see ``_region_viewer.View``), so "run on the selection",
+        "run on this window", and "decon the whole plate" stop being three code paths and become one:
+        run on a View's regions. "Copy the whole plate" and "select all regions" are Views too — the
+        whole-plate View below IS the copy. Order: whole plate, current selection (if any), then each
+        open window / ROI child. The plate's existing status highlight (amber -> done) lights a View's
+        wells as the run processes them, which is the "processed wells highlight on the plate" ask."""
+        from squidmip._region_viewer import View
+
+        views: list = []
+        if getattr(self, "_order", None):
+            views.append(View(id="plate", name="Whole plate",
+                              regions=tuple(self._order), kind="plate"))
+        sel = list(getattr(self, "_selected_regions", None) or [])
+        if sel:
+            ordered = tuple(r for r in self._order if r in set(sel)) or tuple(sel)
+            views.append(View(id="selection", name=f"Selection ({len(ordered)})",
+                              regions=ordered, kind="selection"))
+        views.extend(self._viewer_manager.views())
+        return views
+
+    def run_on_view(self, key: str, view) -> None:
+        """Run operator ``key`` on a View's regions — the operate-on-views ENGINE hook (Julio's lane;
+        the selector UI is Spencer's). Reuses ``run_operator`` unchanged, so the plate's amber->done
+        status lights exactly this View's wells as they process."""
+        regions = list(getattr(view, "regions", None) or [])
+        if not regions:
+            self._readout.setText("this view has no regions to run on.")
+            return
+        self.run_operator(key, regions=regions)
+
     def _open_views_regions(self) -> list:
         """The union of regions held by the open independent windows, in first-seen order — the
         iteration set for an operator run 'on open views' (the decentralized bulk target)."""

@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd LaunchAgent for the git-sync watchdog.
+
+  ============================ EDIT BEFORE USING ============================
+  Replace the TWO placeholders below with absolute paths on this machine:
+    __REPO_PATH__     e.g. /Users/julioamaragall/CEPHLA/projects/SquidMIP
+    __SCRIPT_PATH__   e.g. /Users/julioamaragall/CEPHLA/projects/SquidMIP/scripts/git-sync-watchdog.sh
+  (Both usually share the same repo root; __SCRIPT_PATH__ is __REPO_PATH__/scripts/git-sync-watchdog.sh)
+  ==========================================================================
+
+  INSTALL (runs at login + kept alive):
+    cp scripts/com.cephla.squidxplorer.gitsync.plist ~/Library/LaunchAgents/
+    # then edit the two placeholders in the copied file, then:
+    launchctl load  ~/Library/LaunchAgents/com.cephla.squidxplorer.gitsync.plist
+
+  UNINSTALL:
+    launchctl unload ~/Library/LaunchAgents/com.cephla.squidxplorer.gitsync.plist
+    rm ~/Library/LaunchAgents/com.cephla.squidxplorer.gitsync.plist
+
+  STATUS / LOGS:
+    launchctl list | grep com.cephla.squidxplorer.gitsync
+    tail -f /tmp/gitsync-watchdog.err.log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cephla.squidxplorer.gitsync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__SCRIPT_PATH__</string>
+    </array>
+
+    <!-- Run inside the repo so git picks up the right work tree. -->
+    <key>WorkingDirectory</key>
+    <string>__REPO_PATH__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>REPO_DIR</key>
+        <string>__REPO_PATH__</string>
+        <key>WATCH_INTERVAL</key>
+        <string>60</string>
+        <!-- Ensure git + osascript are found under launchd's minimal PATH. -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Start at login and keep it alive if it ever exits. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Don't hammer restarts if it crash-loops. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/gitsync-watchdog.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/gitsync-watchdog.err.log</string>
+</dict>
+</plist>

@@ -20,6 +20,7 @@ window SHARES the one reader/meta the root opened. No window reopens the dataset
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
 import numpy as np
@@ -47,6 +48,87 @@ log = logging.getLogger("squidmip.regionviewer")
 #: other window (or the plate). A parameter file on the desktop is the same idea; this is the
 #: in-session GUI form of it. Keyed by channel name -> {"clim": (lo, hi), "cmap": <name>}.
 _LUT_CLIPBOARD: "dict[str, dict]" = {}
+
+
+@dataclass(frozen=True)
+class View:
+    """The ONE thing an operator targets: a named set of regions.
+
+    Spencer, 2026-07-23: "operators should really only work on Views ... we need the option to copy
+    the whole plate if we're going to do something like decon the whole plate." A plate selection, a
+    whole plate, an open window, and an ROI child are ALL Views — same shape, different origin. This
+    is the data model that de-convolutes "run on selection vs window vs plate": there is only "run on
+    a View's regions". Operators are per-View, not homogeneous-across-windows.
+
+    ``kind`` records the origin so a UI can label it ('window' | 'plate' | 'selection' | 'roi');
+    ``window_id`` is set when the View is backed by an open window (else None). Building the tab /
+    selector UI over ``PlateWindow.available_views()`` is Spencer's operate-on-views lane; this
+    model + the engine hook (``run_on_view``) is the plumbing under it."""
+    id: str
+    name: str
+    regions: tuple
+    kind: str = "window"
+    window_id: Optional[int] = None
+    roi_bbox: Optional[tuple] = None
+    parent_id: Optional[int] = None
+
+
+def _level_shape(level: Any) -> "Optional[tuple[int, int]]":
+    """The (height, width) of one pyramid level, or None if it has no 2-D+ shape."""
+    shp = getattr(level, "shape", None)
+    if not shp or len(shp) < 2:
+        return None
+    return int(shp[-2]), int(shp[-1])
+
+
+def _crop_levels_to_bbox(levels: "list", region_bbox_um: "Sequence[float]",
+                         roi_bbox_um: "Sequence[float]"):
+    """Crop a LAZY multiscale pyramid to an ROI box, returning ``(cropped_levels, cropped_bbox_um)``
+    or ``None`` if the ROI does not overlap the region.
+
+    Both boxes are ``(x0, y0, x1, y1)`` in stage micrometres — the same space ``mosaic_bbox_um``
+    speaks. The levels are lazy (dask), so slicing them reads NOTHING; napari then materialises only
+    the ROI sub-array. That is the whole point of an ROI child: read a corner, not the region. The
+    returned bbox is derived from level 0's integer crop so placement lands exactly on the ROI."""
+    try:
+        x0, y0, x1, y1 = (float(v) for v in region_bbox_um)
+        rx0, ry0, rx1, ry1 = (float(v) for v in roi_bbox_um)
+    except Exception:                                    # noqa: BLE001 - malformed box, skip crop
+        return None
+    if x1 <= x0 or y1 <= y0:
+        return None
+    # Clip the ROI to the region: a box dragged past the edge still crops to what exists.
+    rx0, rx1 = max(min(rx0, rx1), x0), min(max(rx0, rx1), x1)
+    ry0, ry1 = max(min(ry0, ry1), y0), min(max(ry0, ry1), y1)
+    if rx1 - rx0 <= 0 or ry1 - ry0 <= 0:
+        return None
+    span_x, span_y = x1 - x0, y1 - y0
+    out: list = []
+    l0 = None
+    for lvl in levels:
+        shp = _level_shape(lvl)
+        if shp is None:
+            continue
+        h, w = shp
+        sx, sy = w / span_x, h / span_y
+        c0 = int(max(0, min(w - 1, round((rx0 - x0) * sx))))
+        c1 = int(max(c0 + 1, min(w, round((rx1 - x0) * sx))))
+        r0 = int(max(0, min(h - 1, round((ry0 - y0) * sy))))
+        r1 = int(max(r0 + 1, min(h, round((ry1 - y0) * sy))))
+        out.append(lvl[..., r0:r1, c0:c1])
+        if l0 is None:
+            l0 = (c0, c1, r0, r1, w, h)                  # level 0 defines the returned bbox
+    if not out or l0 is None:
+        return None
+    c0, c1, r0, r1, w0, h0 = l0
+    nbbox = (x0 + (c0 / w0) * span_x, y0 + (r0 / h0) * span_y,
+             x0 + (c1 / w0) * span_x, y0 + (r1 / h0) * span_y)
+    try:
+        from squidmip._mosaic_source import strictly_decreasing_levels
+        out = strictly_decreasing_levels(out)
+    except Exception:                                    # noqa: BLE001 - a 1-level pyramid is fine
+        pass
+    return out, nbbox
 
 #: Debounce before a settled region is fused, matching the central pane's 140 ms. The red frame /
 #: slider move instantly; only the expensive fuse waits for the slider to stop, so a drag across
@@ -433,11 +515,22 @@ class RegionViewer(QMainWindow):
             return                                  # a later region won the race; drop this one
         from squidmip._napari_pane import _colormap_for
 
+        # ROI CHILD: crop the lazy pyramid to the ROI box before adding, so napari materialises only
+        # the ROI corner (read a corner, not the whole region). A window with no ROI box adds the
+        # full region unchanged. The crop also adjusts bbox_um so placement lands on the ROI.
+        add_levels, add_bbox = levels, bbox_um
+        if self._roi_bbox is not None and bbox_um is not None:
+            cropped = _crop_levels_to_bbox(levels, bbox_um, self._roi_bbox)
+            if cropped is not None:
+                add_levels, add_bbox = cropped
+            else:
+                self._say("ROI does not overlap this region — showing the whole region.")
+
         pane.mosaic.add_mosaic(
-            _RAW_OP, channel, levels,
+            _RAW_OP, channel, add_levels,
             colormap=_colormap_for(channel),
             multiscale=True,
-            bbox_um=bbox_um,
+            bbox_um=add_bbox,
             z_scale_um=(self._meta or {}).get("dz_um"),
         )
 
@@ -492,6 +585,13 @@ class RegionViewer(QMainWindow):
                     colormap_by[name] = getattr(cmap, "name", cmap)
                 except Exception:                    # noqa: BLE001
                     pass
+        # ROI CHILD (organoid contract): render the ROI's NATIVE level-0 crop as the 3D volume, not a
+        # centre FOV — the ROI already spans exactly the tissue the user boxed. Texture-bounded and
+        # fail-loud (no silent downsample). See docs/rendering-contract.md.
+        if self._roi_bbox is not None:
+            self._open_3d_roi(contrast_by, colormap_by)
+            return
+
         from squidmip._napari3d import open_native_3d
 
         try:
@@ -503,6 +603,52 @@ class RegionViewer(QMainWindow):
             )
         except Exception as exc:                     # noqa: BLE001 - named to the window, never silent
             self._say(f"3D view could not open: {exc}")
+
+    def _open_3d_roi(self, contrast_by: dict, colormap_by: dict) -> None:
+        """3D of an ROI child = the ROI's NATIVE level-0 crop across the FOVs it spans (the organoid
+        max-res contract). Materialises the texture-bounded ROI volume per channel and hands it to
+        ``open_native_3d_volume``, which REFUSES (never downsamples) if the ROI exceeds the GPU 3D
+        texture. No fall back to a centre FOV: that would misrepresent what the user boxed."""
+        pane = self._pane
+        mosaic = getattr(pane, "mosaic", None) if pane is not None else None
+        if mosaic is None:
+            self._say("no mosaic to render in 3D.")
+            return
+        volumes: dict = {}
+        for c in (self._meta or {}).get("channels", []):
+            name = c["name"]
+            layer = mosaic.find(_RAW_OP, name)
+            if layer is None:
+                continue
+            data = layer.data
+            level0 = data[0] if isinstance(data, (list, tuple)) else data   # native rung of the pyramid
+            if getattr(level0, "ndim", 0) < 3 or int(level0.shape[0]) < 2:
+                self._say("3D needs a z-stack; this ROI has a single z plane.")
+                return
+            volumes[name] = level0
+        if not volumes:
+            self._say("no channel on screen to render in 3D.")
+            return
+        px = float((self._meta or {}).get("pixel_size_um") or 1.0)
+        dz = float((self._meta or {}).get("dz_um") or px)
+        max_tex = 2048
+        try:
+            max_tex = int(self._pane._live_max_3d_texture())
+        except Exception:                            # noqa: BLE001 - Apple default is the safe floor
+            pass
+        from squidmip._napari3d import open_native_3d_volume
+
+        title = f"3D native (ROI) — {self._region_label(self._regions)}"
+        try:
+            self._native3d = open_native_3d_volume(
+                {n: np.asarray(v) for n, v in volumes.items()},
+                scale=(dz, px, px), title=title,
+                contrast_by_channel=contrast_by or None,
+                colormap_by_channel=colormap_by or None,
+                max_texture=max_tex,
+            )
+        except Exception as exc:                     # noqa: BLE001 - named to the window, never silent
+            self._say(f"ROI 3D could not open: {exc}")
 
     def _say(self, text: str) -> None:
         if self._pane is not None and getattr(self._pane, "ok", False):
@@ -580,6 +726,27 @@ class ViewerManager(QObject):
     @property
     def windows(self) -> "list[RegionViewer]":
         return list(self._windows.values())
+
+    def views(self) -> "list[View]":
+        """Every open window as a :class:`View` (a named region-set) — the unit an operator targets.
+
+        Spencer's operate-on-views tab UI binds to this + ``PlateWindow.available_views`` (which adds
+        the whole-plate and current-selection Views). One list, one concept, no per-surface rules."""
+        out: "list[View]" = []
+        for win in self.windows:
+            roi = getattr(win, "_roi_bbox", None)
+            out.append(View(
+                id=f"w{win.window_id}", name=win.windowTitle(),
+                regions=tuple(win._regions),
+                kind="roi" if roi is not None else "window",
+                window_id=win.window_id, roi_bbox=roi))
+        return out
+
+    def view_for(self, window_id: int) -> "Optional[View]":
+        for v in self.views():
+            if v.window_id == int(window_id):
+                return v
+        return None
 
     def open(self, regions: Sequence[str], *, title: Optional[str] = None) -> Optional[RegionViewer]:
         """Open ONE independent window over *regions*. Many regions => one window with a slider."""

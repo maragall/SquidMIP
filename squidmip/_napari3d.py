@@ -218,3 +218,74 @@ def open_native_3d(
     log.info("3D native: opened %s / fov %s, %d channel(s), %d z at native %.3f um/px, dz %.2f um",
              region, fov, len(viewer.layers), n_z, px, dz)
     return viewer
+
+
+def open_native_3d_volume(
+    volumes_by_channel: dict,
+    *,
+    scale: tuple,
+    title: str,
+    contrast_by_channel: Optional[dict] = None,
+    colormap_by_channel: Optional[dict] = None,
+    max_texture: int = 2048,
+) -> Any:
+    """Render READY per-channel ``(z, y, x)`` volumes in a napari 3D popout at NATIVE resolution.
+
+    This is the ORGANOID / ROI path (the contract, see ``docs/rendering-contract.md``): the caller
+    hands the ROI's native LEVEL-0 crop taken from the 2D pyramid — already fused across the FOVs the
+    ROI spans — and we render it with gallery-view's recipe (additive, (dz, py, px) scale, carried
+    LUT). Unlike ``open_native_3d`` this is not limited to a single FOV; it is limited by the GPU.
+
+    THE TEXTURE GUARD IS THE CONTRACT. napari renders 3D from ONE GL texture, so a volume whose Y or
+    X exceeds ``GL_MAX_3D_TEXTURE_SIZE`` is SILENTLY downsampled by napari to a blocky coarse level —
+    the exact "the AI messes up the rendering" failure. We REFUSE and name the overflow instead, so
+    the caller draws a smaller ROI rather than shipping a downsample dressed as native (Julio's
+    NO-FALLBACKS rule). Z is never the limiter (napari sliders z); only Y/X hit the texture."""
+    import napari
+
+    contrast_by_channel = contrast_by_channel or {}
+    colormap_by_channel = colormap_by_channel or {}
+    vols = {name: np.asarray(v) for name, v in volumes_by_channel.items() if v is not None}
+    if not vols:
+        raise ValueError("no channel volume to render in 3D.")
+    first = next(iter(vols.values()))
+    if first.ndim != 3:
+        raise ValueError(f"a 3D volume must be (z, y, x); got shape {first.shape}.")
+    _z, y, x = first.shape
+    if max(int(y), int(x)) > int(max_texture):
+        raise ValueError(
+            f"ROI is {y}x{x} px, over the GPU 3D texture limit ({max_texture} px). Draw a smaller "
+            "ROI so it renders at NATIVE resolution instead of a silent downsample.")
+
+    viewer = napari.Viewer(ndisplay=3, title=title)
+    for name, vol in vols.items():
+        kwargs = {"name": name, "scale": scale, "blending": "additive", "rendering": "mip"}
+        cmap = colormap_by_channel.get(name)
+        if cmap is not None:
+            kwargs["colormap"] = cmap
+        clim = contrast_by_channel.get(name)
+        if clim is None:
+            clim = _auto_clim(vol)
+        if clim is not None:
+            kwargs["contrast_limits"] = tuple(clim)
+        viewer.add_image(vol, **kwargs)
+    if not viewer.layers:
+        viewer.close()
+        raise ValueError("no channel could be rendered, so there is no 3D volume.")
+    try:
+        _add_bounding_box(viewer, scale, first.shape)
+    except Exception:                                   # noqa: BLE001 - overlay is cosmetic
+        pass
+    try:
+        viewer.scale_bar.visible = True
+        viewer.scale_bar.unit = "um"
+        viewer.text_overlay.visible = True
+        viewer.text_overlay.text = title
+        viewer.text_overlay.font_size = 12
+        viewer.text_overlay.color = "white"
+        viewer.text_overlay.position = "top_center"
+    except Exception:                                   # noqa: BLE001 - cosmetic
+        pass
+    _wire_close_to_release_memory(viewer)
+    log.info("3D native volume: %d channel(s), shape %s, scale %s", len(vols), first.shape, scale)
+    return viewer
