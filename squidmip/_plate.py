@@ -544,6 +544,30 @@ def _row_index(letters: str) -> int:
     return n - 1
 
 
+def display_well_id(cell_id: str) -> str:
+    """Numeric well id from the alphabet-encoded well: ``<row letter's 1-based index><column>``.
+
+    ``A1 -> "11"`` (A is row 1, column 1), ``C18 -> "318"`` (C is row 3, column 18). This is a
+    DISPLAY-ONLY re-labelling that Julio asked for; it is deliberately NOT used as a data key. The
+    real ``cell_id`` (``"A1"``, ``"C18"``) stays the reader's region key on disk, because the
+    numeric form is lossy for >=10-column plates (``"318"`` could be row 3/col 18 or row 31/col 8),
+    so it must never be parsed back. A cell id that is not the letter+column form (a tissue
+    slide's freeform region like ``"manual0"``) is returned unchanged — there is no row letter to
+    encode, and inventing one would be the "plain up bs" this is meant to avoid.
+    """
+    s = str(cell_id)
+    i = 0
+    while i < len(s) and s[i].isalpha():
+        i += 1
+    letters, digits = s[:i], s[i:]
+    # A well row label is UPPERCASE and short (1 letter up to 26 rows, 2 up to 702 — a 1536wp is 32
+    # rows = "AF"). A freeform region like "manual0"/"slot3" is lowercase or long, and passes
+    # through untouched rather than being encoded into a meaningless number.
+    if not letters or not digits.isdigit() or not letters.isupper() or len(letters) > 2:
+        return s
+    return f"{_row_index(letters) + 1}{digits}"
+
+
 class WellPlate(Plate):
     """A standard microtitre plate: cells are wells named A1..{row}{col}, 1-based columns."""
 
@@ -743,6 +767,43 @@ def freeform_grid(boxes_um: Mapping[str, tuple]) -> tuple[int, int, dict[str, tu
     return n_rows, n_cols, placement
 
 
+def even_carrier_layout(
+    regions: Sequence[str],
+    order_key: Optional[Mapping[str, tuple]] = None,
+    target_aspect: float = 2.4,
+    gap: float = 0.14,
+) -> tuple[int, int, dict[str, tuple[int, int]], dict[str, tuple[float, float, float, float]]]:
+    """A tissue carrier laid out EVENLY, not by raw stage geometry (Julio, 2026-07-23).
+
+    Returns ``(rows, cols, placement, layout)``. Regions are placed left-to-right, top-to-bottom in
+    a LANDSCAPE-biased grid (like the physical 4-slide carrier, which is a horizontal row of
+    slides), and every region gets an EQUAL cell with the same inset gap — so mosaics are evenly
+    spaced and never overlap even when their native geometries differ wildly. This deliberately
+    REPLACES ``freeform_grid``/``freeform_layout`` for the carrier: those preserve true relative
+    size and position, which stacked two tissues into a tall, tiny, uneven column and wasted the
+    viewer's horizontal space. Even, readable cells beat geometric fidelity for a browse view.
+
+    ``order_key`` (region -> a sortable tuple, e.g. its stage box) orders the cells so spatially
+    left tissue lands on the left; absent, region report order is used.
+    """
+    import math
+
+    regs = list(regions)
+    if order_key is not None:
+        regs = sorted(regs, key=lambda r: (order_key.get(r, (0.0, 0.0))[0],
+                                           order_key.get(r, (0.0, 0.0))[1], r))
+    n = max(1, len(regs))
+    cols = max(1, min(n, math.ceil(math.sqrt(n * target_aspect))))   # bias WIDE (landscape)
+    rows = max(1, math.ceil(n / cols))
+    placement: dict[str, tuple[int, int]] = {}
+    layout: dict[str, tuple[float, float, float, float]] = {}
+    for i, r in enumerate(regs):
+        row, col = divmod(i, cols)
+        placement[r] = (row, col)
+        layout[r] = (col + gap, row + gap, 1.0 - 2 * gap, 1.0 - 2 * gap)   # equal, inset cell
+    return rows, cols, placement, layout
+
+
 def freeform_layout(boxes_um: Mapping[str, tuple], rows: int, cols: int
                     ) -> dict[str, tuple[float, float, float, float]]:
     """Stage boxes -> ``{region: (x, y, w, h)}`` in GRID UNITS, aspect preserved and centred.
@@ -935,17 +996,16 @@ def _make(name, regions, fovs_per_region, stage_boxes=None, **kw) -> Plate:
         if n > 1 and name == GLASS_SLIDE:
             name = FOUR_SLIDE_CARRIER
         geom = PlateGeometry.vendored(name)
-        # GEOMETRIC layout (IMA-253) when the stage placed every region: the grid SHAPE comes from
-        # where the regions physically are, not from the vendored holder's slot count, because the
-        # slot count is exactly the thing that was inventing "side by side in columns 0 and 1".
+        # EVEN layout (2026-07-23): a tissue carrier is drawn as evenly-spaced, equal, landscape-
+        # biased cells — NOT by raw stage geometry. Julio: the stage-proportional freeform layout
+        # stacked two tissues into a tall, tiny, uneven column and wasted the viewer's horizontal
+        # space; even cells that never overlap read far better for browsing, whatever each mosaic's
+        # native geometry. Stage boxes, when present, only ORDER the cells left-to-right so spatial
+        # left tissue stays on the left. (freeform_grid/freeform_layout are kept for reference.)
         placement = layout = None
-        if stage_boxes and len(stage_boxes) == n:
-            rows, cols, placement = freeform_grid(stage_boxes)
-            layout = freeform_layout(stage_boxes, rows, cols)
-            if not layout:                          # degenerate geometry -> keep the nominal grid
-                placement = None
-            else:
-                geom = PlateGeometry(**{**vars(geom), "rows": rows, "cols": cols})
+        if n >= 1:
+            rows, cols, placement, layout = even_carrier_layout(list(regions), order_key=stage_boxes)
+            geom = PlateGeometry(**{**vars(geom), "rows": rows, "cols": cols})
         if placement is None and n > geom.rows * geom.cols:
             # More slides than any standard carrier: widen rather than refuse. There is no art for
             # this, and carrier_art() will correctly return None instead of a wrong-scale PNG.

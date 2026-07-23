@@ -60,9 +60,9 @@ import numpy as np
 from PyQt5.QtCore import (
     Qt, QRectF, QThread, QTimer, pyqtSignal,
 )
-from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QRegion
+from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPalette, QPen, QPixmap, QRegion
 from PyQt5.QtWidgets import (
-    QAction, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QAction, QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QMainWindow, QMenu, QPlainTextEdit, QPushButton, QScrollArea, QSlider, QSpinBox,
     QSplitter, QStackedWidget, QStyleFactory, QTabBar, QVBoxLayout, QWidget,
 )
@@ -83,7 +83,7 @@ from squidmip._output import parse_well_id
 from squidmip._activity import ActivityLog
 from squidmip._logpane import LogBus
 from squidmip._logpanel import LogPanel
-from squidmip._plate import PlateBuildError, build_plate
+from squidmip._plate import PlateBuildError, build_plate, display_well_id
 from squidmip._plate_shape import PlateShapeError
 from squidmip._qt_tabs import _DetachTabBar, _DetachTabs, _FloatWindow  # noqa: F401 (re-export)
 from squidmip._qtstyle import dark_palette as _dark_palette
@@ -518,24 +518,41 @@ class _RunningContrast:
         return self.resolve(ch, self._auto_window(ch))
 
     def _auto_window(self, ch: int) -> tuple[float, float]:
-        """The running histogram's window for *ch*, ignoring any latch.
+        """The FLUORESCENCE window for *ch* from the running histogram, ignoring any latch.
 
-        A DEGENERATE window (hi <= lo) is returned DELIBERATELY when both percentiles land in the
-        same bin — ``_window``'s ``span <= 0`` guard renders that black, which is the honest
-        answer when there is no contrast.
+        This is the maragall/stitcher rule (``_contrast.auto_contrast``): background peak to BLACK,
+        99.9th percentile on top — the SAME rule the viewer windows use. It replaces a plain
+        (1st, 99.8th) percentile low end, which lands INSIDE the fluorescence background so the
+        whole field lifts off black and saturates (``_contrast`` module docstring: "a percentile
+        window washes fluorescence out"). The plate used to get the good window only by FOLLOWING
+        the central pane; with the pane gone (decentralized root) the plate must carry the rule
+        itself, and it already keeps the per-channel histogram the rule needs.
+
+        A DEGENERATE window (hi <= lo) is returned DELIBERATELY for a blank/flat channel —
+        ``_window``'s ``span <= 0`` guard renders that black, the honest answer when there is no
+        contrast. Blank wells are normal on a partially acquired plate and must not read as signal.
         """
-        h = self._hist[ch]
+        h = self._hist[ch].astype(np.float64)
         tot = h.sum()
         if tot == 0:
             return 0.0, self._dmax
+        centers = (np.arange(self._bins) + 0.5) / self._bins * self._dmax
         cdf = np.cumsum(h) / tot
-        lo = np.searchsorted(cdf, self._pct[0] / 100.0) / self._bins * self._dmax
-        hi = np.searchsorted(cdf, self._pct[1] / 100.0) / self._bins * self._dmax
-        # Do NOT widen a collapsed window to lo+1. That +1 is one DATA unit, while a histogram bin
-        # is dmax/bins wide (~128 on uint16) — so for a blank, dead or saturated channel both
-        # percentiles land in one bin and (v - lo)/1 clips to 1.0: the well rendered FULL WHITE and
-        # read as signal. Blank wells are normal on a partially acquired plate. Handing the
-        # degenerate window through instead makes _window's guard reachable, and they render black.
+        mode_val = float(centers[int(np.argmax(h))])                 # background peak = the mode
+        # std of the BACKGROUND (bins at or below the median), computed from the histogram.
+        med_bin = min(int(np.searchsorted(cdf, 0.5)), self._bins - 1)
+        bg = h[: med_bin + 1]
+        bg_tot = float(bg.sum())
+        if bg_tot > 0:
+            bc = centers[: med_bin + 1]
+            bg_mean = float((bc * bg).sum() / bg_tot)
+            bg_std = float(np.sqrt(max(0.0, ((bc - bg_mean) ** 2 * bg).sum() / bg_tot)))
+        else:
+            bg_std = abs(mode_val) * 0.1
+        lo = mode_val + 2.0 * bg_std                                 # push background to black
+        hi = float(centers[min(int(np.searchsorted(cdf, 0.999)), self._bins - 1)])   # 99.9th pct
+        if hi <= lo:
+            return lo, lo                                            # degenerate -> black
         return float(lo), float(hi)
 
     def windows(self) -> list[tuple[float, float]]:
@@ -1036,10 +1053,6 @@ class PlateOverview(QWidget):
     hovered = pyqtSignal(str)              # region id (or "" off-plate), for the window's readout
     wellActivated = pyqtSignal(str, int)   # (well_id, fov_index) double-clicked -> load in ndviewer
     selectionChanged = pyqtSignal(list)    # acquired well ids the operator picked (row-major)
-    controlRequested = pyqtSignal(str)     # right-click menu: set this region as the CONTROL WELL
-                                           # ("" = clear it). The plate ASKS; the window owns the
-                                           # answer and hands it back via set_control — the widget
-                                           # never sets its own frame (IMA-248's one-owner rule).
     marqueeSelected = pyqtSignal(list)     # ...and specifically by a Shift-DRAG: opens an exploration
                                            # tab (IMA-205). Shift+CLICK refines the selection one well
                                            # at a time and deliberately does NOT fire it — otherwise
@@ -1112,9 +1125,7 @@ class PlateOverview(QWidget):
         #                               paintEvent membership-tests it once per cell, 1536x on a 1536wp.
         self._marquee = None          # (x0, y0, x1, y1) widget px while a Shift-drag is in flight
         self._marquee_add = False     # this drag unions (Shift+Alt) rather than replaces
-        self._control = None          # (row_index, col_index) of the CONTROL WELL, or None. A
-        #                               MIRROR of PlateWindow._control_well, written only by
-        #                               set_control — the window owns the identity (IMA-248).
+        self._ctrl_click = None       # (x, y) of a Cmd/Ctrl-press, committed as a TOGGLE on release
         self._press = None            # (x, y, ox, oy) at left-press, for drag-to-pan
         self._panning = False
         self._user_view = False       # True once the user wheel-zooms/pans (stop auto-fitting)
@@ -1714,6 +1725,12 @@ class PlateOverview(QWidget):
             self.selectionChanged.emit([])
             self.update()
 
+    def select_all(self):
+        """Select every occupied well (the Select all button and Cmd/Ctrl-A)."""
+        self._selection = set(self._by_rc.keys())
+        self.selectionChanged.emit(self.selected_wells())
+        self.update()
+
     def wheelEvent(self, e):
         if self._marquee is not None:
             return          # a marquee owns the drag; zooming would slide the plate under the rect
@@ -1743,6 +1760,15 @@ class PlateOverview(QWidget):
             self._panning = False
             self.update()
             return          # a Shift-drag is a selection, never a pan and never a loupe
+        # Cmd/Ctrl-click = TOGGLE this well in the batch selection (Linux-file-manager add/remove).
+        # On macOS Cmd maps to ControlModifier, and a real Ctrl+click is a right-click (not
+        # LeftButton), so this only ever fires for the intended gesture. Committed on RELEASE so a
+        # cmd-drag can still not-select if the user changes their mind, and so it never pans.
+        if e.modifiers() & Qt.ControlModifier:
+            self._ctrl_click = (e.x(), e.y())
+            self._press = None
+            self._panning = False
+            return
         self._press = (e.x(), e.y(), self._ox, self._oy)
         self._panning = False
         c = self._cell(e.x(), e.y())
@@ -1784,11 +1810,19 @@ class PlateOverview(QWidget):
         if new_hover == self._hover:                 # still the same cell -> no repaint (kills the
             return                                   # per-pixel repaint storm; only cross-cell moves repaint)
         self._hover = new_hover
-        self.hovered.emit((c["well_id"] or (c["row"] + c["col"] + "  ·  empty")) if c else "")
+        if c and c["well_id"]:
+            enc = display_well_id(c["well_id"])
+            text = c["well_id"] if enc == c["well_id"] else f'{c["well_id"]} ({enc})'
+        elif c:
+            text = c["row"] + c["col"] + "  ·  empty"
+        else:
+            text = ""
+        self.hovered.emit(text)
         self.update()
 
     def mouseReleaseEvent(self, e):
         self._hold.stop()
+        had_loupe = self._loupe is not None
         # Only the LEFT release commits a selection. The gesture is opened by a left press, but Qt
         # delivers a release for whichever button went up — so a right-click while a Shift-drag is
         # in flight would otherwise silently toggle/replace the selection.
@@ -1800,17 +1834,51 @@ class PlateOverview(QWidget):
                 hit = self._cell(x1, y1)
                 if hit and hit["well_id"]:
                     self._selection ^= {(hit["row_index"], hit["col_index"])}
-            elif add:
-                self._selection |= set(self._cells_in(x0, y0, x1, y1))
+                self.selectionChanged.emit(self.selected_wells())
             else:
-                self._selection = set(self._cells_in(x0, y0, x1, y1))
-            # ONE emission per gesture. A live emit would rebuild a 1536-item list per mouse-move
-            # on a 1536wp; the rubber band already gave the user live feedback.
-            wells = self.selected_wells()
-            self.selectionChanged.emit(wells)
-            if dragged:                    # "hold shift [and drag] to open an exploration tab"
-                self.marqueeSelected.emit(wells)
+                # Shift-DRAG opens a WINDOW over the boxed regions (the meeting's "shift-drag a box
+                # -> a floating view"). It does NOT leave a persistent wash on the plate: you see
+                # that set in the new window's region slider, so a lingering highlight is just the
+                # "stays selected forever" clutter Julio flagged. Emit the window request, then
+                # clear the wash. Shift+Alt still UNIONS into the batch selection instead of opening.
+                boxed = [self._by_rc[rc] for rc in sorted(set(self._cells_in(x0, y0, x1, y1)))]
+                if add:
+                    self._selection |= set(self._cells_in(x0, y0, x1, y1))
+                    self.selectionChanged.emit(self.selected_wells())
+                else:
+                    self.marqueeSelected.emit(boxed)            # open a window over the box
+                    if self._selection:                         # drop any lingering batch wash
+                        self._selection = set()
+                        self.selectionChanged.emit([])
             self.update()
+            self._press = None
+            self._panning = False
+            self._dismiss_loupe()
+            return
+        # Cmd/Ctrl-click TOGGLE (Linux-style add/remove to the batch selection).
+        if self._ctrl_click is not None and e.button() == Qt.LeftButton:
+            px, py, self._ctrl_click = *self._ctrl_click, None
+            hit = self._cell(px, py)
+            if hit and hit["well_id"]:
+                self._selection ^= {(hit["row_index"], hit["col_index"])}
+                self.selectionChanged.emit(self.selected_wells())
+                self.update()
+            self._press = None
+            self._panning = False
+            self._dismiss_loupe()
+            return
+        # Plain CLICK (no modifier, no pan, no loupe) = select ONLY this well, or clear on empty.
+        # This is the deselect path that was missing: without it a batch selection could never be
+        # dropped by clicking, so it "stayed selected forever". A plain DRAG still pans (guarded by
+        # _panning), and a hold that raised the loupe does not select (had_loupe).
+        if (self._press is not None and not self._panning and not had_loupe
+                and e.button() == Qt.LeftButton):
+            hit = self._cell(e.x(), e.y())
+            new_sel = {(hit["row_index"], hit["col_index"])} if hit and hit["well_id"] else set()
+            if new_sel != self._selection:
+                self._selection = new_sel
+                self.selectionChanged.emit(self.selected_wells())
+                self.update()
         self._press = None
         self._panning = False
         self._dismiss_loupe()                        # release always dismisses
@@ -1826,6 +1894,17 @@ class PlateOverview(QWidget):
         self._marquee_add = False
         self.hovered.emit("")
         self.update()
+
+    def keyPressEvent(self, e):
+        """Keyboard selection, Linux-file-manager style. Cmd/Ctrl-A selects every well; Escape
+        clears. Focus is ClickFocus, so these arrive once the user has clicked the plate."""
+        if (e.modifiers() & Qt.ControlModifier) and e.key() == Qt.Key_A:
+            self.select_all()
+            return
+        if e.key() == Qt.Key_Escape:
+            self.clear_selection()
+            return
+        super().keyPressEvent(e)
 
     def set_mosaic_boxes(self, boxes: dict):
         """Adopt the per-FOV cell boxes so a double-click can resolve WHICH FOV was hit.
@@ -1865,26 +1944,14 @@ class PlateOverview(QWidget):
             self._carrier_slide = isinstance(plate, SlideCarrier)
         except Exception:
             self._carrier_slide = False
-        # SLIDE ART (IMA-265): a tissue acquisition with real stage coordinates is drawn as glass
-        # slides at true size, side by side, with the tissue mosaics sitting on them. The slide
-        # layout REPLACES the plain freeform tissue layout, because the tissue must sit on its
-        # slide at the true micron scale (a 25 mm slide dwarfs an 8 mm tissue) -- fitting the
-        # tissue to the grid, as the freeform path does, would put the slide bodies off-widget.
-        # A well plate / an un-placed carrier returns (None, None) and nothing here changes: the
-        # plate Julio designed is on a path this cannot touch.
+        # NO true-scale SLIDE ART (Julio, 2026-07-23). The slide-art layout drew glass slides at
+        # true micron scale (a 25 mm slide dwarfing an 8 mm tissue) and placed the mosaics at their
+        # real stage positions — which stacked two tissues into a tall, tiny, uneven column and
+        # "looked like shite". The plate now keeps its EVEN carrier layout (``even_carrier_layout``,
+        # equal cells side by side) set at construction, so this no longer overrides ``self._layout``
+        # and draws no slide bodies. Even, horizontal, non-overlapping cells beat true-scale slides
+        # for a browse view, whatever each tissue's geometry.
         self._slides = None
-        if plate is not None:
-            try:
-                from squidmip._slide_art import overview_slide_layout
-                tissue_layout, slides = overview_slide_layout(plate)
-            except Exception:                    # noqa: BLE001 - art is never allowed to be fatal
-                tissue_layout = slides = None
-            if tissue_layout is not None:
-                self._layout = {tuple(k): tuple(float(v) for v in val)
-                                for k, val in tissue_layout.items()}
-                self._slides = [tuple(float(v) for v in s) for s in slides]
-                self._scaled = None              # cell rects changed -> drop the zoom cache
-                self._tile_rgn = None
         self.update()
 
     # -- cell rectangles: the ONE place a (row, col) becomes widget pixels (IMA-253) --
@@ -1983,51 +2050,6 @@ class PlateOverview(QWidget):
         self._hold.stop()
         self._dismiss_loupe()
         super().focusOutEvent(e)
-
-    # -- CONTROL WELL (IMA-248, made reachable by IMA-260's empty-state example) -------------------
-    def set_control(self, well_id: Optional[str]):
-        """Mirror the window's control-well identity onto the plate. ``None``/unknown clears it.
-
-        Deliberately a setter and not a toggle: there is ONE control at a time and ONE thing that
-        decides which, so the plate cannot drift out of agreement with the exploration pane by
-        answering a click locally."""
-        rc = next((k for k, v in self._by_rc.items() if v == well_id), None) if well_id else None
-        if rc == self._control:
-            return
-        self._control = rc
-        self.update()
-
-    def control_well(self) -> Optional[str]:
-        """The control's region id as the PLATE currently draws it — for asserting that all three
-        views agree by reading them, rather than by trusting that they were all told."""
-        return self._by_rc.get(self._control) if self._control is not None else None
-
-    def contextMenuEvent(self, e):
-        """Right-click a region -> the dropdown the empty pane's example points at.
-
-        This menu IS the example: 'right-click a well and choose Control Well'. It exists on the
-        plate rather than in a menu bar because that is the sentence the user said, and an example
-        that names a gesture the app does not have is worse than no example at all."""
-        c = self._cell(e.x(), e.y())
-        well = c["well_id"] if c else None
-        menu = QMenu(self)
-        menu.setStyleSheet(_MENU_QSS)
-        if well:
-            if self._control is not None and self._by_rc.get(self._control) == well:
-                act = menu.addAction(f"Clear Control Well ({well})")
-                act.triggered.connect(lambda *_: self.controlRequested.emit(""))
-            else:
-                act = menu.addAction(f"Control Well  ·  set {well} as the reference")
-                act.triggered.connect(lambda *_, w=well: self.controlRequested.emit(w))
-        else:
-            act = menu.addAction("Control Well")     # off-plate: say why it is unavailable
-            act.setEnabled(False)
-        if self._control is not None and self._by_rc.get(self._control) != well:
-            clear = menu.addAction(f"Clear Control Well ({self._by_rc.get(self._control)})")
-            clear.triggered.connect(lambda *_: self.controlRequested.emit(""))
-        self._context_menu = menu           # keep a ref so offscreen tests can drive the actions
-        menu.popup(e.globalPos())
-        e.accept()
 
     def mouseDoubleClickEvent(self, e):
         # Qt sends press/release/dblclick — the second press already re-armed the hold timer, so
@@ -2153,17 +2175,6 @@ class PlateOverview(QWidget):
                 continue
             p.setPen(_ACCENT if hov else _MUTED)
             p.drawText(int(self._ox), int(ay + r * cd), _HDR, int(cd), Qt.AlignCenter, str(self._rows[r]))
-        if self._control is not None and self._control in self._by_rc:
-            # THE CONTROL WELL: a PERSISTENT light-blue frame, labelled, drawn UNDER the red box so
-            # the transient current-FOV marker still reads when the two land on the same cell. The
-            # label is what stops "a blue box" from being a mystery a week later.
-            cx, cy, cw, ch = self._cell_rect(*self._control)
-            p.setPen(QPen(_CONTROL_BLUE, 3))
-            p.setBrush(Qt.NoBrush)
-            p.drawRect(int(cx) + 1, int(cy) + 1, int(cw) - 2, int(ch) - 2)
-            p.setFont(QFont("Helvetica Neue", 10, QFont.Bold))
-            p.drawText(QRectF(cx, cy + 2, max(cw, 50.0), 16.0), int(Qt.AlignCenter), "Control")
-            p.setFont(QFont("Helvetica Neue", 11, QFont.DemiBold))
         if self._sel is not None:          # the CURRENT well in the detail viewer = a red BOX
             p.setPen(QPen(_RED, 2))
             p.setBrush(Qt.NoBrush)
@@ -3447,6 +3458,13 @@ class PlateWindow(QMainWindow):
         self._selected_regions = []   # wells picked on the plate (IMA-221); scopes an operator run
         self._pushed = set()          # wells whose raw z-stack is already registered in the detail viewer
 
+        # DECENTRALIZED VIEWER (Spencer, 2026-07-23 call). The plate is the ROOT; a selection opens
+        # an INDEPENDENT napari window that floats on the desktop, tracked by ID in the Open View
+        # list. Many wells become ONE window with a region slider, not many windows. Every window
+        # shares this one stateless reader/meta — nothing reopens the dataset. See _region_viewer.
+        from squidmip._region_viewer import ViewerManager
+        self._viewer_manager = ViewerManager(parent=self)
+
         # File menu: a reliable "Open acquisition folder" (drag-drop can be blocked on Windows by the
         # GL child pane or an elevation mismatch, so this is the always-works path).
         file_menu = self.menuBar().addMenu("&File")
@@ -3492,8 +3510,6 @@ class PlateWindow(QMainWindow):
         self._readout_base = ""
         self._dropped_pushes = 0
         self._active_exploration = None   # the exploration tab currently in front, if any
-        self._control_well = None     # THE control well (IMA-248/IMA-260): one region id, owned
-        #                               here, mirrored onto the plate frame and pane 3's pinned tab
         self._tabs_muted = False      # suppress _on_tab_changed during bulk teardown (ingest)
         self._run_out_dir = None      # output dir of the in-flight SAVE run (for partial cleanup)
         self._run_tab_key = None      # exploration tab that owns the in-flight run's LAYER, if any
@@ -3543,13 +3559,21 @@ class PlateWindow(QMainWindow):
         self._fusion_style = QStyleFactory.create("Fusion")   # keep a ref: setStyle doesn't own it
         if self._fusion_style is not None:
             self._left_tabs.setStyle(self._fusion_style)
-        self._left_tabs.setPalette(_dark_palette())
+        # LIGHT-BLUE tab-scroll arrows on BLACK boxes (Julio). The ‹ › scroller buttons draw their
+        # arrow in the palette's ButtonText, so force that light blue on the tab widget; the QSS
+        # keeps the button boxes black.
+        _tabs_pal = _dark_palette()
+        _tabs_pal.setColor(QPalette.ButtonText, QColor("#58a6ff"))
+        self._left_tabs.setPalette(_tabs_pal)
         self._left_tabs.setAutoFillBackground(True)
-        self._left_tabs.setStyleSheet(_TABS_DARK)
+        self._left_tabs.setStyleSheet(
+            _TABS_DARK
+            + "QTabBar QToolButton{background:#000000;border:1px solid #30363d;}"
+              "QTabBar QToolButton:hover{background:#161b22;}")
         self._left_tabs.setTabsClosable(True)
         self._left_tabs.tabCloseRequested.connect(self._close_op_tab)
         self._left_tabs.currentChanged.connect(self._on_tab_changed)
-        self._left_tabs.addTab(self._build_process_pane(), "Process wells")
+        self._left_tabs.addTab(self._build_process_pane(), "Operators")
         self._left_tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)  # home tab isn't closable
 
         # PANE 3: the exploration pane. Same _DetachTabs class as the console (one detach seam, not
@@ -3586,62 +3610,16 @@ class PlateWindow(QMainWindow):
         # on the TEXT, and text you have to read a syllable at a time is not legible either.
         self._explore_pane.setMinimumWidth(360)
 
-        # right (pane 2): the central viewer. napari renders the region MOSAIC as a multiscale
-        # pyramid — the reason for the move, and the unit the user actually looks at (IMA-265).
-        # ndviewer_light is the fallback viewer and, in fallback mode, the per-FOV z-stack detail
-        # viewer; `self._detail` refers to it and every push path below is unchanged.
-        #
-        # It is NOT constructed when napari is the viewer. Building it anyway "just for the push
-        # paths" leaves its LUT sliders in the widget tree, where they are a SECOND control
-        # surface over contrast — invisible to the user, but two widgets that can move one value
-        # is the defect either way, and the IMA-268 gate walks the tree and actuates everything it
-        # finds. Measured with that gate: origin/main FAILS with 8 sliders + 4 auto buttons in the
-        # plate view; with this, "contrast: 0 sliders, 0 auto buttons". napari's mosaic pane
-        # supersedes the per-FOV detail viewer — it shows the region mosaic WITH a z slider — and
-        # every `self._detail` path already guards on None.
-        self._mosaic_pane, viewer_mode, viewer_msg = _make_mosaic_pane()
-        self._detail = None if viewer_mode == "napari" else self._make_detail_viewer()
-        if self._detail is not None:   # connect the FOV slider -> red box ONCE (not per ingest)
-            slider = getattr(self._detail, "_fov_slider", None)
-            if slider is not None:
-                slider.valueChanged.connect(self._on_fov_slider)
-            # CONTRAST HAS ONE OWNER, AND IT IS THE ARRAY VIEWER (IMA-261). Connected ONCE here,
-            # for the same reason the FOV slider is: the detail viewer is a singleton that
-            # outlives every ingest, and a per-ingest connect would stack duplicate slots.
-            sig = getattr(self._detail, "contrastChanged", None)
-            if sig is not None:
-                sig.connect(self._on_detail_contrast)
-            elif viewer_mode != "napari":
-                # Fail LOUD, in the readout: a silent no-sync is the bug. Only when ndviewer_light
-                # is ACTUALLY the viewer, though — under napari the contrast owner is
-                # layer.contrast_limits and this signal is irrelevant, so warning about it there
-                # would be a false alarm, and a warning that cries wolf gets ignored.
-                self._readout.setText(
-                    "this ndviewer_light has no contrastChanged signal — the plate cannot follow "
-                    "the array viewer's contrast (needs the IMA-261 build of ndviewer_light)")
-
-        if viewer_mode == "napari" and self._mosaic_pane is not None:
-            self._right_widget = self._mosaic_pane
-            # The analysis-operator trigger. Connected ONCE here, like the FOV slider and the
-            # contrast signal above: the pane is a singleton that outlives every ingest, and a
-            # per-ingest connect would stack duplicate slots and run the operator N times.
-            btn = getattr(self._mosaic_pane, "detect_button", None)
-            if btn is not None:
-                btn.clicked.connect(self._on_detect_nuclei)
-        elif self._detail is not None:
-            self._right_widget = self._detail
-            # A fallback the user cannot see is a silent failure. Say it in the status line.
-            if viewer_msg:
-                self._readout.setText(viewer_msg)
-        else:
-            ph = QLabel(
-                (viewer_msg + "\n" if viewer_msg else "")
-                + "ndviewer_light unavailable — pip install ndviewer_light"
-            )
-            ph.setAlignment(Qt.AlignCenter)
-            ph.setWordWrap(True)
-            ph.setStyleSheet("color:#8b98ad;")
-            self._right_widget = ph
+        # NO CENTRAL VIEWER (decentralized, 2026-07-23). The locked central napari pane is gone:
+        # viewing now happens in INDEPENDENT windows spawned from the plate (see _region_viewer),
+        # each its own napari viewer. The root is just the plate + the Open View list + the log.
+        # These stay defined-as-None because dozens of methods guard on them (``_load_mosaic``,
+        # ``_on_result``, ``activate_well`` all early-return when they are None), so a stray call
+        # from a menu operator no-ops instead of crashing rather than needing every call site cut
+        # in one pass. Operator-result display migrates onto the windows next (Phase C).
+        self._mosaic_pane = None
+        self._detail = None
+        self._right_widget = None
 
         # bottom-left: plate view (drop target until an acquisition opens). Its FIXED title bar names
         # the wellplate we're on (the acquisition) — the plate's identity lives with the plate.
@@ -3667,6 +3645,30 @@ class PlateWindow(QMainWindow):
         self._left_l.setContentsMargins(0, 0, 0, 0)
         self._left_l.setSpacing(0)
         self._left_l.addWidget(plate_title_bar)
+
+        # SELECTION BAR (the deck's "Selection" label): shows which wells operators will run on
+        # ("run on selected wells"), and a Select all button. Operators default to this selection.
+        sel_bar = QWidget()
+        sel_bar.setStyleSheet("background:#0b0e14;border-bottom:1px solid #232b3a;")
+        _sb = QHBoxLayout(sel_bar)
+        _sb.setContentsMargins(12, 5, 12, 5)
+        _sb.setSpacing(8)
+        _sel_cap = QLabel("Selection:")
+        _sel_cap.setStyleSheet("color:#8b98ad;font-size:12px;border:none;")
+        self._selection_label = QLabel("none — click wells, or Select all")
+        self._selection_label.setStyleSheet("color:#c9d1d9;font-size:12px;border:none;")
+        self._select_all_btn = QPushButton("Select all")
+        self._select_all_btn.setCursor(Qt.PointingHandCursor)
+        self._select_all_btn.setStyleSheet(
+            "QPushButton{background:#161b22;color:#c9d1d9;border:1px solid #30363d;"
+            "border-radius:4px;padding:3px 10px;font-size:12px;}"
+            "QPushButton:hover{background:#21262d;}")
+        self._select_all_btn.clicked.connect(self._select_all_wells)
+        _sb.addWidget(_sel_cap)
+        _sb.addWidget(self._selection_label, 1)
+        _sb.addWidget(self._select_all_btn)
+        self._left_l.addWidget(sel_bar)
+
         self._left_l.addWidget(self._drop, 1)    # the plate overview replaces this on ingest
 
         # THE REGION SLIDER — the navigation control, replacing the FOV slider. It lives in the
@@ -3674,148 +3676,141 @@ class PlateWindow(QMainWindow):
         # drawn on that plate. Under napari there was previously no navigation control on screen
         # at all: the FOV slider belonged to ndviewer_light, which is not constructed when napari
         # is the viewer.
-        self._region_slider = self._make_region_slider()
-        if self._region_slider is not None:
-            self._left_l.addWidget(self._region_slider)
+        # NO region slider on the root plate. The deck puts the region slider ("<> A1, B6, C3") in
+        # each spawned WINDOW, not on the plate — navigation is per window now. Building napari's
+        # QtDims here also loaded napari icons with no napari viewer registered, which is the
+        # "theme_dark:/playback-forward.svg not found" warning spam. Playback/frame_done paths
+        # guard on None, so leaving it unbuilt is safe.
+        self._region_slider = None
 
-        left_col = QSplitter(Qt.Vertical)
-        left_col.setStyleSheet("QSplitter::handle{background:#232b3a;height:1px;}")
-        left_col.setChildrenCollapsible(False)
-        left_col.addWidget(self._left_tabs)
-        left_col.addWidget(plate_host)
-        left_col.setStretchFactor(0, 0)
-        left_col.setStretchFactor(1, 1)
-        left_col.setSizes([340, 610])
-        left_col.setChildrenCollapsible(True)
-        left_col.setHandleWidth(6)
-
-        # the right (array viewer) pane gets a thin white outline via a 1px-margin frame
-        right_frame = QFrame()
-        right_frame.setStyleSheet("QFrame{background:#6e7681;}")   # shows through the 1px margin = outline
-        rfl = QVBoxLayout(right_frame)
-        rfl.setContentsMargins(1, 1, 1, 1)
-        rfl.setSpacing(0)
-        rfl.addWidget(self._right_widget, 1)
-        # A small control bar UNDER the detail viewer (below its FOV slider): "focus reference plane"
-        # jumps the z-slider to the current FOV's sharpest plane (Tenengrad) — a per-FOV autofocus, not
-        # a plate-wide save.
-        detail_bar = QWidget()
-        detail_bar.setStyleSheet(f"background:{_BG};")
-        dbl = QHBoxLayout(detail_bar)
-        dbl.setContentsMargins(8, 5, 8, 5)
+        # "Focus reference plane" was a control UNDER the old central viewer. It has no central
+        # viewer to drive now (per-FOV autofocus belongs on a window, Phase C), but its setEnabled
+        # callers still exist, so keep the button as a hidden orphan rather than chase every call
+        # site. _sync_focus_button leaves it hidden.
         self._focus_btn = QPushButton("Focus reference plane")
-        self._focus_btn.setStyleSheet(_BTN_QSS)
-        self._focus_btn.setToolTip("Jump the z-slider to the sharpest plane of the FOV in view")
         self._focus_btn.clicked.connect(self._focus_reference_plane)
-        # A reference-plane pick only means something with a z-stack. On a 2D acquisition
-        # (Nz == 1) there is exactly one plane and nothing to focus, so the button would jump
-        # the slider to itself. Hide it rather than offer a no-op. Meta is None until an
-        # acquisition loads, so start hidden and let _sync_focus_button reveal it for a z-stack.
         self._focus_btn.hide()
-        dbl.addWidget(self._focus_btn)
-        dbl.addStretch(1)
-        rfl.addWidget(detail_bar)
 
-        # PANE 3 COLUMN: the exploration pane, and UNDER it the log panel. Julio: "the logger... on
-        # the bottom right of the GUI, below the exploration pane." Squid's gui_hcs puts RAM +
-        # throughput + errors in a persistent bottom status bar; this is that shape, docked under
-        # the exploration pane rather than spanning the whole window, because that is where he asked
-        # for it. A vertical splitter so the user can drag it, and it starts small so it never
-        # steals the exploration pane's space; collapsed it shrinks to its one-line header.
+        # THE ROOT IS JUST THE PLATE (decentralized, 2026-07-23). The central viewer and the
+        # exploration pane are gone from the layout; the plate column IS the window. Selections
+        # open independent napari windows (the Views dock, added below), and the log lives in a
+        # bottom dock — Julio: "the logger on the bottom of the GUI". This replaces the locked
+        # 3-pane grid that Spencer asked us to dismantle.
         self._log_panel = LogPanel(self._log_bus, self._activity)
         self._log_panel.start()
-        self._explore_col = QSplitter(Qt.Vertical)
-        self._explore_col.setStyleSheet("QSplitter::handle{background:#232b3a;height:1px;}")
-        self._explore_col.addWidget(self._explore_pane)
-        self._explore_col.addWidget(self._log_panel)
-        self._explore_col.setStretchFactor(0, 1)   # the exploration pane grows on resize
-        self._explore_col.setStretchFactor(1, 0)   # the log keeps its height, never eats the pane
-        self._explore_col.setCollapsible(0, False)
-        self._explore_col.setCollapsible(1, True)  # the log can be dragged fully shut
-        self._explore_col.setHandleWidth(6)
-        self._explore_col.setSizes([760, 150])
 
-        outer = QSplitter(Qt.Horizontal)
-        outer.setStyleSheet("QSplitter::handle{background:#232b3a;width:1px;}")
-        outer.setChildrenCollapsible(False)
-        outer.addWidget(left_col)                  # pane 1: plate + controls with the tabs
-        outer.addWidget(right_frame)               # pane 2: the initial viewer
-        outer.addWidget(self._explore_col)         # pane 3: exploration + log panel under it
-        outer.setSizes([600, 620, _EXPLORE_W])     # three real panes on a 1600 px window
-        # Draggable and COLLAPSIBLE. Julio: "Since the GUI is so large, I need to be able to
-        # collapse windows and be able to drag the splitters." A fixed pane on a large monitor
-        # is dead space he cannot reclaim; a collapsible one lets him give the canvas the whole
-        # window when he is inspecting a mosaic.
-        outer.setChildrenCollapsible(True)
-        outer.setHandleWidth(6)
-        for _i in range(outer.count()):
-            outer.setCollapsible(_i, True)
-            outer.setStretchFactor(_i, 1 if _i == 1 else 0)
-        # Stretch: panes 1 and 2 share the window; pane 3 gets 0 so a window RESIZE grows the plate
-        # and the viewer, never the exploration strip. Requirement 5 — pane 3 must not squash the
-        # plate view — is why its width is a CONSTANT taken once at construction rather than a
-        # share: the pane never widens behind the user's back, and never has to be carved out of a
-        # neighbour later, because it was there from the first frame.
-        outer.setStretchFactor(0, 1)
-        outer.setStretchFactor(1, 1)
-        outer.setStretchFactor(2, 0)
-        self._split = outer
-        self.setCentralWidget(outer)
-        self._sync_explore_pane()                  # page 0 (the example copy) is what an empty pane shows
+        # THE DECK LAYOUT (2026-07-23 image): ONE COMPACT PORTRAIT (h>w) window — a top row of two
+        # small panels [Open View list | Operators (bulk)] over a big Wellplate view below. NOT OS
+        # docks spread across a wide window (that was wrong): the deck is a single tidy rectangle.
+        from squidmip._region_viewer import OpenViewList
+        self._open_views = OpenViewList(self._viewer_manager, self)
+
+        top_row = QSplitter(Qt.Horizontal)
+        top_row.setStyleSheet("QSplitter{background:#0b0e14;}"
+                              "QSplitter::handle{background:#232b3a;width:1px;}")
+        top_row.addWidget(self._open_views)     # top-left: "Open View list 'selectable'"
+        top_row.addWidget(self._left_tabs)      # top-right: "Operators (bulk) to selection"
+        top_row.setSizes([280, 280])
+        top_row.setHandleWidth(6)
+        # The top row is a COMPACT strip — the plate is the star, not these two small panels. A
+        # fixed max height stops the operator cards' size hint from ballooning it into the "super
+        # thick" top that squashed the plate. Its OWN panels scroll inside this height.
+        top_row.setMaximumHeight(240)
+        top_row.setMinimumHeight(150)
+
+        root = QWidget()
+        root.setStyleSheet(f"background:{_BG};")
+        rv = QVBoxLayout(root)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(1)
+        rv.addWidget(top_row, 0)                # compact strip, keeps its height
+        rv.addWidget(plate_host, 1)             # the Wellplate view fills the rest
+        self._split = top_row
+        self.setCentralWidget(root)
+
+        # LOCK THE WHOLE ROOT DARK so macOS LIGHT theme cannot whiten the framing (Julio: "make
+        # sure my mac's light theme doesn't whiten the framing"). The old code scoped Fusion+dark to
+        # just the tab subtree to protect the embedded ndviewer's colour swatches — but ndviewer and
+        # the central pane are gone, so the whole root can go dark. napari's windows are SEPARATE
+        # top-levels with their own stylesheet, so this does not touch them.
+        if self._fusion_style is not None:
+            self.setStyle(self._fusion_style)
+        self.setPalette(_dark_palette())
+        self.setStyleSheet("QMainWindow{background:#0b0e14;}")
+        self.statusBar().setStyleSheet(
+            "QStatusBar{background:#0b0e14;color:#8b98ad;} QStatusBar::item{border:0px;}")
+        self.menuBar().setStyleSheet(
+            "QMenuBar{background:#0b0e14;color:#c9d1d9;} "
+            "QMenuBar::item:selected{background:#1f6feb;}")
+
+        # THE LOG IS ITS OWN SMALL WINDOW (Julio: "logger on a small separate window, so we can
+        # follow this compact h>w layout"). A top-level QMainWindow kept alive on self; toggle it
+        # from the View menu. Not a dock — a dock would widen the compact root.
+        self._log_window = QMainWindow(self)
+        self._log_window.setWindowFlag(Qt.Window, True)
+        self._log_window.setWindowTitle("Log")
+        self._log_window.setCentralWidget(self._log_panel)
+        if self._fusion_style is not None:
+            self._log_window.setStyle(self._fusion_style)
+        self._log_window.setPalette(_dark_palette())
+        self._log_window.setStyleSheet("QMainWindow{background:#0b0e14;}")
+        self._log_window.resize(760, 240)
+
+        self._sync_explore_pane()                  # keeps the (now-hidden) op-tab stack coherent
+
+        # FIXED SIZE on any display (Julio): 596 wide x 850 tall. A hard setFixedSize so the compact
+        # portrait shape is identical on every monitor and never balloons — the plate dominates
+        # below the capped top strip.
+        self.setFixedSize(596, 850)
+
+        # The log window opens alongside the root and is toggled from the View menu.
+        view_menu = self.menuBar().addMenu("&View")
+        self._log_act = QAction("&Log window", self)
+        self._log_act.setCheckable(True)
+        self._log_act.setChecked(True)
+        self._log_act.toggled.connect(self._log_window.setVisible)
+        view_menu.addAction(self._log_act)
+        self._log_window.show()
 
         self.setAcceptDrops(True)
         if initial_path:
             self.ingest(initial_path)
 
-    # -- top-left process console: pick an operator (params via dialogs), open the CLI stub ---------
+    # -- the Operators panel (top-right): a scrollable list of operator blocks ----------------------
     def _build_process_pane(self) -> QWidget:
-        """The 'Process wells' console: a compact one-line status, a scrollable stack of operator cards
-        (MIP, Record z-stack) plus a 'to be added' roadmap, and an 'Open CLI' button. Operators gather
-        any parameters through dialogs, so this pane is self-contained — no tabs."""
+        """The Operators panel: JUST a scrollable list of operator blocks — no header, no footer
+        (Julio, 2026-07-23). Each block opens that operator; operators apply to the plate SELECTION
+        (Cmd/Ctrl-A picks the whole plate). Minerva and Gallery View are here as the deck's terminal
+        operators. Status moved to the window status bar; the old 'run on' scope combo and the
+        raw/3D/MIP footer buttons are kept as hidden orphans so their many callers still resolve —
+        they migrate onto the operator tabs and the windows in the operator phase."""
+        # Status line — tests and many methods read self._readout; it now lives in the status bar,
+        # not as a pane header. Created here because _build_process_pane runs during __init__.
+        self._readout = QLabel("Drop a Squid acquisition, then pick an operator.")
+        self._readout.setStyleSheet("color:#8b98ad;font-size:12px;")
+        self.statusBar().addWidget(self._readout, 1)
+
+        # Hidden orphans (referenced elsewhere; not shown — no header/footer).
+        self._scope_run = QComboBox()
+        self._scope_run.addItems(list(_explore.RUN_SCOPES))
+        self._scope_run.hide()
+        self._raw_btn = QPushButton("Return to raw view")
+        self._raw_btn.clicked.connect(self._return_to_raw)
+        self._raw_btn.hide()
+        self._native3d_btn = QPushButton("3D native (napari)…")
+        self._native3d_btn.clicked.connect(self._open_native_3d)
+        self._native3d_btn.hide()
+
         pane = QWidget()
         pane.setStyleSheet(f"background:{_BG};")
         v = QVBoxLayout(pane)
-        v.setContentsMargins(14, 10, 14, 12)
-        v.setSpacing(7)
-
-        # a single small subtitle (also the live status line — tests read this)
-        self._readout = QLabel("Drop a Squid acquisition, then pick an operator to run on the plate.")
-        self._readout.setStyleSheet("color:#8b98ad;font-size:12px;")
-        self._readout.setWordWrap(True)
-        v.addWidget(self._readout)
-
-        def _section(text):
-            lab = QLabel(text)
-            lab.setStyleSheet("color:#57606a;font-size:10px;font-weight:800;letter-spacing:1.5px;padding-top:8px;")
-            return lab
-
-        # RUN SCOPE — the one place a run is aimed. Julio: "we have the controls for the whole
-        # dataset on the left, but those controls are repeated for the subset on the right pane.
-        # Maybe it's not a good idea for there to be repetition of knowledge in our user
-        # interface." So "run it on the subset" is a value HERE, not a second button set over
-        # there: one operator catalogue, one control panel, several scopes. The side pane owns
-        # the subset and this reads it (``parked_subset``).
-        scope_row = QHBoxLayout(); scope_row.setSpacing(6)
-        _run_scope_lbl = QLabel("run on")
-        _run_scope_lbl.setStyleSheet("color:#8b98ad;font-size:12px;")
-        self._scope_run = QComboBox()
-        self._scope_run.setStyleSheet(_COMBO_QSS)
-        self._scope_run.addItems(list(_explore.RUN_SCOPES))
-        self._scope_run.setToolTip(
-            "What the next operator run covers.\n"
-            f"{_explore.SCOPE_SELECTION} — the wells picked on the plate (all of them if none is).\n"
-            f"{_explore.SCOPE_PLATE} — every region of the acquisition.\n"
-            f"{_explore.SCOPE_REGION} — the region open in the viewer.\n"
-            f"{_explore.SCOPE_SUBSET} — the subset parked in the side pane.")
-        scope_row.addWidget(_run_scope_lbl)
-        scope_row.addWidget(self._scope_run, 1)
-        v.addLayout(scope_row)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(0)
 
         stack = QWidget()
         sv = QVBoxLayout(stack)
         sv.setContentsMargins(0, 0, 0, 0)
-        sv.setSpacing(7)
-        sv.addWidget(_section("OPERATORS"))
+        sv.setSpacing(8)
         self._op_cards = {}
         for op in _OPERATIONS:
             card = QPushButton(f"{op.label}\n{op.blurb}")
@@ -3826,77 +3821,36 @@ class PlateWindow(QMainWindow):
             card.clicked.connect(lambda _=False, k=op.key: self._activate_operator(k))
             sv.addWidget(card)
             self._op_cards[op.key] = card
-        if _TO_BE_ADDED:                                    # only show the section when it has cards
-            sv.addWidget(_section("TO BE ADDED"))
-            for label, blurb in _TO_BE_ADDED:
-                soon = QPushButton(f"{label}\n{blurb}")
-                soon.setEnabled(False)
-                soon.setStyleSheet(_CARD_QSS + "QPushButton:disabled{color:#57606a;border-style:dashed;}")
-                soon.setMinimumHeight(46)
-                sv.addWidget(soon)
+        # Gallery View (slide 2 terminal operator): assemble a gallery from the OPEN windows.
+        gv = QPushButton("Gallery View\nArrange the open viewer windows into a gallery")
+        gv.setEnabled(False)
+        gv.setCursor(Qt.PointingHandCursor)
+        gv.setStyleSheet(_CARD_QSS)
+        gv.setMinimumHeight(54)
+        gv.clicked.connect(self._open_gallery_view)
+        sv.addWidget(gv)
+        self._op_cards["galleryview"] = gv
         sv.addStretch(1)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
         scroll.setWidget(stack)
         v.addWidget(scroll, 1)
-
-        open_btn = QPushButton("Open a computed MIP…")     # load a previously written .hcs plate
-        open_btn.setStyleSheet(_BTN_QSS)
-        open_btn.clicked.connect(self._open_computed)
-        v.addWidget(open_btn)
-        self._raw_btn = QPushButton("Return to raw view")  # only shown once an operator has run
-        self._raw_btn.setStyleSheet(_BTN_QSS)
-        self._raw_btn.clicked.connect(self._return_to_raw)
-        self._raw_btn.hide()
-        v.addWidget(self._raw_btn)
-        # The 3D view. NOT an Operation: it computes no plate result and writes nothing next to
-        # the acquisition, so putting it in _OPERATIONS would advertise it in the "Process well
-        # plates" menu as something that processes wells. It is a VIEW, offered from pane 1 and
-        # opening in pane 3 — the supplementary pane it belongs to.
-        self._agave_btn = QPushButton("3D view (AGAVE)…")
-        self._agave_btn.setStyleSheet(_BTN_QSS)
-        self._agave_btn.setToolTip("Path-trace the selected region's z-stack in the exploration pane")
-        self._agave_btn.clicked.connect(self._open_agave_view)
-        v.addWidget(self._agave_btn)
-        # Native-resolution napari 3D, gallery-view's recipe: a popout napari viewer on ONE FOV's
-        # native z-stack (fits the GPU texture, so it is crisp where the fused region cannot be).
-        self._native3d_btn = QPushButton("3D native (napari)…")
-        self._native3d_btn.setStyleSheet(_BTN_QSS)
-        self._native3d_btn.setToolTip("Open a popout napari 3D viewer on the current region's "
-                                      "centre FOV at NATIVE resolution (fits the GPU texture).")
-        self._native3d_btn.clicked.connect(self._open_native_3d)
-        v.addWidget(self._native3d_btn)
-        cli_btn = QPushButton("Open CLI")                  # opens a CLI tab within this pane (ABOVE Layers)
-        cli_btn.setStyleSheet(_BTN_QSS)
-        cli_btn.clicked.connect(lambda: self._open_op_tab("cli", "CLI", self._build_cli_tab))
-        v.addWidget(cli_btn)
-        layers_btn = QPushButton("Layers")                 # toggle/reorder applied operation layers
-        layers_btn.setStyleSheet(_BTN_QSS)
-        layers_btn.clicked.connect(lambda: self._open_op_tab("layers", "Layers", self._build_layers_tab))
-        v.addWidget(layers_btn)
         return pane
 
-    # -- the 3D view (AGAVE). Offered from pane 1, OPENS IN PANE 3. -------------------------------
-    def _open_agave_view(self):
-        """Open (or focus) the AGAVE 3D tab in pane 3.
-
-        Goes through ``_open_op_tab`` with ``tabs=self._explore_tabs``, so it inherits the whole
-        embedded-tab contract for free: built once, focused on a second click, torn down through
-        ``_dispose_tab_widget`` (which calls its ``shutdown``, killing the AGAVE server), and
-        floatable like any other pane-3 tab. Never a top-level window of its own."""
-        if self._reader is None or self._meta is None:
-            self._readout.setText(
-                "No acquisition open — drop a Squid acquisition before opening the 3D view.")
+    def _open_gallery_view(self):
+        """Gallery View terminal operator (slide 2): "prepares a gallery view instance using the
+        selected Napari windows, with current views". The window-assembly lands with the operator
+        phase; for now report what it will gather so the block is never a silent dead control."""
+        n = len(self._viewer_manager.windows) if hasattr(self, "_viewer_manager") else 0
+        if n == 0:
+            self._readout.setText("Gallery View: open some viewer windows first, then gather them.")
             return
-        self._open_op_tab(AGAVE_KEY, "3D · AGAVE", self._build_agave_tab,
-                          tabs=self._explore_tabs)
-
-    def _build_agave_tab(self) -> QWidget:
-        from squidmip._agave_pane import AgaveTab
-
-        return AgaveTab(self._reader, self._meta, self._acq_path)
+        self._readout.setText(
+            f"Gallery View: {n} open window(s) will be arranged into a gallery "
+            "(assembly lands with the operator phase).")
 
     def _open_native_3d(self):
         """Popout napari 3D on the current region's centre FOV at native resolution (gallery-view
@@ -4077,9 +4031,6 @@ class PlateWindow(QMainWindow):
         if index < 0:
             return None
         w = tabs.widget(index)
-        if w is not None and w is self._op_tabs.get(self.CONTROL_KEY):
-            return None      # the CONTROL tab is pinned: floating it would leave pane 3 claiming
-            #                  no control while the plate still wears the blue frame (IMA-248)
         key = next((k for k, v in self._op_tabs.items() if v is w), None)
         if key is None:
             return None
@@ -4317,65 +4268,6 @@ class PlateWindow(QMainWindow):
                 colormap=_colormap_for(channel),
                 bbox_um=bbox,
             )
-
-    # -- CONTROL WELL (IMA-248's unit, corrected from FOV to WELL; reachable because IMA-260's
-    # -- empty-state example points at it) ---------------------------------------------------------
-    CONTROL_KEY = "control"           # the pinned tab's registry key: there is only ever one
-
-    def set_control_well(self, well_id: Optional[str]):
-        """Pin *well_id* as THE control: the reference region every other well is compared against.
-
-        A control well is standard HCS practice — you read a treated well against an untreated one
-        — and under IMA-253's model a well IS a region (a mosaic of FOVs), which is why the unit
-        here is the well and not a single field.
-
-        ONE piece of state, ``self._control_well``, owned here. The plate and the exploration pane
-        are told from it; neither keeps its own answer and neither is asked. That is the whole
-        design constraint of IMA-248: this project has already shipped four bugs whose shape was
-        two places holding the same fact and disagreeing.
-
-        ``None`` or ``""`` clears it. Setting a different well releases the previous one — the
-        release is implicit in there being one variable, not a step that can be forgotten."""
-        well_id = well_id or None
-        if well_id is not None and well_id not in self._fov_index:
-            self._readout.setText(f"{well_id} is not a region of this acquisition")
-            return
-        self._control_well = well_id
-        if self._overview is not None:
-            self._overview.set_control(well_id)          # the frame is DERIVED, never independent
-        self._sync_control_tab()
-        self._readout.setText(f"control well: {well_id}" if well_id else "control well cleared")
-
-    def control_well(self) -> Optional[str]:
-        """The one control-well identity. Every view answers this question by asking here."""
-        return self._control_well
-
-    def _sync_control_tab(self):
-        """Make pane 3's pinned first tab agree with ``self._control_well``.
-
-        The control is a PINNED tab (IMA-248): always index 0, and with no close button — you clear
-        a control from the plate, where you set it, not by tidying a tab away and leaving a blue
-        frame behind on a well that is no longer anything."""
-        old = self._op_tabs.get(self.CONTROL_KEY)
-        if old is not None and getattr(old, "regions", None) != ([self._control_well]
-                                                                 if self._control_well else None):
-            idx = self._explore_tabs.indexOf(old)        # a DIFFERENT (or no) control: retire it
-            if idx >= 0:
-                self._explore_tabs.removeTab(idx)
-            self._dispose_tab_widget(old)
-        if not self._control_well:
-            self._sync_explore_pane()
-            return
-        if self._op_tabs.get(self.CONTROL_KEY) is None:
-            w = self._build_exploration_tab([self._control_well], self.CONTROL_KEY)
-            self._op_tabs[self.CONTROL_KEY] = w
-            self._explore_tabs.addTab(w, f"Control · {self._control_well}")
-        idx = self._explore_tabs.indexOf(self._op_tabs[self.CONTROL_KEY])
-        if idx > 0:
-            self._explore_tabs.tabBar().moveTab(idx, 0)  # pinned FIRST, ahead of every subset tab
-        self._explore_tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)   # ...and not closable
-        self._sync_explore_pane()
-        self._explore_tabs.setCurrentIndex(0)
 
     def _current_exploration(self) -> Optional["_ExplorationTab"]:
         """The exploration tab the plate and viewer follow: pane 3's FRONT tab, or None when pane 3
@@ -5456,8 +5348,6 @@ class PlateWindow(QMainWindow):
         # layer keys point at a _fov_index that is about to be rebuilt for a different plate.
         self._close_exploration_tabs()
         self._active_exploration = None
-        self._control_well = None     # a control is a region OF THIS acquisition; the next plate
-        #                               has no reference until the user picks one on it
         self._push_index = None
         self._run_tab_key = self._run_view_tab_key = None
         self._reader = self._meta = None
@@ -5503,6 +5393,7 @@ class PlateWindow(QMainWindow):
         self._processed_plate = None
         self._sync_focus_button()                    # 2D acquisition -> no reference-plane button
         self._populate_detect_channels()             # channel-aware cellpose picker
+        self._viewer_manager.set_dataset(reader, meta)   # every spawned window shares this reader
         rows, cols, wells, order = plate.viewer_grid()
         for idx, region in enumerate(order):
             self._fov_index[region] = {"idx": idx, "well_id": region, "rc": plate.cell_index(region)}
@@ -5523,7 +5414,6 @@ class PlateWindow(QMainWindow):
         self._overview.wellActivated.connect(self.activate_well)
         self._overview.selectionChanged.connect(self._on_selection_changed)
         self._overview.marqueeSelected.connect(self._on_marquee_selected)
-        self._overview.controlRequested.connect(self.set_control_well)
         self._plate_mode = "raw"                     # a freshly-opened plate shows raw previews
         self._plate_title.setText(f"{self._acq_name}   ·   raw")   # bottom-left plate-pane title
         self._op_stack.reset()                       # fresh layer stack (base only)
@@ -6277,7 +6167,6 @@ class PlateWindow(QMainWindow):
         # to the raw acquisition) and go back to identity push indexing over the full plate.
         self._close_exploration_tabs()
         self._active_exploration = None
-        self._control_well = None                 # ...including the control (a raw-plate region)
         self._push_index = None
         self._run_tab_key = self._run_view_tab_key = None
         wells_rc, self._fov_index, self._order, worker_wells = {}, {}, [], []
@@ -6306,7 +6195,6 @@ class PlateWindow(QMainWindow):
         self._overview.set_carrier(self._plate)
         self._overview.hovered.connect(self._on_hover)
         self._overview.wellActivated.connect(self.activate_well)
-        self._overview.controlRequested.connect(self.set_control_well)
         self._active_op_key = "computed"
         if getattr(self, "_raw_btn", None):
             self._raw_btn.hide()                      # a computed plate has no raw to return to
@@ -6748,6 +6636,12 @@ class PlateWindow(QMainWindow):
         from squidmip._napari_pane import _colormap_for
 
         pane = self._mosaic_pane
+        if pane is None:
+            # No central viewer any more (decentralized root). Operator results will target the
+            # spawned windows in Phase C; until then, say so rather than crash on a None pane.
+            self._readout.setText(
+                f"{result.op}: result computed — per-window result display lands next.")
+            return
         for channel in result.channels:
             pane.mosaic.add_mosaic(
                 result.op, channel, result.plane(channel),
@@ -6886,21 +6780,41 @@ class PlateWindow(QMainWindow):
         """
         picked = set(wells)
         self._selected_regions = [w for w in self._order if w in picked]   # plate row-major
+        self._update_selection_label()
+
+    def _update_selection_label(self):
+        """Show the current selection in the Selection bar ("run on selected wells")."""
+        lbl = getattr(self, "_selection_label", None)
+        if lbl is None:
+            return
+        sel = self._selected_regions
+        if not sel:
+            lbl.setText("none — click wells, or Select all")
+        elif len(sel) <= 6:
+            lbl.setText(f"{', '.join(sel)}  ({len(sel)})")
+        else:
+            lbl.setText(f"{', '.join(sel[:6])}, +{len(sel) - 6}  ({len(sel)})")
+
+    def _select_all_wells(self):
+        if self._overview is not None:
+            self._overview.select_all()
 
     def _on_marquee_selected(self, wells: list):
-        """Shift-DRAG released on the plate -> open the exploration tab for that subset (IMA-205).
+        """Shift-DRAG released on the plate -> open an INDEPENDENT napari window for that subset.
 
-        This is the user's sentence end to end: "hold shift to open an 'exploration' tab with the
-        selected FOV subset". The marquee (IMA-221) is the only gesture wired here — Shift+CLICK
-        toggles single wells while you refine a selection, and opening a tab per corrective click
-        would bury the one you actually wanted (each distinct set is a distinct content-addressed
-        tab, so they would NOT dedupe).
+        The decentralized flow (Spencer, 2026-07-23): a selection opens a floating napari window,
+        and MANY wells become ONE window with a region slider to step through them — not one window
+        per well, which "is really not what anybody wants". The window is tracked by ID in the Open
+        View list. Shift+CLICK still refines the selection; the drag-release is the "open" gesture.
 
         An empty drag (over blank plate) is a miss, not a request: return quietly rather than
         writing 'empty selection' over whatever the readout is saying."""
         if not wells:
             return
-        self.open_exploration_tab(wells)
+        ordered = [w for w in self._order if w in set(wells)] or list(wells)  # plate row-major
+        win = self._viewer_manager.open(ordered)
+        if win is None:
+            self._readout.setText("Open an acquisition before opening a view.")
 
     def selected_region_fovs(self) -> list:
         """The current selection as (region, fov) pairs — the payload IMA-205 will consume."""
@@ -6952,6 +6866,11 @@ class PlateWindow(QMainWindow):
             self._readout.setText(f"{well_id} is not in the current region order")
             return
         if self._detail is None:
+            # Decentralized root: double-click opens ONE independent window on this region (the
+            # single-region case of the shift-drag gesture). Many regions -> shift-drag a box.
+            win = self._viewer_manager.open([well_id])
+            if win is None:
+                self._readout.setText("Open an acquisition before opening a view.")
             return
         if self._active_op_key is not None or self._reader is None:   # processed/computed: already pushed
             self._detail.go_to_well_fov(well_id, fov_index)
