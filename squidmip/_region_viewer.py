@@ -299,19 +299,14 @@ class RegionViewer(QMainWindow):
         # popout is the single-FOV native volume for when the fused mosaic exceeds the GPU texture.
         view_box, vv = self._titled_box("2D / 3D · ROI")
         r1 = QHBoxLayout(); r1.setSpacing(4)
-        self._btn_2d = self._chip("2D", "Show the mosaic in 2D.", lambda: self._set_ndisplay(2),
-                                  checkable=True)
-        self._btn_3d = self._chip("3D", "Render the mosaic volume in 3D (max texture resolution).",
-                                  lambda: self._set_ndisplay(3), checkable=True)
-        self._btn_2d.setChecked(True)
-        grp = QButtonGroup(self)
-        grp.setExclusive(True)
-        grp.addButton(self._btn_2d)
-        grp.addButton(self._btn_3d)
-        self._nd_group = grp
-        pop = self._chip("⛶ native", "Open this region's centre FOV as a native-resolution napari "
-                         "3D popout (gallery-view recipe).", self._open_3d)
-        r1.addWidget(self._btn_2d); r1.addWidget(self._btn_3d); r1.addWidget(pop)
+        self._btn_2d = self._chip("2D", "Show the mosaic in 2D.", lambda: self._set_ndisplay(2))
+        # 3D is ONE thing: a NATIVE-resolution popout of this view (never the whole fused mosaic,
+        # which exceeds the GPU texture and renders blocky). 2D just keeps the mosaic. No embedded
+        # 3D toggle, no separate "native" button -- one behaviour, so the cases don't explode.
+        self._btn_3d = self._chip("3D", "Open this view in 3D at NATIVE resolution (the region if it "
+                                  "fits the GPU texture, else draw an ROI to pick the spot).",
+                                  self._open_3d)
+        r1.addWidget(self._btn_2d); r1.addWidget(self._btn_3d)
         r1.addStretch(1)
         vv.addLayout(r1)
         r2 = QHBoxLayout(); r2.setSpacing(4)
@@ -556,99 +551,75 @@ class RegionViewer(QMainWindow):
             self._slider.frame_done()
 
     # -- 2D -> 3D, per window -----------------------------------------------------------
+    @staticmethod
+    def _texture_bounded(level0, max_tex: int):
+        """A native (z, y, x) crop that FITS the GPU 3D texture: the whole level if it already fits,
+        else its centre. This is what guarantees 3D is always native and never blocky — we never hand
+        napari a volume wider than one texture, so it never silently downsamples."""
+        h, w = int(level0.shape[-2]), int(level0.shape[-1])
+        if max(h, w) <= int(max_tex):
+            return np.asarray(level0)
+        r0 = max(0, (h - int(max_tex)) // 2)
+        c0 = max(0, (w - int(max_tex)) // 2)
+        return np.asarray(level0[..., r0:r0 + int(max_tex), c0:c0 + int(max_tex)])
+
     def _open_3d(self) -> None:
-        """Open a native-resolution napari 3D popout of this window's current region (gallery-view
-        recipe, ``_napari3d.open_native_3d``), carrying the per-channel contrast/colormap on screen.
-
-        A popout, not an embedded toggle: 3D is the whole region's centre FOV at NATIVE resolution
-        (fits the GPU texture where a fused mosaic cannot), so it is its own window the user can
-        place beside the 2D one — exactly the compare-two-views flow Spencer described."""
-        region = self._cursor.region if self._cursor is not None else (
-            self._regions[0] if self._regions else None)
-        if region is None or self._reader is None or self._meta is None:
-            self._say("no region to render in 3D.")
-            return
-        contrast_by: dict = {}
-        colormap_by: dict = {}
-        if self._pane is not None and self._pane.mosaic is not None:
-            for c in self._meta.get("channels", []):
-                name = c["name"]
-                layer = self._pane.mosaic.find(_RAW_OP, name)
-                if layer is None:
-                    continue
-                try:
-                    contrast_by[name] = tuple(layer.contrast_limits)
-                except Exception:                    # noqa: BLE001 - contrast is a nicety
-                    pass
-                try:
-                    cmap = layer.colormap
-                    colormap_by[name] = getattr(cmap, "name", cmap)
-                except Exception:                    # noqa: BLE001
-                    pass
-        # ROI CHILD (organoid contract): render the ROI's NATIVE level-0 crop as the 3D volume, not a
-        # centre FOV — the ROI already spans exactly the tissue the user boxed. Texture-bounded and
-        # fail-loud (no silent downsample). See docs/rendering-contract.md.
-        if self._roi_bbox is not None:
-            self._open_3d_roi(contrast_by, colormap_by)
-            return
-
-        from squidmip._napari3d import open_native_3d
-
-        try:
-            # Keep a ref so the popout viewer is not garbage-collected the instant this returns.
-            self._native3d = open_native_3d(
-                self._reader, self._meta, region,
-                contrast_by_channel=contrast_by or None,
-                colormap_by_channel=colormap_by or None,
-            )
-        except Exception as exc:                     # noqa: BLE001 - named to the window, never silent
-            self._say(f"3D view could not open: {exc}")
-
-    def _open_3d_roi(self, contrast_by: dict, colormap_by: dict) -> None:
-        """3D of an ROI child = the ROI's NATIVE level-0 crop across the FOVs it spans (the organoid
-        max-res contract). Materialises the texture-bounded ROI volume per channel and hands it to
-        ``open_native_3d_volume``, which REFUSES (never downsamples) if the ROI exceeds the GPU 3D
-        texture. No fall back to a centre FOV: that would misrepresent what the user boxed."""
+        """3D = THIS VIEW at NATIVE resolution, in a napari popout (gallery-view recipe). ONE
+        behaviour, never the whole fused mosaic: a mosaic exceeds the GPU 3D texture and napari would
+        render it blocky (the "3D sucks" bug). We take the pyramid's native level 0 — the ROI's crop
+        if this is an ROI child, else the region — bound it to the texture (its centre if the region
+        is larger), and render with the contrast/colormap on screen. Draw an ROI to pick the spot."""
         pane = self._pane
         mosaic = getattr(pane, "mosaic", None) if pane is not None else None
         if mosaic is None:
-            self._say("no mosaic to render in 3D.")
+            self._say("open a region first, then 3D.")
             return
+        max_tex = 2048
+        try:
+            max_tex = int(self._pane._live_max_3d_texture())
+        except Exception:                            # noqa: BLE001 - Apple default is the safe floor
+            pass
+        contrast_by: dict = {}
+        colormap_by: dict = {}
         volumes: dict = {}
         for c in (self._meta or {}).get("channels", []):
             name = c["name"]
             layer = mosaic.find(_RAW_OP, name)
             if layer is None:
                 continue
+            try:
+                contrast_by[name] = tuple(layer.contrast_limits)
+            except Exception:                        # noqa: BLE001 - contrast is a nicety
+                pass
+            try:
+                cmap = layer.colormap
+                colormap_by[name] = getattr(cmap, "name", cmap)
+            except Exception:                        # noqa: BLE001
+                pass
             data = layer.data
             level0 = data[0] if isinstance(data, (list, tuple)) else data   # native rung of the pyramid
             if getattr(level0, "ndim", 0) < 3 or int(level0.shape[0]) < 2:
-                self._say("3D needs a z-stack; this ROI has a single z plane.")
+                self._say("3D needs a z-stack; this view has a single z plane.")
                 return
-            volumes[name] = level0
+            volumes[name] = self._texture_bounded(level0, max_tex)
         if not volumes:
             self._say("no channel on screen to render in 3D.")
             return
         px = float((self._meta or {}).get("pixel_size_um") or 1.0)
         dz = float((self._meta or {}).get("dz_um") or px)
-        max_tex = 2048
-        try:
-            max_tex = int(self._pane._live_max_3d_texture())
-        except Exception:                            # noqa: BLE001 - Apple default is the safe floor
-            pass
         from squidmip._napari3d import open_native_3d_volume
 
-        title = f"3D native (ROI) — {self._region_label(self._regions)}"
+        tag = "ROI" if self._roi_bbox is not None else "region"
         try:
             self._native3d = open_native_3d_volume(
-                {n: np.asarray(v) for n, v in volumes.items()},
-                scale=(dz, px, px), title=title,
+                volumes, scale=(dz, px, px),
+                title=f"3D native ({tag}) — {self._region_label(self._regions)}",
                 contrast_by_channel=contrast_by or None,
                 colormap_by_channel=colormap_by or None,
                 max_texture=max_tex,
             )
         except Exception as exc:                     # noqa: BLE001 - named to the window, never silent
-            self._say(f"ROI 3D could not open: {exc}")
+            self._say(f"3D could not open: {exc}")
 
     def _say(self, text: str) -> None:
         if self._pane is not None and getattr(self._pane, "ok", False):
