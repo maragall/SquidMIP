@@ -795,3 +795,58 @@ def test_channel_rgb_reports_what_the_canvas_is_tinting_with(layers):
     rgb = layers.channel_rgb("638")
     assert rgb is not None and rgb[2] > 0.9
     assert layers.channel_rgb("no-such-channel") is None
+
+
+# ----------------------------------------------------------------- scale bar (IMA-265)
+
+
+def test_enable_scale_bar_turns_it_on_in_micrometres():
+    """The mosaic IS a zoomable micrometre view, so it must carry a scale bar. napari has one
+    built in; this only configures it (visible, µm), it does not build a bar of our own.
+
+    MUTATION: make enable_scale_bar a no-op -> visible stays False -> red.
+    """
+    from napari.components import ViewerModel
+
+    from squidmip._napari_view import enable_scale_bar
+
+    v = ViewerModel()
+    enable_scale_bar(v)
+    assert v.scale_bar.visible is True
+    # pint normalises "um" -> "micrometer"; either spelling is the micron, never pixels.
+    assert str(v.scale_bar.unit) in ("um", "µm", "micrometer")
+
+
+def test_the_bar_reads_micrometres_because_the_layer_scale_IS_micrometres():
+    """The number the bar shows is world coordinates, and world = data * layer.scale. So the bar
+    is correct IFF layer.scale is µm/px. add_mosaic sets scale from bbox_um, and this pins that a
+    64 px layer given a 640 µm box spans 640 world units -- i.e. the bar's µm are real µm.
+
+    This is the correctness check the plan demanded: a scale bar that lies is worse than none.
+
+    MUTATION: divide bbox by 2 in scale_translate_from_bbox_um -> world extent halves -> red.
+    """
+    from napari.components import ViewerModel
+
+    v = ViewerModel()
+    layers = MosaicLayers(v)
+    lyr = layers.add_mosaic("raw", "488", _img(shape=(64, 64)),
+                            bbox_um=(0.0, 0.0, 640.0, 640.0))
+    # world extent along x = cols * scale_x = 64 * 10 µm = 640 µm, exactly the box width.
+    assert lyr.data.shape[-1] * float(lyr.scale[-1]) == pytest.approx(640.0)
+    assert lyr.data.shape[-2] * float(lyr.scale[-2]) == pytest.approx(640.0)
+
+
+def test_add_mosaic_labels_the_layer_units_micrometres():
+    """napari >=0.7 reads the scale bar's unit from the LAYER, not the deprecated
+    viewer.scale_bar.unit. Labelling each mosaic keeps the bar honest across that migration.
+
+    MUTATION: stop setting layer.units -> stays pixel -> red.
+    """
+    from napari.components import ViewerModel
+
+    v = ViewerModel()
+    layers = MosaicLayers(v)
+    lyr = layers.add_mosaic("raw", "488", _img(shape=(16, 16)),
+                            bbox_um=(0.0, 0.0, 160.0, 160.0))
+    assert all("meter" in str(u) or str(u) in ("um", "µm") for u in lyr.units)

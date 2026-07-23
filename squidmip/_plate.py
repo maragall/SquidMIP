@@ -590,7 +590,8 @@ class SlideCarrier(Plate):
 
     def __init__(self, geometry, occupancy=None, cell_ids: Optional[Iterable[str]] = None,
                  placement: Optional[Mapping[str, tuple]] = None,
-                 layout: Optional[Mapping[str, tuple]] = None, **kw):
+                 layout: Optional[Mapping[str, tuple]] = None,
+                 stage_boxes_um: Optional[Mapping[str, tuple]] = None, **kw):
         """*placement* / *layout* carry the GEOMETRIC assignment (IMA-253).
 
         ``placement`` is ``{region: (row, col)}`` derived from stage coordinates by
@@ -598,6 +599,12 @@ class SlideCarrier(Plate):
         from :func:`freeform_layout`. Both absent is the legacy POSITIONAL carrier -- regions left
         to right in report order -- which is still exactly right when the acquisition has no stage
         coordinates at all, and is the only thing that can be done then.
+
+        ``stage_boxes_um`` is ``{region: (x, y, w, h)}`` in stage MICROMETRES -- the raw
+        measurement ``layout`` was normalised from. It is retained (not just its normalised form)
+        because the SLIDE renderer (:mod:`squidmip._slide_art`) needs the true micron scale to draw
+        a 25 x 75 mm slide at the right size relative to the tissue on it; the normalised ``layout``
+        has already divided that scale out.
         """
         names = list(cell_ids) if cell_ids is not None else []
         n_slots = geometry.rows * geometry.cols
@@ -617,6 +624,8 @@ class SlideCarrier(Plate):
         self._pos = {cid: i for i, cid in enumerate(self._ids)}
         self._layout = {str(k): tuple(float(v) for v in val)
                         for k, val in (layout or {}).items()} or None
+        self.stage_boxes_um = {str(k): tuple(float(v) for v in val)
+                               for k, val in (stage_boxes_um or {}).items()}
         super().__init__(geometry, occupancy, **kw)
 
     @classmethod
@@ -942,5 +951,6 @@ def _make(name, regions, fovs_per_region, stage_boxes=None, **kw) -> Plate:
             # this, and carrier_art() will correctly return None instead of a wrong-scale PNG.
             geom = PlateGeometry(**{**vars(geom), "cols": n})
         return SlideCarrier(geom, occupancy, cell_ids=list(regions), placement=placement,
-                            layout=layout, format_name=geom.name, **kw)
+                            layout=layout, stage_boxes_um=stage_boxes,
+                            format_name=geom.name, **kw)
     return WellPlate(PlateGeometry.vendored(name), occupancy, format_name=name, **kw)
