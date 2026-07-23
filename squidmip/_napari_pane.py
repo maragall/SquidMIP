@@ -19,7 +19,7 @@ from typing import Any, Callable, Optional
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QLabel, QPushButton, QSizePolicy, QHBoxLayout, QVBoxLayout, QWidget,
+    QComboBox, QLabel, QPushButton, QSizePolicy, QHBoxLayout, QVBoxLayout, QWidget,
 )
 
 from squidmip._napari_view import MosaicLayers, resolve_viewer
@@ -119,9 +119,9 @@ def _colormap_for(channel_name: str):
 #: button to AGAVE would be the wrong fix: it would hide a real limit behind a relabelled control.
 NDISPLAY_TOOLTIP = (
     "3D view (napari).\n"
-    "napari renders 3D from the COARSEST pyramid level only, so a large mosaic looks blocky "
-    "here.\n"
-    "For a higher-quality volume rendering of this region, open it in AGAVE — the "
+    "Renders this region's z-stack at FULL resolution (we hand napari the level-0 volume in 3D "
+    "and restore the fast pyramid in 2D).\n"
+    "For a path-traced, publication-quality render, open it in AGAVE — the "
     "\"3D view (AGAVE)…\" button, which opens in the exploration pane."
 )
 
@@ -147,6 +147,7 @@ class MosaicPane(QWidget):
         #: button. Built unconditionally (even when napari's button could not be mounted) so the
         #: operator is never silently unreachable; PlateWindow enables it once a region is shown.
         self.detect_button: Optional[QWidget] = None
+        self.detect_channel: Optional[QComboBox] = None   # channel-aware cellpose picker
         self.layer_tree: Optional[QWidget] = None
         self._button_source = None               # keeps napari's row alive; see _install_ndisplay
         self.canvas: Optional[QWidget] = None
@@ -265,10 +266,23 @@ class MosaicPane(QWidget):
         # upgrade that moves QtViewerButtons must not also take the operator off the screen.
         # Disabled until PlateWindow has a region on the canvas to run it on -- a button that
         # silently does nothing is the same defect as a silent failure.
+        # CHANNEL-AWARE cellpose. The nuclei signal is not always in 405 (on the 10x tissue set
+        # 405 is blank and the structure is in 488/638), so which channel to segment must be the
+        # user's choice, not "whatever is visible". PlateWindow fills this when a mosaic loads;
+        # empty means fall back to the first visible channel.
+        rl.addWidget(QLabel("Detect on:", row))
+        self.detect_channel = QComboBox(row)
+        self.detect_channel.setToolTip(
+            "Which channel cellpose segments. Pick the one that actually carries the signal "
+            "(a nuclear stain for nuclei); a blank channel finds nothing."
+        )
+        self.detect_channel.setMinimumWidth(150)
+        rl.addWidget(self.detect_channel)
+
         self.detect_button = QPushButton("Detect nuclei", row)
         self.detect_button.setToolTip(
-            "Count the nuclei in the channel currently shown, and overlay the mask and the "
-            "centroids on this canvas."
+            "Segment the chosen channel with Cellpose, and overlay the mask and the centroids "
+            "on this canvas."
         )
         self.detect_button.setEnabled(False)
         rl.addWidget(self.detect_button)
@@ -278,6 +292,55 @@ class MosaicPane(QWidget):
         lay.addWidget(row)
         apply_ndisplay_tooltip(btn)      # a tooltip only: this stays NAPARI's 3D button
         self.ndisplay_button = btn
+
+        # MAX-RES 3D. napari drops multiscale layers to their coarsest level in 3D; we override
+        # that by serving the full-res volume while ndisplay == 3 and restoring the pyramid in 2D.
+        # There is one owner of 2D/3D (``viewer.dims.ndisplay``), so listening to its event catches
+        # the toggle no matter which button (ours or napari's own) the user pressed.
+        try:
+            self._viewer.dims.events.ndisplay.connect(self._on_ndisplay_changed)
+            # A region change while already in 3D re-adds mosaics as multiscale, which napari would
+            # again drop to coarsest. Re-apply the full-res swap when a layer lands and we are in 3D.
+            self._viewer.layers.events.inserted.connect(self._reapply_3d_on_insert)
+        except Exception:                    # noqa: BLE001 - the 2D pane still works without it
+            pass
+
+    def _on_ndisplay_changed(self, event=None) -> None:
+        """Follow the 2D/3D toggle: fill the GPU texture budget in 3D, fast pyramid in 2D."""
+        if self.mosaic is None or self._viewer is None:
+            return
+        try:
+            self.mosaic._max_3d_texture = self._live_max_3d_texture()
+            self.mosaic.render_max_res_3d(self._viewer.dims.ndisplay == 3)
+        except Exception:                    # noqa: BLE001 - never break the toggle itself
+            pass
+
+    def _live_max_3d_texture(self) -> int:
+        """The GPU's real GL_MAX_3D_TEXTURE_SIZE from the live canvas, or 2048 (Apple GPU default).
+
+        napari computes this on first draw and stores (2d, 3d) on the vispy canvas. Reaching it is
+        version-specific, so this tries the known paths and falls back to the safe Apple value."""
+        default = 2048
+        for getter in (
+            lambda: self._viewer.window._qt_viewer.canvas.max_texture_sizes[1],
+            lambda: getattr(self.canvas, "max_texture_sizes", None)[1],
+        ):
+            try:
+                v = getter()
+                if v:
+                    return int(v)
+            except Exception:                # noqa: BLE001 - try the next path
+                continue
+        return default
+
+    def _reapply_3d_on_insert(self, event=None) -> None:
+        if self.mosaic is None or self._viewer is None:
+            return
+        try:
+            if self._viewer.dims.ndisplay == 3:
+                self.mosaic.render_max_res_3d(True)
+        except Exception:                    # noqa: BLE001
+            pass
 
     # -- the grouped layer tree ---------------------------------------------------------
     def _install_layer_tree(self) -> None:

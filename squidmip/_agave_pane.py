@@ -35,7 +35,7 @@ from typing import Optional
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import (
-    QHBoxLayout, QLabel, QSizePolicy, QSlider, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSlider, QVBoxLayout, QWidget,
 )
 
 from squidmip._agave import DEFAULT_MAX_PX, AgaveEngine
@@ -89,8 +89,14 @@ class _AgaveWorker(QThread):
     def request_orbit(self, dtheta: float, dphi: float) -> None:
         self._put(("orbit", float(dtheta), float(dphi)))
 
+    def request_zoom(self, notches: float) -> None:
+        self._put(("zoom", float(notches)))
+
     def request_frame(self, width: int, height: int) -> None:
         self._put(("frame", int(width), int(height)))
+
+    def request_launch_app(self) -> None:
+        self._put(("launch_app",))
 
     def _put(self, job) -> None:
         if self._alive:
@@ -137,6 +143,16 @@ class _AgaveWorker(QThread):
             engine.set_time(job[1])
         elif kind == "orbit":
             engine.orbit(job[1], job[2])
+        elif kind == "zoom":
+            engine.zoom(job[1])
+        elif kind == "launch_app":
+            self.note.emit("fusing a higher-resolution volume and launching the full AGAVE app…")
+            info = engine.open_in_app()
+            self.note.emit(
+                f"opened the full AGAVE app on {info['region']} at ~{info['max_px']} px "
+                f"(all controls, native full screen). If it starts empty, open this file: "
+                f"{info['path']}")
+            return                                    # launching does not change the embedded frame
         elif kind == "frame":
             self._size = (job[1], job[2])
         w, h = self._size
@@ -168,6 +184,9 @@ class AgaveTab(QWidget):
         self.n_timepoints = max(1, int(self._meta.get("n_t") or 1))
         self.has_problem = False
         self._down = False
+        self._fs_window = None                    # the full-screen top-level, when active
+        self._prev_parent = None
+        self.setFocusPolicy(Qt.StrongFocus)       # so Esc reaches keyPressEvent in full screen
 
         self.setStyleSheet(f"background:{_BG};")
         v = QVBoxLayout(self)
@@ -176,12 +195,36 @@ class AgaveTab(QWidget):
 
         self.title = QLabel("3D — AGAVE path-traced volume")
         self.title.setStyleSheet("color:#c9d1d9;font-size:12px;font-weight:700;")
-        v.addWidget(self.title)
+        # The embedded pane paints AGAVE frames into a QLabel: quick, but it exposes NONE of AGAVE's
+        # transfer-function / lighting / material controls and is capped at the interactive volume
+        # resolution. "Open in AGAVE" launches the real desktop app on a higher-res fuse, which is
+        # where all the controls, max resolution and native full screen actually live.
+        self.launch_btn = QPushButton("Open in AGAVE (all controls)")
+        self.launch_btn.setToolTip("Launch the full AGAVE application on a higher-resolution volume "
+                                   "of the current region: every control, max detail, native full "
+                                   "screen. The embedded view here stays the quick preview.")
+        self.launch_btn.setStyleSheet("color:#c9d1d9;font-size:11px;padding:2px 8px;")
+        self.launch_btn.clicked.connect(self._launch_full_app)
+        self.fs_btn = QPushButton("Full screen")
+        self.fs_btn.setToolTip("Full-screen the embedded preview (Esc to exit). "
+                               "Scroll to zoom, drag to orbit. For all controls use 'Open in AGAVE'.")
+        self.fs_btn.setStyleSheet("color:#c9d1d9;font-size:11px;padding:2px 8px;")
+        self.fs_btn.clicked.connect(self.toggle_fullscreen)
+        header = QHBoxLayout()
+        header.addWidget(self.title)
+        header.addStretch(1)
+        header.addWidget(self.launch_btn)
+        header.addWidget(self.fs_btn)
+        v.addLayout(header)
 
         self.canvas = QLabel()
         self.canvas.setAlignment(Qt.AlignCenter)
         self.canvas.setMinimumHeight(240)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # FILL the pane (and the full-screen window). Without this the fixed-size AGAVE pixmap sat
+        # small and centred on a big black canvas, which is why "full screen doesn't work" -- the
+        # window went full screen but the image did not grow. Scale the pixmap to the label instead.
+        self.canvas.setScaledContents(True)
         self.canvas.setStyleSheet("background:#000;border:1px solid #232b3a;")
         v.addWidget(self.canvas, 1)
 
@@ -257,6 +300,66 @@ class AgaveTab(QWidget):
     def mouseReleaseEvent(self, e):                           # pragma: no cover - GUI gesture
         self._down = False
         super().mouseReleaseEvent(e)
+
+    def zoom(self, notches: float) -> None:
+        """Zoom the volume. Exposed as a method so the offscreen tests drive the real path."""
+        self._worker.request_zoom(float(notches))
+
+    def wheelEvent(self, e):                                  # pragma: no cover - GUI gesture
+        # One wheel notch is 120 in Qt's angleDelta units. Positive (wheel up) = zoom IN. This is
+        # the gesture the user reported missing ("when I click on the agave window I can't zoom").
+        notches = e.angleDelta().y() / 120.0
+        if notches:
+            self.zoom(notches)
+        e.accept()
+
+    def _launch_full_app(self) -> None:
+        """Hand off to the worker: fuse a higher-res volume and launch the full AGAVE app on it."""
+        self.status.setText("preparing the full AGAVE app (fusing a higher-resolution volume)…")
+        self.status.setStyleSheet("color:#8b98ad;font-size:11px;")
+        self._worker.request_launch_app()
+
+    def toggle_fullscreen(self) -> None:
+        """Full-screen the 3D view so it leverages the whole app for a fancy render; restore on a
+        second press or Esc. Reparents to a top-level window rather than maximising the tab, so it
+        truly fills the display, and asks for a bigger, higher-iteration frame while there."""
+        if self._fs_window is not None:
+            self._exit_fullscreen()
+            return
+        self._prev_parent = self.parentWidget()
+        self._fs_window = QWidget()
+        self._fs_window.setWindowTitle("AGAVE — 3D (full screen)  ·  Esc to exit")
+        self._fs_window.setStyleSheet(f"background:{_BG};")
+        lay = QVBoxLayout(self._fs_window)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self)                       # reparents self into the full-screen window
+        self.fs_btn.setText("Exit full screen")
+        # Request a frame sized to the actual screen so the fancy render is crisp, not a 1600px
+        # image stretched to fill. Fall back to a large default if the screen size is unavailable.
+        try:
+            from PyQt5.QtWidgets import QApplication
+            scr = QApplication.primaryScreen().size()
+            self._worker.request_frame(min(scr.width(), 2560), min(scr.height(), 1600))
+        except Exception:                    # noqa: BLE001 - a bigger frame is a nicety
+            self._worker.request_frame(2200, 1400)
+        self._fs_window.showFullScreen()
+
+    def _exit_fullscreen(self) -> None:
+        if self._fs_window is None:
+            return
+        parent = self._prev_parent
+        if parent is not None and parent.layout() is not None:
+            parent.layout().addWidget(self)
+        self.fs_btn.setText("Full screen")
+        self._worker.request_frame(*FRAME_SIZE)
+        self._fs_window.close()
+        self._fs_window = None
+
+    def keyPressEvent(self, e):                               # pragma: no cover - GUI gesture
+        if e.key() == Qt.Key_Escape and self._fs_window is not None:
+            self._exit_fullscreen()
+            return
+        super().keyPressEvent(e)
 
     # -- from the worker ------------------------------------------------------------------
     def _on_frame(self, data: bytes) -> None:

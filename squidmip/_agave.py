@@ -88,6 +88,15 @@ DEFAULT_PORT = 1235
 #: Default long-edge budget for the fused volume. 1000 px is the measured interactive point.
 DEFAULT_MAX_PX = 1000
 
+#: Long-edge budget when launching the FULL AGAVE app (not the embedded preview). The desktop app
+#: is not held to interactive frame rates the way the embedded QLabel is, so it can carry a much
+#: finer volume. 3000 px is ~9x the pixels of the preview and still fits the raised budget below.
+HIGH_RES_MAX_PX = 3000
+
+#: Volume budget for the full-app path only. Bigger than DEFAULT_VOLUME_BUDGET because the app is
+#: the "fancy, max detail" path the user explicitly asked for; still bounded so disk cannot blow up.
+HIGH_RES_VOLUME_BUDGET = 1536 * 1024 ** 2
+
 #: One region's volume may not exceed this. Level 0 of the 10x set is ~2.2 GB; that is the thing
 #: this number exists to refuse, loudly, from geometry alone.
 DEFAULT_VOLUME_BUDGET = 512 * 1024 ** 2
@@ -566,9 +575,27 @@ OPENING_ORBIT = (35.0, -25.0)
 #: for the measured sweep this comes from.
 ORBIT_LIMIT = 70.0
 
+#: Zoom is AGAVE's PERSPECTIVE field-of-view, narrowed to magnify. AGAVE's CAMERA_PROJECTION
+#: command takes a projection type (0 = perspective) and, for perspective, the vertical FOV in
+#: degrees. frame_scene() frames the volume at AGAVE's default ~55 deg, so that is the origin the
+#: zoom multiplies from — a smaller FOV fills the frame with less of the scene, i.e. zooms in.
+#: Clamped so the user can neither invert the frustum (too small) nor dolly the volume to a speck
+#: (too wide). Matched to the orbit's "cannot ruin the view" contract.
+PERSPECTIVE_PROJECTION = 0
+DEFAULT_FOV_Y = 55.0
+FOV_MIN = 6.0
+FOV_MAX = 88.0
+#: Multiplier applied to the FOV per wheel notch. <1 so a positive notch narrows the FOV (zooms
+#: in); 0.85 is ~15% per notch, which measured as a comfortable step at 900x700.
+ZOOM_PER_NOTCH = 0.85
+
 
 def _clamp(v: float, limit: float) -> float:
     return max(-limit, min(limit, float(v)))
+
+
+def _clamp_fov(v: float) -> float:
+    return max(FOV_MIN, min(FOV_MAX, float(v)))
 
 
 class AgaveView:
@@ -586,6 +613,7 @@ class AgaveView:
         self.path: Optional[str] = None
         self.voxel_um: tuple[float, float, float] = (1.0, 1.0, 1.0)
         self._theta, self._phi = 0.0, 0.0        # cumulative orbit from the framed pose
+        self._fov = DEFAULT_FOV_Y                 # current zoom, as the perspective FOV in degrees
 
     def show_volume(self, path: str, voxel_um, channels: Sequence[str],
                     *, t: int = 0, density: float = OPENING_DENSITY,
@@ -616,6 +644,10 @@ class AgaveView:
         self.client.density(float(density))
         self.client.exposure(float(exposure))
         self.client.frame_scene()
+        # Pin the zoom to a known baseline AFTER frame_scene (which reframes the camera), so the
+        # wheel multiplies from a deterministic FOV rather than whatever the last region left.
+        self._fov = DEFAULT_FOV_Y
+        self.client.camera_projection(PERSPECTIVE_PROJECTION, self._fov)
         self._theta, self._phi = OPENING_ORBIT   # the framed pose is the origin of the clamp
         self.client.orbit_camera(*OPENING_ORBIT)
         return info
@@ -646,6 +678,20 @@ class AgaveView:
             return                                # already at the stop: send nothing
         self._theta, self._phi = t, p
         self.client.orbit_camera(dt, dp)
+
+    def zoom(self, notches: float) -> None:
+        """Zoom by mouse-wheel notches. Positive = zoom IN (narrow the FOV).
+
+        Like ``orbit``, this is idempotent at the stops: a wheel spin past the clamp sends nothing
+        to AGAVE, so a user cannot pump the FOV past the frustum limits and get a blank or inverted
+        frame. The zoom is a camera-only change, so no re-fuse and no reload — the same cheap path
+        as the timepoint slider.
+        """
+        f = _clamp_fov(self._fov * (ZOOM_PER_NOTCH ** float(notches)))
+        if f == self._fov:
+            return                                # already at a stop: send nothing
+        self._fov = f
+        self.client.camera_projection(PERSPECTIVE_PROJECTION, f)
 
     def frame(self, width: int, height: int, iterations: int = 64) -> bytes:
         return render_frame(self.client, width=width, height=height, iterations=iterations)
@@ -751,6 +797,38 @@ class AgaveEngine:
         self.region, self.info = region, info
         return info
 
+    def open_in_app(self, region: Optional[str] = None, t: int = 0,
+                    max_px: Optional[int] = None) -> dict:
+        """Launch the FULL AGAVE desktop app on a HIGHER-resolution fuse of a region.
+
+        The embedded pane drives AGAVE headlessly and paints frames into a QLabel, so it exposes
+        none of AGAVE's transfer-function / lighting / material controls and is capped at the
+        interactive volume resolution. This launches the real AGAVE GUI (the same binary, without
+        --server) on a finer volume, which is where "retain all of AGAVE's fanciness, at max res,
+        full screen, leveraging the whole app" actually lives. The embedded preview stays as the
+        quick look; this is the fancy one.
+
+        Best-effort file argument: if this AGAVE build does not open a positional file, the caller
+        is handed the path to open via File > Open. Runs on the worker thread (the fuse blocks).
+        """
+        region = str(region or self.region or (self.regions[0] if self.regions else ""))
+        if not region:
+            raise AgaveRenderError("no region is loaded, so there is nothing to open in AGAVE.")
+        hi = int(max_px or HIGH_RES_MAX_PX)
+        key = volume_key(self.acq_path, region, t=int(t), max_px=hi)
+
+        def _write(tmp: Path):
+            write_region_volume(self.reader, self.meta, region, tmp, t=int(t),
+                                max_px=hi, budget_bytes=HIGH_RES_VOLUME_BUDGET)
+
+        path = self.cache.ensure(key, _write)
+        exe = self._require()                     # same resolver the server uses; raises by name
+        proc = subprocess.Popen([exe, str(path)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log.info("launched the full AGAVE app (pid %s) on region %s at max_px=%d: %s",
+                 proc.pid, region, hi, path)
+        return {"path": str(path), "exe": exe, "region": region, "max_px": hi, "pid": proc.pid}
+
     def _describe(self, region: str, path: Path) -> dict:
         """Geometry for a volume already on disk — the same numbers the writer would report."""
         from squidmip._mosaic_source import _planned_plane
@@ -776,6 +854,10 @@ class AgaveEngine:
     def orbit(self, theta: float, phi: float) -> None:
         if self.view is not None:
             self.view.orbit(theta, phi)
+
+    def zoom(self, notches: float) -> None:
+        if self.view is not None:
+            self.view.zoom(notches)
 
     def frame(self, width: int, height: int, iterations: int = 64) -> bytes:
         if self.view is None or self.info is None:

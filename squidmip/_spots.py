@@ -520,6 +520,26 @@ add_segmenter(
     blurb="scikit-image Otsu + distance-transform watershed. Fast, no model, no GPU.",
 )
 
+# Cellpose is the PREFERRED nuclei segmenter (Spencer: "I was thinking Cellpose"; Julio: "cellpose
+# should trump this"). Registered here unconditionally so it is always listed; it becomes the
+# default only when its package is importable (see ``preferred_segmenter``). The registration is
+# in _cellpose.py so the heavyweight adapter stays out of this module's import path.
+from squidmip._cellpose import SEGMENTER_NAME as _CELLPOSE, register as _register_cellpose
+
+_register_cellpose()
+
+
+def preferred_segmenter() -> str:
+    """The segmenter to use when the caller does not name one.
+
+    Cellpose TRUMPS the traditional otsu-watershed when it is installed — it is the "good" model
+    Spencer and Julio both named — but the traditional one is the honest fallback so the feature
+    never becomes "install a 2 GB dependency or get nothing". The choice is by availability, not a
+    hardcoded winner, so a machine without Cellpose still counts nuclei.
+    """
+    ok, _why = segmenter_available(_CELLPOSE)
+    return _CELLPOSE if ok else DEFAULT_SEGMENTER
+
 # The whole engine registration: one call, no engine edit. `spot` is now a peer of mip / bgsub /
 # decon / flatfield in the SAME table, and therefore appears in `runnable_operators()` for free.
 add_projector(LAYER_KEY, spots_op())

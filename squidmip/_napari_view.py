@@ -72,10 +72,19 @@ authoritative palette and is resolved through ``_channels`` rather than restated
 
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence
+
+import numpy as np
+
+log = logging.getLogger("squidmip.napari")
+
+#: Fallback GPU 3D texture cap (Apple GPUs report GL_MAX_3D_TEXTURE_SIZE = 2048). The live value
+#: is read off the canvas at runtime; this is only used until that is known.
+_DEFAULT_MAX_3D_TEXTURE = 2048
 
 # NOTE: napari is NOT imported at module scope. It costs ~88 ms and pulls Qt, and the pure
 # hierarchy logic below must stay importable (and testable) in a headless process with no
@@ -304,6 +313,10 @@ class MosaicLayers:
         # from a real gesture. Tracking programmatic writes here too matters: without it, a
         # user dragging BACK to a previously delivered value would be suppressed as an echo.
         self._last_seen: dict[str, tuple[float, float]] = {}
+        #: GPU 3D texture cap, read off the live canvas by the pane; napari refuses to render a
+        #: single 3D texture larger than this per axis, so the 3D swap targets the level that fills
+        #: it rather than a bigger volume napari would silently downsample.
+        self._max_3d_texture: int = _DEFAULT_MAX_3D_TEXTURE
 
     # -- who moved the contrast: us, or the user? ---------------------------------------
     @contextmanager
@@ -367,6 +380,66 @@ class MosaicLayers:
             if key_of(ly) == MosaicKey(op, channel):
                 return ly
         return None
+
+    # -- 2D pyramid <-> 3D full resolution ----------------------------------------------
+    def render_max_res_3d(self, on: bool) -> None:
+        """Swap our image mosaics between the fast multiscale pyramid (2D) and their FULL-RES
+        single-scale volume (3D).
+
+        napari does not support multiscale in 3D: the instant ``ndisplay`` flips to 3 it drops a
+        multiscale layer to the COARSEST level unconditionally (``_scalar_field/_slice.py``), which
+        is the blocky volume Julio screenshotted. We do not want that. When 3D is on we hand each
+        layer its level-0 ``(Z, Y, X)`` array so napari renders the volume at max resolution ("max
+        res in napari first, then AGAVE"); when it goes back to 2D we restore the pyramid so
+        navigation stays fast. napari 0.6.6 allows the in-place swap (verified). Idempotent: a
+        layer already in the requested form is skipped, so re-applying on a region change is safe.
+        """
+        limit = int(self._max_3d_texture or _DEFAULT_MAX_3D_TEXTURE)
+        with self.programmatic():
+            for ly in self.ours():
+                self._swap_layer_scale(ly, full_res=bool(on), limit=limit)
+
+    @staticmethod
+    def _fits_texture(level: Any, limit: int) -> bool:
+        shp = getattr(level, "shape", None)
+        if not shp:
+            return False
+        return max(int(s) for s in shp) <= int(limit)
+
+    def _swap_layer_scale(self, ly: Any, *, full_res: bool, limit: int) -> None:
+        meta = dict(getattr(ly, "metadata", None) or {})
+        try:
+            if full_res:
+                data = ly.data
+                if not isinstance(data, (list, tuple)):
+                    return                       # already single-scale, nothing to swap
+                meta["_pyramid"] = data          # stash the pyramid so 2D can restore it
+                ly.metadata = meta
+                # napari renders 3D from ONE GL texture and refuses any axis over
+                # GL_MAX_3D_TEXTURE_SIZE (~2048 on Apple GPUs); handed a bigger volume it does its
+                # OWN crude stride-downsample. So target the FINEST pyramid level that still fits
+                # the texture: that fills the GPU budget = the max resolution napari can physically
+                # show for the whole region. Native full res needs a CROP or AGAVE (one texture
+                # cannot hold 5731 px). Levels are finest-first; take the first that fits, else the
+                # coarsest as a floor.
+                chosen = data[-1]
+                for lvl in data:
+                    if self._fits_texture(lvl, limit):
+                        chosen = lvl
+                        break
+                ly.multiscale = False
+                ly.data = chosen
+                log.info("napari 3D: rendering %s at %s (fills the %d px GPU texture budget; "
+                         "full native res needs a crop or AGAVE)",
+                         getattr(ly, "name", "layer"), tuple(getattr(chosen, "shape", ())), limit)
+            else:
+                pyr = meta.get("_pyramid")
+                if pyr is None:
+                    return                       # never swapped, or not one of ours
+                ly.multiscale = True
+                ly.data = list(pyr)
+        except Exception as exc:                 # noqa: BLE001 - a render nicety, never fatal
+            log.warning("napari 3D swap failed on %s: %s", getattr(ly, "name", "layer"), exc)
 
     # -- construction -------------------------------------------------------------------
     def add_mosaic(

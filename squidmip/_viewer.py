@@ -48,6 +48,7 @@ Design notes:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import threading
@@ -65,6 +66,13 @@ from PyQt5.QtWidgets import (
     QMainWindow, QMenu, QPlainTextEdit, QPushButton, QScrollArea, QSlider, QSpinBox,
     QSplitter, QStackedWidget, QStyleFactory, QTabBar, QVBoxLayout, QWidget,
 )
+
+#: The main window's logger. The log panel taps the stdlib ROOT logger, so anything logged here
+#: appears in the bottom-right panel for free — the reason a failure the user triggers (a spot
+#: detection that raised, a region that would not fuse) MUST go through this and not only into an
+#: in-widget banner: a banner the user has already clicked past leaves no trace, and "the logger
+#: didn't show it" is the exact gap this closes.
+log = logging.getLogger("squidmip.viewer")
 
 from squidmip import _explore, _qtstyle
 from squidmip._engine import _default_workers, available_projectors
@@ -2984,14 +2992,16 @@ class _SpotWorker(QThread):
         self._stop.set()
 
     def run(self):
-        from squidmip._spots import SpotDetectionCancelled, detect_spots
+        from squidmip._spots import SpotDetectionCancelled, detect_spots, preferred_segmenter
 
         where = f"{self._region}/{self._channel}"
+        algorithm = preferred_segmenter()
         try:
             plane = _full_res_plane(self._data, self._z)
+            log.info("%s: detecting nuclei with %s on a %s plane", where, algorithm, plane.shape)
 
             res = detect_spots(
-                plane, self._params,
+                plane, self._params, algorithm=algorithm,
                 on_stage=lambda name, done, total: (self.stageChanged.emit(name),
                                                     self.progress.emit(done, total)),
                 should_stop=self._stop.is_set,
@@ -3000,11 +3010,19 @@ class _SpotWorker(QThread):
             self.cancelled.emit()
             return
         except Exception as exc:                   # noqa: BLE001 - NAMED, never swallowed
+            # Log AND banner. The banner shows it where the user is looking; the log gives it a
+            # permanent, copyable line in the panel — a user who clicked the banner away still has
+            # the record. (This is the "logger didn't show the detect-nuclei error" gap.)
+            log.error("%s: spot detection failed — %s: %s", where, type(exc).__name__, exc)
             self.problem.emit(f"{where}: spot detection failed — {type(exc).__name__}: {exc}")
             return
 
         self.progress.emit(len(_spot_stages()), len(_spot_stages()))
         self.stageChanged.emit("done")
+        # Success goes to the LOG too, not only the napari readout — the user saw the count in the
+        # viewer but nothing in the panel. A run that produced a number the user can act on should
+        # leave a copyable line in the log like every other operator.
+        log.info("%s: %d nuclei detected (%s)", where, res.count, algorithm)
         self.ready.emit(self._region, self._channel, res.labels, res.centroids,
                         self._bbox_um, res.count)
         self.finished_count.emit(self._region, self._channel, res.count)
@@ -3015,6 +3033,64 @@ def _spot_stages():
     from squidmip._spots import STAGES
 
     return STAGES
+
+
+class _FlatfieldWorker(QThread):
+    """Estimate an illumination profile LIVE from plate tiles, off the GUI thread.
+
+    All processing comes from maragall/: this calls ``_flatfield.estimate_profile`` which is
+    ``tilefusion.flatfield.estimate_flatfield_channel`` (the numpy BaSiC port), NOT a reimplemented
+    estimator. The BaSiC solve is seconds-to-minutes, so it must not run on the GUI thread. Reads a
+    SPREAD sample of FOVs across the plate (decorrelated content makes the low-rank/sparse split
+    better than the first N tiles of one well). Fails to the LOG by name, never silently.
+    """
+
+    done = pyqtSignal(object)     # FlatfieldProfile
+    problem = pyqtSignal(str)
+    stage = pyqtSignal(str)
+
+    def __init__(self, reader, meta, channel, *, max_tiles=48, use_darkfield=False, parent=None):
+        super().__init__(parent)
+        self._reader, self._meta, self._channel = reader, meta, channel
+        self._max_tiles = int(max_tiles)
+        self._use_dark = bool(use_darkfield)
+
+    def run(self):                                    # pragma: no cover - Qt thread
+        try:
+            from squidmip._flatfield import estimate_profile
+
+            meta = self._meta
+            z0 = (meta.get("z_levels") or [0])[0]
+            fpr = meta.get("fovs_per_region") or {}
+            pairs = [(region, int(fov))
+                     for region in (meta.get("regions") or [])
+                     for fov in (fpr.get(region) or [])]
+            if not pairs:
+                self.problem.emit("no FOVs to estimate a flat-field from.")
+                return
+            # Spread the sample across the plate, not the first N of one well.
+            step = max(1, len(pairs) // self._max_tiles)
+            sample = pairs[::step][: self._max_tiles]
+            tiles = []
+            for region, fov in sample:
+                try:
+                    tiles.append(np.asarray(self._reader.read(region, fov, self._channel, int(z0))))
+                except Exception:                     # noqa: BLE001 - one bad tile is not fatal
+                    continue
+                self.stage.emit(f"read {len(tiles)}/{len(sample)} tiles for {self._channel}…")
+            if len(tiles) < 3:
+                self.problem.emit(
+                    f"flat-field estimate needs at least 3 readable tiles for {self._channel}, "
+                    f"got {len(tiles)}.")
+                return
+            self.stage.emit(f"estimating illumination (tilefusion BaSiC) from {len(tiles)} tiles…")
+            profile = estimate_profile(np.stack(tiles), use_darkfield=self._use_dark)
+            log.info("flat-field: estimated a %s profile from %d tiles (tilefusion BaSiC)",
+                     self._channel, len(tiles))
+            self.done.emit(profile)
+        except Exception as exc:                      # noqa: BLE001 - NAMED to the log, not swallowed
+            log.error("flat-field estimate failed for %s: %s", self._channel, exc)
+            self.problem.emit(f"{type(exc).__name__}: {exc}")
 
 
 def _full_res_plane(data, z_index):
@@ -3032,16 +3108,32 @@ def _full_res_plane(data, z_index):
     Only the ONE plane asked for is ever materialised; a lazy pyramid stays lazy until the
     ``np.asarray`` at the end.
     """
-    # A pyramid arrives as a list/tuple of arrays. `ndim` is the discriminator, not `type`:
-    # a tuple, a list and a dask stack all have to work.
+    # A pyramid arrives as a list/tuple whose ELEMENTS are arrays (level 0 is full resolution). A
+    # plain nested Python list whose elements are lists/scalars is NOT a pyramid — it merely
+    # encodes one array — so it is converted whole. `ndim` on the first element is the
+    # discriminator: >=2 means "element is an array" (pyramid); otherwise it is a nested list.
     if isinstance(data, (list, tuple)):
         if not data:
             raise ValueError("the layer holds an EMPTY multiscale pyramid — nothing to count.")
-        data = data[0]                      # level 0 == full resolution
-    if getattr(data, "ndim", 2) == 3:
-        n_z = data.shape[0]
+        data = data[0] if getattr(data[0], "ndim", 0) >= 2 else np.asarray(data)
+
+    # Trust ``.ndim`` when present (keeps a lazy dask/zarr level lazy until the final asarray). When
+    # it is ABSENT — a container whose ndim defaulted to 2 is exactly what let a (z, y, x) stack
+    # skip the reduction and reach the raise as a 3-D "plane" — materialise once and read the real
+    # ndim, so the shape of the container never decides whether the z reduction runs.
+    ndim = getattr(data, "ndim", None)
+    if ndim is None:
+        data = np.asarray(data)
+        ndim = data.ndim
+
+    # A 3-D (z, y, x) stack is indexed at the z the user is looking at. Anything with MORE leading
+    # axes is genuinely ambiguous — we cannot know which is z, which is channel, which is time — so
+    # it is REFUSED by name rather than silently counting the middle of the wrong axis.
+    if ndim == 3:
+        n_z = int(data.shape[0])
         z = n_z // 2 if z_index is None else int(z_index)
         data = data[min(max(z, 0), n_z - 1)]
+
     plane = np.asarray(data)
     if plane.ndim != 2:
         raise ValueError(
@@ -3615,6 +3707,11 @@ class PlateWindow(QMainWindow):
         self._focus_btn.setStyleSheet(_BTN_QSS)
         self._focus_btn.setToolTip("Jump the z-slider to the sharpest plane of the FOV in view")
         self._focus_btn.clicked.connect(self._focus_reference_plane)
+        # A reference-plane pick only means something with a z-stack. On a 2D acquisition
+        # (Nz == 1) there is exactly one plane and nothing to focus, so the button would jump
+        # the slider to itself. Hide it rather than offer a no-op. Meta is None until an
+        # acquisition loads, so start hidden and let _sync_focus_button reveal it for a z-stack.
+        self._focus_btn.hide()
         dbl.addWidget(self._focus_btn)
         dbl.addStretch(1)
         rfl.addWidget(detail_bar)
@@ -3763,6 +3860,14 @@ class PlateWindow(QMainWindow):
         self._agave_btn.setToolTip("Path-trace the selected region's z-stack in the exploration pane")
         self._agave_btn.clicked.connect(self._open_agave_view)
         v.addWidget(self._agave_btn)
+        # Native-resolution napari 3D, gallery-view's recipe: a popout napari viewer on ONE FOV's
+        # native z-stack (fits the GPU texture, so it is crisp where the fused region cannot be).
+        self._native3d_btn = QPushButton("3D native (napari)…")
+        self._native3d_btn.setStyleSheet(_BTN_QSS)
+        self._native3d_btn.setToolTip("Open a popout napari 3D viewer on the current region's "
+                                      "centre FOV at NATIVE resolution (fits the GPU texture).")
+        self._native3d_btn.clicked.connect(self._open_native_3d)
+        v.addWidget(self._native3d_btn)
         cli_btn = QPushButton("Open CLI")                  # opens a CLI tab within this pane (ABOVE Layers)
         cli_btn.setStyleSheet(_BTN_QSS)
         cli_btn.clicked.connect(lambda: self._open_op_tab("cli", "CLI", self._build_cli_tab))
@@ -3792,6 +3897,42 @@ class PlateWindow(QMainWindow):
         from squidmip._agave_pane import AgaveTab
 
         return AgaveTab(self._reader, self._meta, self._acq_path)
+
+    def _open_native_3d(self):
+        """Popout napari 3D on the current region's centre FOV at native resolution (gallery-view
+        recipe). Carries the embedded layers' current contrast and colormap so the volume matches
+        what is on screen. Fails to the LOG by name, never silently."""
+        if self._reader is None or self._meta is None:
+            self._readout.setText("No acquisition open — drop one before opening the 3D view.")
+            return
+        region = getattr(self, "_mosaic_region", None) or self._cursor.region
+        if region is None:
+            self._readout.setText("No region is open to render in 3D.")
+            return
+        contrast, colormap = {}, {}
+        pane = getattr(self, "_mosaic_pane", None)
+        mosaic = getattr(pane, "mosaic", None) if pane is not None else None
+        if mosaic is not None:
+            op = mosaic.visible_op()
+            if op is not None and op != getattr(self, "SPOTS_OP", None):
+                for ch in mosaic.channels(op):
+                    ly = mosaic.find(op, ch)
+                    if ly is None:
+                        continue
+                    try:
+                        contrast[ch] = tuple(float(x) for x in ly.contrast_limits)
+                        colormap[ch] = ly.colormap
+                    except Exception:                # noqa: BLE001 - carry what we can
+                        pass
+        try:
+            from squidmip._napari3d import open_native_3d
+
+            open_native_3d(self._reader, self._meta, region,
+                           contrast_by_channel=contrast, colormap_by_channel=colormap)
+            log.info("opened native napari 3D popout for region %s", region)
+        except Exception as exc:                     # noqa: BLE001 - NAMED, to the log and readout
+            log.error("native 3D view failed for region %s: %s", region, exc)
+            self._readout.setText(f"3D native view failed: {exc}")
 
     # -- operator UIs live as tabs INSIDE pane 1 (home tab + one per opened operator); exploration
     # -- tabs live in pane 3. Both bars share every path below — *tabs* says which one. -----------
@@ -4522,6 +4663,55 @@ class PlateWindow(QMainWindow):
             pick_prof.setStyleSheet(_BTN_QSS)
             pick_prof.clicked.connect(load_profile)
             v.addWidget(pick_prof)
+
+            # ESTIMATE LIVE from the plate (maragall/stitcher's tilefusion BaSiC), no .npy needed.
+            # Julio: flat-field computation comes from maragall/stitcher and must run from tiles.
+            est_row = QHBoxLayout(); est_row.setSpacing(6)
+            est_row.addWidget(QLabel("channel"))
+            est_channel = QComboBox(); est_channel.setStyleSheet(_COMBO_QSS)
+            est_channel.addItems([c["name"] for c in (self._meta or {}).get("channels", [])])
+            est_row.addWidget(est_channel, 1)
+            est_row.addWidget(QLabel("tiles"))
+            est_tiles = QSpinBox(); est_tiles.setRange(3, 256); est_tiles.setValue(48)
+            est_tiles.setStyleSheet(_COMBO_QSS)
+            est_row.addWidget(est_tiles)
+            v.addLayout(est_row)
+
+            est_btn = QPushButton("Estimate from plate")
+            est_btn.setStyleSheet(_BTN_QSS)
+            est_btn.setToolTip("Estimate the illumination profile LIVE from a spread of plate tiles "
+                               "with the stitcher's BaSiC estimator (tilefusion). No .npy required.")
+
+            def estimate_from_plate():
+                if self._reader is None or self._meta is None:
+                    prof_lbl.setText("no acquisition open to estimate a flat-field from.")
+                    return
+                ch = est_channel.currentText()
+                est_btn.setEnabled(False)
+                prof_lbl.setText(f"estimating illumination for {ch} from the plate…")
+                w = _FlatfieldWorker(self._reader, self._meta, ch,
+                                     max_tiles=est_tiles.value(), parent=self)
+
+                def _ok(profile):
+                    from squidmip._flatfield import set_profile
+                    set_profile(profile)
+                    state["profile"] = f"estimated:{ch}"
+                    prof_lbl.setText(f"estimated from plate ({ch})  {profile.shape}")
+                    prev.setEnabled(True)
+                    est_btn.setEnabled(True)
+
+                def _bad(msg):
+                    prof_lbl.setText(str(msg))
+                    est_btn.setEnabled(True)
+
+                w.done.connect(_ok)
+                w.problem.connect(_bad)
+                w.stage.connect(lambda s: prof_lbl.setText(str(s)))
+                self._flatfield_worker = w            # keep a ref so it is not GC'd mid-run
+                w.start()
+
+            est_btn.clicked.connect(estimate_from_plate)
+            v.addWidget(est_btn)
             v.addWidget(prof_lbl)
             v.addWidget(_hline())
 
@@ -5311,6 +5501,8 @@ class PlateWindow(QMainWindow):
         self._acq_name = Path(p).name
         self._acq_path = Path(p)
         self._processed_plate = None
+        self._sync_focus_button()                    # 2D acquisition -> no reference-plane button
+        self._populate_detect_channels()             # channel-aware cellpose picker
         rows, cols, wells, order = plate.viewer_grid()
         for idx, region in enumerate(order):
             self._fov_index[region] = {"idx": idx, "well_id": region, "rc": plate.cell_index(region)}
@@ -5456,7 +5648,19 @@ class PlateWindow(QMainWindow):
             self._region_slider.setToolTip(
                 f"region {index + 1} of {self._cursor.count}: {region}\n"
                 "Press play to walk the regions; right-click play for frames per second.")
-        self._load_mosaic(region=region)
+        # RESPONSIVE REGION SLIDER (viewport rendering). Fusing a region's mosaic is the expensive
+        # step: each tick stops the prior _MosaicWorker (waiting up to 2 s) and starts a new one, so
+        # dragging across ten regions queued ten fuses and stalled. The RED FRAME above already moved
+        # instantly; only the mosaic load needs to wait for the slider to SETTLE. Debounce it: the
+        # last region the slider lands on is the only one we fuse. A short delay is imperceptible when
+        # you stop, and turns a drag from ten blocking loads into one.
+        if getattr(self, "_region_load_timer", None) is None:
+            self._region_load_timer = QTimer(self)
+            self._region_load_timer.setSingleShot(True)
+            self._region_load_timer.timeout.connect(
+                lambda: self._load_mosaic(region=self._pending_region))
+        self._pending_region = region
+        self._region_load_timer.start(140)
 
     def _load_mosaic(self, region: Optional[str] = None, op: str = "raw"):
         """Show one region's fused MOSAIC in pane 2, one napari layer per channel.
@@ -5642,6 +5846,16 @@ class PlateWindow(QMainWindow):
         op = pane.mosaic.visible_op()
         if op is None or op == self.SPOTS_OP:
             return None, None
+        # CHANNEL-AWARE: if the "Detect on" dropdown names a channel, that is authoritative -- the
+        # user picked the channel that carries the signal, which need not be the visible one (405
+        # is blank on the tissue set). Segmentation reads layer.data, so visibility is irrelevant.
+        combo = getattr(pane, "detect_channel", None)
+        chosen = combo.currentText().strip() if combo is not None and combo.count() else ""
+        if chosen:
+            layer = pane.mosaic.find(op, chosen)
+            if layer is not None:
+                return chosen, layer
+        # fallback: the first VISIBLE channel, as before.
         for channel in pane.mosaic.channels(op):
             layer = pane.mosaic.find(op, channel)
             if layer is not None and getattr(layer, "visible", False):
@@ -6801,6 +7015,35 @@ class PlateWindow(QMainWindow):
         if not (0 <= ch < n_ch):
             return          # ndv drew a channel the plate does not have (RGB mode, or a re-ingest)
         self._overview.follow_channel_window(ch, float(lo), float(hi))
+
+    def _sync_focus_button(self):
+        """Show the reference-plane button only for a z-stack. A 2D acquisition (one z level) has
+        nothing to focus, so the button would jump the slider to the plane it is already on."""
+        btn = getattr(self, "_focus_btn", None)
+        if btn is None:
+            return
+        btn.setVisible(len((self._meta or {}).get("z_levels", [])) > 1)
+
+    def _populate_detect_channels(self):
+        """Fill the 'Detect on' dropdown with this acquisition's channels, defaulting to the one
+        most likely to carry nuclei. Channel-aware cellpose: the user segments the channel that has
+        signal, not whatever happens to be visible (405 is blank on the tissue set)."""
+        pane = getattr(self, "_mosaic_pane", None)
+        combo = getattr(pane, "detect_channel", None) if pane is not None else None
+        if combo is None:
+            return
+        names = [c["name"] for c in (self._meta or {}).get("channels", [])]
+        prev = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(names)
+        # Prefer a previously chosen channel if it still exists, else a 405/nuclei/DAPI-looking one.
+        pick = prev if prev in names else next(
+            (n for n in names if any(t in n.lower() for t in ("405", "dapi", "hoechst", "nuclei"))),
+            names[0] if names else "")
+        if pick:
+            combo.setCurrentText(pick)
+        combo.blockSignals(False)
 
     def _focus_reference_plane(self):
         """Jump THE z SLIDER to the current FOV's sharpest plane (Tenengrad autofocus).
