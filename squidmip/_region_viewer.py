@@ -310,9 +310,12 @@ class RegionViewer(QMainWindow):
         r1.addStretch(1)
         vv.addLayout(r1)
         r2 = QHBoxLayout(); r2.setSpacing(4)
-        r2.addWidget(self._chip("▭ ROI", "Draw an ROI rectangle inside the mosaic.", self._new_roi))
-        r2.addWidget(self._chip("ROI → window", "Open the drawn ROI(s) as child window(s) — the "
-                                "next level of the view tree.", self._open_roi_children))
+        r2.addWidget(self._chip("▭ new", "Draw an ROI rectangle inside the mosaic.", self._new_roi))
+        r2.addWidget(self._chip("⊙ select", "Select ROIs: click one, then press Delete to remove it.",
+                                self._select_rois))
+        r2.addWidget(self._chip("✕ clear", "Remove all ROIs in this window.", self._clear_rois))
+        r2.addWidget(self._chip("→ window", "Open the drawn ROI(s) as child window(s) — the next "
+                                "level of the view tree.", self._open_roi_children))
         r2.addStretch(1)
         vv.addLayout(r2)
         view_box.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
@@ -366,23 +369,75 @@ class RegionViewer(QMainWindow):
             self._say(f"could not switch to {n}D: {exc}")
 
     # -- ROI -> child window (the next level of the tree) --------------------------------
-    def _new_roi(self) -> None:
-        """Start drawing an ROI rectangle inside the mosaic (deck: boxes inside the well view)."""
+    @staticmethod
+    def _sync_roi_width(viewer, layer, screen_px: float = 3.0) -> None:
+        """Keep the ROI border a ~constant thickness ON SCREEN as you zoom (Julio: "ROI width should
+        react to zoom level"). napari's edge_width is in DATA units, so the world width for a given
+        screen thickness is screen_px / camera.zoom (zoom = screen px per data unit)."""
+        try:
+            zoom = float(getattr(viewer.camera, "zoom", 1.0)) or 1.0
+            w = max(1e-6, float(screen_px) / zoom)
+            layer.edge_width = w
+            layer.current_edge_width = w
+        except Exception:                                # noqa: BLE001 - width is cosmetic
+            pass
+
+    def _roi_shapes_layer(self, create: bool = False):
+        """This window's ROI Shapes layer (creating it, zoom-reactive, on first use if asked)."""
         v = self._napari_viewer()
         if v is None:
+            return None, None
+        layer = self._roi_layer
+        if layer is None or layer not in list(v.layers):
+            if not create:
+                return v, None
+            layer = v.add_shapes(name="ROIs", edge_color="#58a6ff", face_color="transparent")
+            self._roi_layer = layer
+            self._sync_roi_width(v, layer)
+            try:                                         # border reacts to zoom from here on
+                v.camera.events.zoom.connect(
+                    lambda e=None, vv=v, ly=layer: self._sync_roi_width(vv, ly))
+            except Exception:                            # noqa: BLE001
+                pass
+        return v, layer
+
+    def _new_roi(self) -> None:
+        """Start drawing an ROI rectangle inside the mosaic (deck: boxes inside the well view)."""
+        v, layer = self._roi_shapes_layer(create=True)
+        if v is None or layer is None:
             self._say("ROI needs the napari viewer, which isn't available here.")
             return
         try:
-            layer = self._roi_layer
-            if layer is None or layer not in list(v.layers):
-                layer = v.add_shapes(name="ROIs", edge_color="#58a6ff",
-                                     face_color="transparent", edge_width=6)
-                self._roi_layer = layer
             v.layers.selection.active = layer
             layer.mode = "add_rectangle"
-            self._say("Draw an ROI rectangle, then 'ROI → window' to open it as a child window.")
+            self._say("Draw an ROI rectangle, then '→ window' to open it as a child window.")
         except Exception as exc:                         # noqa: BLE001
             self._say(f"could not start an ROI: {exc}")
+
+    def _select_rois(self) -> None:
+        """Enter select mode so an ROI can be clicked and deleted (Julio: "how do I delete ROIs")."""
+        v, layer = self._roi_shapes_layer(create=False)
+        if v is None or layer is None:
+            self._say("draw an ROI first with '▭ new'.")
+            return
+        try:
+            v.layers.selection.active = layer
+            layer.mode = "select"
+            self._say("Select mode: click an ROI, then press Delete/Backspace to remove it.")
+        except Exception as exc:                         # noqa: BLE001
+            self._say(f"could not enter select mode: {exc}")
+
+    def _clear_rois(self) -> None:
+        """Remove every ROI in this window."""
+        v, layer = self._roi_shapes_layer(create=False)
+        if v is None or layer is None or not list(getattr(layer, "data", []) or []):
+            self._say("no ROIs to clear.")
+            return
+        try:
+            layer.data = []
+            self._say("cleared all ROIs.")
+        except Exception as exc:                         # noqa: BLE001
+            self._say(f"could not clear ROIs: {exc}")
 
     def _open_roi_children(self) -> None:
         """Open the drawn ROI(s) as child window(s) — "first dev step: one ROI, one child window"."""
@@ -551,72 +606,65 @@ class RegionViewer(QMainWindow):
             self._slider.frame_done()
 
     # -- 2D -> 3D, per window -----------------------------------------------------------
-    @staticmethod
-    def _texture_bounded(level0, max_tex: int):
-        """A native (z, y, x) crop that FITS the GPU 3D texture: the whole level if it already fits,
-        else its centre. This is what guarantees 3D is always native and never blocky — we never hand
-        napari a volume wider than one texture, so it never silently downsamples."""
-        h, w = int(level0.shape[-2]), int(level0.shape[-1])
-        if max(h, w) <= int(max_tex):
-            return np.asarray(level0)
-        r0 = max(0, (h - int(max_tex)) // 2)
-        c0 = max(0, (w - int(max_tex)) // 2)
-        return np.asarray(level0[..., r0:r0 + int(max_tex), c0:c0 + int(max_tex)])
+    def _roi_center_fov(self, region: str) -> Optional[int]:
+        """The FOV nearest the ROI box's centre (stage um), so an ROI's 3D lands on the tissue you
+        boxed. None (region centre) when there is no ROI."""
+        if self._roi_bbox is None:
+            return None
+        x0, y0, x1, y1 = self._roi_bbox
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        positions = (self._meta or {}).get("fov_positions_um") or {}
+        fovs = ((self._meta or {}).get("fovs_per_region") or {}).get(region) or []
+        best, best_d = None, None
+        for f in fovs:
+            p = positions.get((region, int(f)))
+            if p is None:
+                continue
+            d = (p[0] - cx) ** 2 + (p[1] - cy) ** 2
+            if best_d is None or d < best_d:
+                best, best_d = int(f), d
+        return best
 
     def _open_3d(self) -> None:
-        """3D = THIS VIEW at NATIVE resolution, in a napari popout (gallery-view recipe). ONE
-        behaviour, never the whole fused mosaic: a mosaic exceeds the GPU 3D texture and napari would
-        render it blocky (the "3D sucks" bug). We take the pyramid's native level 0 — the ROI's crop
-        if this is an ROI child, else the region — bound it to the texture (its centre if the region
-        is larger), and render with the contrast/colormap on screen. Draw an ROI to pick the spot."""
-        pane = self._pane
-        mosaic = getattr(pane, "mosaic", None) if pane is not None else None
-        if mosaic is None:
-            self._say("open a region first, then 3D.")
+        """3D = THIS view at NATIVE resolution, read STRAIGHT FROM THE READER (gallery-view recipe).
+
+        Why not the 2D pyramid: its level 0 is itself CAPPED to the fused-plane budget
+        (``_MAX_FUSED_PX``), so cropping the pyramid is already downsampled -- that was the "still
+        downsampled" bug. One FOV's raw z-stack IS native and fits the GPU texture, so we read the FOV
+        under the ROI (or the region centre) directly and carry the EXACT on-screen contrast so 3D
+        matches 2D. (Native fusion across the FOVs a large ROI spans is the next step; one native FOV
+        is the honest max-res primitive today -- simple, and never downsampled.)"""
+        region = self._cursor.region if self._cursor is not None else (
+            self._regions[0] if self._regions else None)
+        if region is None or self._reader is None or self._meta is None:
+            self._say("no region to render in 3D.")
             return
-        max_tex = 2048
-        try:
-            max_tex = int(self._pane._live_max_3d_texture())
-        except Exception:                            # noqa: BLE001 - Apple default is the safe floor
-            pass
+        mosaic = getattr(self._pane, "mosaic", None) if self._pane is not None else None
         contrast_by: dict = {}
         colormap_by: dict = {}
-        volumes: dict = {}
-        for c in (self._meta or {}).get("channels", []):
-            name = c["name"]
-            layer = mosaic.find(_RAW_OP, name)
-            if layer is None:
-                continue
-            try:
-                contrast_by[name] = tuple(layer.contrast_limits)
-            except Exception:                        # noqa: BLE001 - contrast is a nicety
-                pass
-            try:
-                cmap = layer.colormap
-                colormap_by[name] = getattr(cmap, "name", cmap)
-            except Exception:                        # noqa: BLE001
-                pass
-            data = layer.data
-            level0 = data[0] if isinstance(data, (list, tuple)) else data   # native rung of the pyramid
-            if getattr(level0, "ndim", 0) < 3 or int(level0.shape[0]) < 2:
-                self._say("3D needs a z-stack; this view has a single z plane.")
-                return
-            volumes[name] = self._texture_bounded(level0, max_tex)
-        if not volumes:
-            self._say("no channel on screen to render in 3D.")
-            return
-        px = float((self._meta or {}).get("pixel_size_um") or 1.0)
-        dz = float((self._meta or {}).get("dz_um") or px)
-        from squidmip._napari3d import open_native_3d_volume
+        if mosaic is not None:
+            for c in (self._meta or {}).get("channels", []):
+                name = c["name"]
+                layer = mosaic.find(_RAW_OP, name)
+                if layer is None:
+                    continue
+                try:
+                    contrast_by[name] = tuple(layer.contrast_limits)   # EXACT window on screen
+                except Exception:                    # noqa: BLE001
+                    pass
+                try:
+                    cmap = layer.colormap
+                    colormap_by[name] = getattr(cmap, "name", cmap)
+                except Exception:                    # noqa: BLE001
+                    pass
+        fov = self._roi_center_fov(region)           # ROI -> its FOV; else region centre (None)
+        from squidmip._napari3d import open_native_3d
 
-        tag = "ROI" if self._roi_bbox is not None else "region"
         try:
-            self._native3d = open_native_3d_volume(
-                volumes, scale=(dz, px, px),
-                title=f"3D native ({tag}) — {self._region_label(self._regions)}",
+            self._native3d = open_native_3d(
+                self._reader, self._meta, region, fov=fov,
                 contrast_by_channel=contrast_by or None,
                 colormap_by_channel=colormap_by or None,
-                max_texture=max_tex,
             )
         except Exception as exc:                     # noqa: BLE001 - named to the window, never silent
             self._say(f"3D could not open: {exc}")

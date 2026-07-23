@@ -3715,9 +3715,20 @@ class PlateWindow(QMainWindow):
             "border-radius:4px;padding:3px 10px;font-size:12px;}"
             "QPushButton:hover{background:#21262d;}")
         self._select_all_btn.clicked.connect(self._select_all_wells)
+        # OPEN the current selection as ONE window (for a shift-/Cmd-CLICK selection, which unlike a
+        # shift-DRAG has no release gesture to open on). Julio: "how do I open a new window with them
+        # after selecting them with the shift click?"
+        self._open_sel_btn = QPushButton("Open view")
+        self._open_sel_btn.setCursor(Qt.PointingHandCursor)
+        self._open_sel_btn.setStyleSheet(
+            "QPushButton{background:#1f6feb;color:#ffffff;border:1px solid #1f6feb;"
+            "border-radius:4px;padding:3px 10px;font-size:12px;}"
+            "QPushButton:hover{background:#388bfd;}")
+        self._open_sel_btn.clicked.connect(self._open_selected_view)
         _sb.addWidget(_sel_cap)
         _sb.addWidget(self._selection_label, 1)
         _sb.addWidget(self._select_all_btn)
+        _sb.addWidget(self._open_sel_btn)
         self._left_l.addWidget(sel_bar)
 
         self._left_l.addWidget(self._drop, 1)    # the plate overview replaces this on ingest
@@ -6878,6 +6889,16 @@ class PlateWindow(QMainWindow):
     def _select_all_wells(self):
         if self._overview is not None:
             self._overview.select_all()
+
+    def _open_selected_view(self):
+        """Open ONE window over the wells picked on the plate. This is the "open" gesture for a
+        shift-/Cmd-CLICK selection, which (unlike a shift-DRAG) has no release to open on."""
+        regions = list(self._selected_regions or [])
+        if not regions:
+            self._readout.setText("Pick wells first (shift/Cmd-click or Select all), then Open view.")
+            return
+        if self._viewer_manager.open(regions) is None:
+            self._readout.setText("Open an acquisition before opening a view.")
 
     def _highlight_view_regions(self, regions):
         """A view was clicked/opened — move the plate's blue wash onto its regions."""
