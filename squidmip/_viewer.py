@@ -3510,11 +3510,9 @@ class PlateWindow(QMainWindow):
         # Operators DELIBERATELY do not live in the spawned windows (Spencer, 2026-07-23: "operators
         # should really only work on Views", picked centrally and aimed at the selected view(s)).
         # The manager only instantiates/raises windows; operate-on-views is the root's job.
-        # Clicking an open view (or opening one) moves the plate's blue wash onto that view's
-        # regions, so the plate always shows which regions the focused window holds. windowsChanged
-        # and viewFocused BOTH re-tint the plate so every open view/thread keeps its own hue and the
-        # active one reads brighter (Julio's "hue the different view threads").
-        self._viewer_manager.viewFocused.connect(self._highlight_view_regions)
+        # The plate wash shows ONLY the view you CLICK (Julio), coloured by that view's own hue so
+        # different view threads are told apart. Not all views at once — that clutters the plate.
+        # viewFocused fires on open/raise; windowsChanged clears it when the focused view closes.
         self._viewer_manager.viewFocused.connect(lambda _regions: self._refresh_view_hues())
         self._viewer_manager.windowsChanged.connect(self._refresh_view_hues)
 
@@ -6887,14 +6885,15 @@ class PlateWindow(QMainWindow):
             self._overview.highlight_regions(regions)
 
     def _refresh_view_hues(self):
-        """Re-tint the plate so each open view/thread keeps its own stable hue (the active view
-        brighter). Rebuilt from the manager's live view set, so it can never drift from the windows."""
+        """Wash the plate for the CLICKED view only, in that view's own hue (Julio: "the washes only
+        show when I click the view"). Different views get different hues so threads are told apart,
+        but only one wash shows at a time. Cleared when there is no focused view (it was closed)."""
         if self._overview is None:
             return
         mgr = self._viewer_manager
         focused = mgr.focused_id
-        entries = [(v.regions, _view_hue(v.window_id, focused=(v.window_id == focused)))
-                   for v in mgr.views()]
+        v = mgr.view_for(focused) if focused is not None else None
+        entries = [(v.regions, _view_hue(v.window_id, focused=True))] if v is not None else []
         self._overview.set_view_hues(entries)
 
     def available_views(self) -> list:
