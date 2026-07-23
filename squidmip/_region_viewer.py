@@ -714,6 +714,7 @@ class ViewerManager(QObject):
         self._meta = meta
         self._windows: "dict[int, RegionViewer]" = {}
         self._next_id = 1
+        self._focused_id: Optional[int] = None    # which view is active (its plate hue reads brighter)
 
         self._mem_timer = QTimer(self)
         self._mem_timer.setInterval(2000)
@@ -784,6 +785,7 @@ class ViewerManager(QObject):
         )
         win.closed.connect(self._on_window_closed)
         self._windows[wid] = win
+        self._focused_id = wid
         win.show()
         win.raise_()
         win.activateWindow()
@@ -791,9 +793,15 @@ class ViewerManager(QObject):
         self.viewFocused.emit(list(win._regions))       # highlight its regions on the plate
         return win
 
+    @property
+    def focused_id(self) -> Optional[int]:
+        """The window id of the active view (its plate hue reads brighter), or None."""
+        return self._focused_id
+
     def focus(self, window_id: int) -> None:
         win = self._windows.get(int(window_id))
         if win is not None:
+            self._focused_id = int(window_id)
             win.showNormal()
             win.raise_()
             win.activateWindow()
@@ -809,7 +817,10 @@ class ViewerManager(QObject):
             win.close()
 
     def _on_window_closed(self, win: "RegionViewer") -> None:
-        self._windows.pop(getattr(win, "window_id", -1), None)
+        wid = getattr(win, "window_id", -1)
+        self._windows.pop(wid, None)
+        if self._focused_id == wid:
+            self._focused_id = None
         self.windowsChanged.emit()
 
     def _poll_memory(self) -> None:

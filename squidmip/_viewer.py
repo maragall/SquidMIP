@@ -116,6 +116,15 @@ _SEL_FILL = _qtstyle.SEL_FILL
 #: The plate's region highlight — a MORE TRANSPARENT light-blue wash than _SEL_FILL (Julio). Shown
 #: on the manually-picked wells AND on the regions of the open view you click (highlight_regions).
 _VIEW_WASH = QColor(88, 166, 255, 40)   # ~16% alpha light blue
+
+
+def _view_hue(view_id: int, *, focused: bool = False) -> QColor:
+    """A STABLE, distinct hue per open view/thread, so the plate colour-codes which wells belong to
+    which window (Julio: "colour hueing the different view threads"). The golden-ratio hue step keeps
+    successive views far apart on the wheel; the focused view is more opaque so it reads as active."""
+    h = (0.13 + 0.61803398875 * int(view_id)) % 1.0     # golden-ratio walk => maximally spread hues
+    c = QColor.fromHsvF(h, 0.62, 1.0, 0.34 if focused else 0.20)
+    return c
 _MIN_PREVIEW_BOX_PX = 4    # smallest FOV box (of _CELL) the RAW preview will bother mosaicking
 #                            (IMA-253): below this a field is a speck, and reading one plane per
 #                            field to draw specks is pure cost. The operator path is unaffected.
@@ -1126,6 +1135,7 @@ class PlateOverview(QWidget):
         # survive selecting, and selecting must survive scrubbing.
         self._selection: set = set()  # acquired (row_index, col_index) the user picked. A SET:
         #                               paintEvent membership-tests it once per cell, 1536x on a 1536wp.
+        self._view_hues: list = []    # [(rc_set, QColor)] per open view — plate colour-codes threads
         self._marquee = None          # (x0, y0, x1, y1) widget px while a Shift-drag is in flight
         self._marquee_add = False     # this drag unions (Shift+Alt) rather than replaces
         self._ctrl_click = None       # (x, y) of a Cmd/Ctrl-press, committed as a TOGGLE on release
@@ -1742,6 +1752,19 @@ class PlateOverview(QWidget):
         self.selectionChanged.emit(self.selected_wells())
         self.update()
 
+    def set_view_hues(self, entries):
+        """Colour-code the OPEN VIEWS on the plate: *entries* is a list of ``(region_ids, QColor)``,
+        one per open window/thread. Each view's wells get that view's hue, so overlapping/adjacent
+        views are told apart at a glance (Julio's "hue the different view threads"). Painted UNDER
+        the blue focus/selection wash, which still marks the one active view. Empty list clears it."""
+        hues = []
+        for region_ids, color in (entries or []):
+            rcs = {rc for rc, rid in self._by_rc.items() if rid in set(region_ids or [])}
+            if rcs:
+                hues.append((rcs, color))
+        self._view_hues = hues
+        self.update()
+
     def wheelEvent(self, e):
         if self._marquee is not None:
             return          # a marquee owns the drag; zooming would slide the plate under the rect
@@ -2141,6 +2164,15 @@ class PlateOverview(QWidget):
                     p.drawEllipse(ex, ey, int(d), int(d))
                 # else: has an image on the active layer -> no dot
         p.setBrush(Qt.NoBrush)
+
+        if self._view_hues:           # PER-VIEW HUES (under the focus wash): each open window/thread
+            p.setPen(Qt.NoPen)         # tints its wells in its own colour, so views are told apart.
+            for rcs, color in self._view_hues:
+                p.setBrush(color)
+                for ri, ci in rcs:
+                    rx, ry, rw, rh = self._cell_rect(ri, ci)
+                    p.drawRect(int(rx), int(ry), int(rw), int(rh))
+            p.setBrush(Qt.NoBrush)
 
         if self._selection:            # SELECTED / focused-view wells = a light blue wash. More
             p.setPen(Qt.NoPen)         # transparent than before (Julio), and it FOLLOWS the open
@@ -3479,8 +3511,12 @@ class PlateWindow(QMainWindow):
         # should really only work on Views", picked centrally and aimed at the selected view(s)).
         # The manager only instantiates/raises windows; operate-on-views is the root's job.
         # Clicking an open view (or opening one) moves the plate's blue wash onto that view's
-        # regions, so the plate always shows which regions the focused window holds.
+        # regions, so the plate always shows which regions the focused window holds. windowsChanged
+        # and viewFocused BOTH re-tint the plate so every open view/thread keeps its own hue and the
+        # active one reads brighter (Julio's "hue the different view threads").
         self._viewer_manager.viewFocused.connect(self._highlight_view_regions)
+        self._viewer_manager.viewFocused.connect(lambda _regions: self._refresh_view_hues())
+        self._viewer_manager.windowsChanged.connect(self._refresh_view_hues)
 
         # File menu: a reliable "Open acquisition folder" (drag-drop can be blocked on Windows by the
         # GL child pane or an elevation mismatch, so this is the always-works path).
@@ -6849,6 +6885,17 @@ class PlateWindow(QMainWindow):
         """A view was clicked/opened — move the plate's blue wash onto its regions."""
         if self._overview is not None:
             self._overview.highlight_regions(regions)
+
+    def _refresh_view_hues(self):
+        """Re-tint the plate so each open view/thread keeps its own stable hue (the active view
+        brighter). Rebuilt from the manager's live view set, so it can never drift from the windows."""
+        if self._overview is None:
+            return
+        mgr = self._viewer_manager
+        focused = mgr.focused_id
+        entries = [(v.regions, _view_hue(v.window_id, focused=(v.window_id == focused)))
+                   for v in mgr.views()]
+        self._overview.set_view_hues(entries)
 
     def available_views(self) -> list:
         """Every View an operator could target, UNIFIED (Spencer's operate-on-views UI binds here).
