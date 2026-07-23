@@ -574,6 +574,9 @@ class _DeconQCWorker(QThread):
 
     def run(self):
         dataset, region, fov, channel, iterations, gpu, crop_half, view_half = self._args
+        if self.isInterruptionRequested():
+            return          # a close/shutdown beat us to the start — do not begin an RL run nobody
+            #                 is waiting for (lets DeconQCPanel.shutdown().wait() return at once)
         try:
             from squidmip._decon import OpticsParams, _run, make_psf
             from squidmip._decon_qc import (
@@ -807,9 +810,35 @@ class DeconQCPanel(_Panel):
         self.run_btn.setEnabled(True)
         self.say(f"deconvolution did not run: {message}")
 
+    def shutdown(self) -> None:
+        """Join the QC worker before this panel is destroyed.
+
+        ``_dispose_tab_widget`` (tab close / float close / app exit) calls ``shutdown()`` on any
+        panel that has one, then ``deleteLater()``s it. This panel used to expose only ``stop()``
+        — which the teardown path does not call — and even that waited a mere 50 ms, far less than
+        an RL run. So closing the Decon QC tab mid-run dropped the last reference to a RUNNING
+        QThread: "QThread: Destroyed while thread is still running" aborts the interpreter. RL on a
+        256 px crop is a bounded, fixed-iteration run, so waiting for it to finish is finite.
+        """
+        w = self._worker
+        if w is None:
+            return
+        # Drop the result callbacks FIRST: a done/failed emit that lands while this panel and its
+        # pane-3 view are being torn down would call show_iteration on a deleted widget.
+        for sig, slot in ((w.done, self._on_done), (w.failed, self._on_failed)):
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass          # not connected, or already gone — either way there is nothing to drop
+        if w.isRunning():
+            w.requestInterruption()   # honoured before the expensive RL call begins
+            w.wait()                  # block until run() returns — bounded on a crop, never a hang
+        self._worker = None
+
+    # ``stop`` predates ``shutdown`` and joined for only 50 ms (far less than an RL run), so the
+    # thread it meant to reap was usually still alive. It now routes through the real join.
     def stop(self) -> None:
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.wait(50)
+        self.shutdown()
 
 
 def _shipped_iterations() -> int:

@@ -333,6 +333,37 @@ def test_the_decon_panel_add_one_button_advances_by_exactly_one(qapp):
     assert p.iter_spin.value() == 3
 
 
+def test_the_decon_panel_shutdown_joins_a_running_worker(qapp):
+    """Closing the Decon QC tab mid-run must JOIN the RL thread, not drop the last reference to a
+    running QThread (which aborts the interpreter). _dispose_tab_widget calls shutdown(), so the
+    panel must expose exactly that name — stop() alone was never on the teardown path."""
+    import threading
+
+    from squidmip._op_panels import _DeconQCWorker
+
+    assert hasattr(DeconQCPanel, "shutdown"), "the teardown path calls shutdown(), not stop()"
+
+    started = threading.Event()
+
+    class _SlowWorker(_DeconQCWorker):
+        def __init__(self):
+            super().__init__(None, "A1", 0, "c0", 1, False, 8, 8)
+
+        def run(self):                       # stand in for an in-flight RL run
+            started.set()
+            while not self.isInterruptionRequested():
+                self.msleep(10)
+
+    p = DeconQCPanel(_Host())
+    p._worker = _SlowWorker()
+    p._worker.start()
+    assert started.wait(2.0) and p._worker.isRunning()
+
+    p.shutdown()                             # must interrupt + wait(), never abort
+
+    assert p._worker is None                 # the worker was reaped, not orphaned
+
+
 def test_the_result_view_renders_the_turbo_composite_at_the_composite_s_own_size(qapp):
     """Pane 3 shows the picture squidmip._decon_qc produced -- it does not build one."""
     pytest.importorskip("matplotlib")

@@ -406,8 +406,14 @@ class MosaicPane(QWidget):
         self._timer.setInterval(max(10, SETTLE_MS // 4))
         self._timer.timeout.connect(self._settle.poll)
         camera = self.mosaic.model.camera
-        camera.events.zoom.connect(lambda e: self._note_camera())
-        camera.events.center.connect(lambda e: self._note_camera())
+        # Keep a handle on each connection so shutdown() can DISCONNECT it. These lambdas capture
+        # `self`; a napari EventEmitter holds a strong ref to them, so without an explicit
+        # disconnect the pane (and its QTimer) cannot be collected after the tab is gone.
+        self._cam_cbs = []
+        for emitter in (camera.events.zoom, camera.events.center):
+            cb = lambda e: self._note_camera()
+            emitter.connect(cb)
+            self._cam_cbs.append((emitter, cb))
 
     def _note_camera(self) -> None:
         if self._settle is None or self._timer is None:
@@ -438,6 +444,33 @@ class MosaicPane(QWidget):
     @property
     def ok(self) -> bool:
         return self.mosaic is not None
+
+    def shutdown(self) -> None:
+        """Tear down the napari Viewer this pane owns — its GL context, its QMainWindow, and the
+        camera/timer subscriptions.
+
+        ``_ExplorationTab.dispose()`` calls this before ``deleteLater()``. deleteLater() on the Qt
+        wrapper alone does NOT close the napari Viewer: napari keeps every Viewer in its own
+        instance registry, so one leaked per Shift-drag — the exact leak dispose()'s docstring
+        claims to prevent ("kills a session after twenty selections"). Idempotent.
+        """
+        if self._timer is not None:
+            self._timer.stop()
+        for emitter, cb in getattr(self, "_cam_cbs", ()):
+            try:
+                emitter.disconnect(cb)
+            except (TypeError, RuntimeError, ValueError):
+                pass                                  # already gone, or napari changed the emitter
+        self._cam_cbs = []
+        viewer = self._viewer
+        self._viewer = None
+        if viewer is not None:
+            try:
+                viewer.close()                        # napari: closes the window + drops the registry entry
+            except Exception as exc:                  # a teardown error must not mask the dispose,
+                import logging                        # but it is NOT swallowed — it is named
+                logging.getLogger(__name__).warning(
+                    "napari viewer close failed during pane shutdown: %s", exc)
 
 
 #: Qt platform plugins that ship no OpenGL. napari's canvas is vispy/GL, so constructing it
