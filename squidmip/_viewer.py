@@ -113,6 +113,9 @@ _VIEWER_WORKERS = min(6, _default_workers())   # adapt to the machine, but CAP a
 _BG = _qtstyle.BG
 _GRID, _RED, _MUTED, _ACCENT = _qtstyle.GRID, _qtstyle.RED, _qtstyle.MUTED, _qtstyle.ACCENT
 _SEL_FILL = _qtstyle.SEL_FILL
+#: The plate's region highlight — a MORE TRANSPARENT light-blue wash than _SEL_FILL (Julio). Shown
+#: on the manually-picked wells AND on the regions of the open view you click (highlight_regions).
+_VIEW_WASH = QColor(88, 166, 255, 40)   # ~16% alpha light blue
 _MIN_PREVIEW_BOX_PX = 4    # smallest FOV box (of _CELL) the RAW preview will bother mosaicking
 #                            (IMA-253): below this a field is a speck, and reading one plane per
 #                            field to draw specks is pure cost. The operator path is unaffected.
@@ -1731,6 +1734,14 @@ class PlateOverview(QWidget):
         self.selectionChanged.emit(self.selected_wells())
         self.update()
 
+    def highlight_regions(self, region_ids):
+        """Move the blue wash onto *region_ids* — used when the user clicks an OPEN VIEW so the
+        plate shows which regions that window holds. Same wash the manual selection uses."""
+        want = set(region_ids or [])
+        self._selection = {rc for rc, rid in self._by_rc.items() if rid in want}
+        self.selectionChanged.emit(self.selected_wells())
+        self.update()
+
     def wheelEvent(self, e):
         if self._marquee is not None:
             return          # a marquee owns the drag; zooming would slide the plate under the rect
@@ -2131,9 +2142,9 @@ class PlateOverview(QWidget):
                 # else: has an image on the active layer -> no dot
         p.setBrush(Qt.NoBrush)
 
-        if self._selection:            # SELECTED wells = translucent accent wash (IMA-221). Drawn
-            p.setPen(Qt.NoPen)         # under the grid/labels so it reads as a highlight, and kept
-            p.setBrush(_SEL_FILL)      # visually distinct from _sel's red BOX and _hover's red DOT.
+        if self._selection:            # SELECTED / focused-view wells = a light blue wash. More
+            p.setPen(Qt.NoPen)         # transparent than before (Julio), and it FOLLOWS the open
+            p.setBrush(_VIEW_WASH)     # view you click (highlight_regions), as well as manual picks.
             for ri, ci in self._selection:
                 rx, ry, rw, rh = self._cell_rect(ri, ci)
                 p.drawRect(int(rx), int(ry), int(rw), int(rh))
@@ -3464,6 +3475,9 @@ class PlateWindow(QMainWindow):
         # shares this one stateless reader/meta — nothing reopens the dataset. See _region_viewer.
         from squidmip._region_viewer import ViewerManager
         self._viewer_manager = ViewerManager(parent=self)
+        # Clicking an open view (or opening one) moves the plate's blue wash onto that view's
+        # regions, so the plate always shows which regions the focused window holds.
+        self._viewer_manager.viewFocused.connect(self._highlight_view_regions)
 
         # File menu: a reliable "Open acquisition folder" (drag-drop can be blocked on Windows by the
         # GL child pane or an elevation mismatch, so this is the always-works path).
@@ -4641,7 +4655,22 @@ class PlateWindow(QMainWindow):
         state = {"dir": None}
         dir_lbl = QLabel("(no folder chosen)"); dir_lbl.setWordWrap(True)
         dir_lbl.setStyleSheet("color:#8b98ad;font-size:12px;")
-        run = QPushButton("Run on the whole plate"); run.setStyleSheet(_BTN_QSS); run.setEnabled(False)
+        run = QPushButton("Run"); run.setStyleSheet(_BTN_QSS); run.setEnabled(False)
+
+        # RUN ON — the target the operator iterates over (Julio: the per-tool "run on" choice, not a
+        # master-pane one). The decentralized model adds OPEN VIEWS: run the operator over the
+        # regions currently held by the independent windows, not just the plate selection.
+        TARGET_PLATE, TARGET_SELECTION, TARGET_OPEN = "Whole plate", "Selected wells", "Open views"
+        run_row = QHBoxLayout(); run_row.setSpacing(6)
+        _rl = QLabel("Run on"); _rl.setStyleSheet("color:#8b98ad;font-size:12px;")
+        target = QComboBox(); target.setStyleSheet(_COMBO_QSS)
+        target.addItems([TARGET_SELECTION, TARGET_OPEN, TARGET_PLATE])
+        target.setToolTip(
+            "What the operator iterates over.\n"
+            f"{TARGET_SELECTION} — the wells picked on the plate (all if none).\n"
+            f"{TARGET_OPEN} — every region held by the open viewer windows.\n"
+            f"{TARGET_PLATE} — every region of the acquisition.")
+        run_row.addWidget(_rl); run_row.addWidget(target, 1)
 
         def pick():
             d = QFileDialog.getExistingDirectory(self, f"Save {op.label} plate to folder")
@@ -4655,8 +4684,22 @@ class PlateWindow(QMainWindow):
         pick_btn = QPushButton("Choose output folder…"); pick_btn.setStyleSheet(_BTN_QSS)
         pick_btn.clicked.connect(pick)
 
+        def do_run():
+            choice = target.currentText()
+            if choice == TARGET_PLATE:
+                regions = None                       # None = whole dataset (run_operator's contract)
+            elif choice == TARGET_OPEN:
+                regions = self._open_views_regions()
+                if not regions:
+                    self._readout.setText("Run on open views: no windows are open — open some first.")
+                    return
+            else:                                    # selected wells (all if none selected)
+                regions = self._selected_regions or None
+            self.run_operator(op.key, out_parent=state["dir"], regions=regions)
+
         v.addWidget(_hline())
-        run.clicked.connect(lambda: self.run_operator(op.key, out_parent=state["dir"]))
+        run.clicked.connect(do_run)
+        v.addLayout(run_row)
         v.addWidget(pick_btn); v.addWidget(dir_lbl); v.addWidget(run)
 
         # PREVIEW on a subset — test the operator on the first N wells without committing the whole
@@ -6798,6 +6841,23 @@ class PlateWindow(QMainWindow):
     def _select_all_wells(self):
         if self._overview is not None:
             self._overview.select_all()
+
+    def _highlight_view_regions(self, regions):
+        """A view was clicked/opened — move the plate's blue wash onto its regions."""
+        if self._overview is not None:
+            self._overview.highlight_regions(regions)
+
+    def _open_views_regions(self) -> list:
+        """The union of regions held by the open independent windows, in first-seen order — the
+        iteration set for an operator run 'on open views' (the decentralized bulk target)."""
+        seen: set = set()
+        out: list = []
+        for win in getattr(self._viewer_manager, "windows", []):
+            for r in getattr(win, "_regions", []):
+                if r not in seen:
+                    seen.add(r)
+                    out.append(r)
+        return out
 
     def _on_marquee_selected(self, wells: list):
         """Shift-DRAG released on the plate -> open an INDEPENDENT napari window for that subset.

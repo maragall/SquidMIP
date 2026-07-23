@@ -324,6 +324,7 @@ class ViewerManager(QObject):
 
     windowsChanged = pyqtSignal()          # the set of open windows changed
     memoryChanged = pyqtSignal(float)      # process RSS as a fraction 0..1 of total RAM
+    viewFocused = pyqtSignal(object)       # a window was opened/raised -> its regions (list[str])
 
     def __init__(self, reader: Any = None, meta: Optional[dict] = None,
                  parent: Optional[QObject] = None) -> None:
@@ -362,6 +363,7 @@ class ViewerManager(QObject):
         win.raise_()
         win.activateWindow()
         self.windowsChanged.emit()
+        self.viewFocused.emit(list(win._regions))       # highlight its regions on the plate
         return win
 
     def focus(self, window_id: int) -> None:
@@ -370,6 +372,7 @@ class ViewerManager(QObject):
             win.showNormal()
             win.raise_()
             win.activateWindow()
+            self.viewFocused.emit(list(win._regions))   # move the plate wash onto this view
 
     def close(self, window_id: int) -> None:
         win = self._windows.get(int(window_id))
