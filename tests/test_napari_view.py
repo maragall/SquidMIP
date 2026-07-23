@@ -850,3 +850,115 @@ def test_add_mosaic_labels_the_layer_units_micrometres():
     lyr = layers.add_mosaic("raw", "488", _img(shape=(16, 16)),
                             bbox_um=(0.0, 0.0, 160.0, 160.0))
     assert all("meter" in str(u) or str(u) in ("um", "µm") for u in lyr.units)
+# ---------------------------------------------------------------- analysis-result layers
+# add_mosaic makes IMAGE layers. A segmentation operator's result is not an image: it is a
+# Labels mask and a Points set (that is what every napari segmentation plugin returns, and what
+# Cellpose will return when it lands). These are the siblings that carry those.
+
+
+def _labels(n=3, shape=(32, 32)):
+    lab = np.zeros(shape, dtype=np.int32)
+    for i in range(1, n + 1):
+        lab[i * 4: i * 4 + 3, i * 4: i * 4 + 3] = i
+    return lab
+
+
+def test_a_mask_lands_as_a_real_napari_Labels_layer_not_an_image(layers):
+    """A Labels layer is what gives napari its label colormap, pick-by-click and 0-transparency.
+    Adding a mask with add_image would render it as a near-black gradient and read as broken."""
+    from napari.layers import Labels
+
+    lyr = layers.add_labels("spots", "488 mask", _labels())
+    assert isinstance(lyr, Labels)
+    assert lyr in layers.model.layers
+
+
+def test_centroids_land_as_a_real_napari_Points_layer(layers):
+    from napari.layers import Points
+
+    pts = np.array([[4.0, 4.0], [8.0, 8.0]])
+    lyr = layers.add_points("spots", "488 centroids", pts)
+    assert isinstance(lyr, Points)
+    assert np.asarray(lyr.data).shape == (2, 2)
+
+
+def test_analysis_layers_carry_our_metadata_so_the_layer_tree_groups_them(layers):
+    """Identity lives in metadata, never parsed back out of the name (module docstring)."""
+    layers.add_labels("spots", "488 mask", _labels())
+    layers.add_points("spots", "488 centroids", np.array([[1.0, 2.0]]))
+
+    assert key_of(layers.model.layers["spots · 488 mask"]) == MosaicKey("spots", "488 mask")
+    assert set(layers.channels("spots")) == {"488 mask", "488 centroids"}
+    assert "spots" in layers.ops()
+
+
+def test_an_empty_points_layer_is_still_added_so_zero_nuclei_is_visible_as_a_result(layers):
+    """Zero found is an ANSWER. Skipping the layer would make 'nothing ran' and 'nothing there'
+    look identical — a silent failure."""
+    from napari.layers import Points
+
+    lyr = layers.add_points("spots", "488 centroids", np.zeros((0, 2)))
+    assert isinstance(lyr, Points)
+    assert len(np.asarray(lyr.data)) == 0
+
+
+def test_analysis_layers_are_NOT_linked_into_the_per_channel_contrast_group(layers):
+    """A Labels/Points layer has no contrast_limits. Registering it as a contrast peer would
+    make link_layers raise on the next channel added — and napari OWNS contrast, not us."""
+    layers.add_mosaic("raw", "488", _img())
+    layers.add_labels("spots", "488", _labels())          # same channel string, on purpose
+
+    peers = layers._by_channel["488"]
+    assert len(peers) == 1, "an analysis layer was registered as a contrast peer"
+    layers.set_contrast("488", 10.0, 900.0)               # must not raise
+
+
+def test_analysis_layers_are_placed_in_stage_micrometres_like_the_mosaic_they_describe(layers):
+    """The mask must land ON the mosaic. Same bbox -> same scale/translate, or the overlay is
+    a plausible-looking lie sitting somewhere else in world space."""
+    img = layers.add_mosaic("raw", "488", np.zeros((40, 80), dtype=np.uint16),
+                            bbox_um=(100.0, 200.0, 900.0, 600.0))
+    mask = layers.add_labels("spots", "488 mask", np.zeros((40, 80), dtype=np.int32),
+                             bbox_um=(100.0, 200.0, 900.0, 600.0))
+    pts = layers.add_points("spots", "488 centroids", np.array([[20.0, 40.0]]),
+                            bbox_um=(100.0, 200.0, 900.0, 600.0), shape=(40, 80))
+
+    assert tuple(mask.scale) == pytest.approx(tuple(img.scale))
+    assert tuple(mask.translate) == pytest.approx(tuple(img.translate))
+    assert tuple(pts.scale) == pytest.approx(tuple(img.scale))
+    assert tuple(pts.translate) == pytest.approx(tuple(img.translate))
+
+
+def test_points_without_a_shape_cannot_be_placed_and_says_so(layers):
+    """A Points layer carries no array shape, so bbox placement needs the mask's shape passed in.
+    Silently leaving it unplaced would put every centroid at the world origin."""
+    with pytest.raises(ValueError, match="shape"):
+        layers.add_points("spots", "488 centroids", np.array([[1.0, 2.0]]),
+                          bbox_um=(0.0, 0.0, 10.0, 10.0))
+
+
+def test_re_running_replaces_the_previous_result_instead_of_stacking_duplicates(layers):
+    layers.add_labels("spots", "488 mask", _labels(n=3))
+    layers.add_labels("spots", "488 mask", _labels(n=5))
+    assert len(layers.group("spots")) == 1
+    assert int(np.asarray(layers.find("spots", "488 mask").data).max()) == 5
+
+
+def test_remove_op_clears_masks_and_points_together(layers):
+    layers.add_labels("spots", "488 mask", _labels())
+    layers.add_points("spots", "488 centroids", np.array([[1.0, 2.0]]))
+    gone = layers.remove_op("spots")
+
+    assert set(gone) == {"488 mask", "488 centroids"}
+    assert layers.group("spots") == []
+
+
+def test_the_count_rides_on_the_points_layer_features_keyed_by_label(layers):
+    """Fractal's feature-table contract — one row per object, indexed by label value — expressed
+    in the shape napari already has. Neither cellpose-napari nor napari-sbatwm surfaces a count
+    at all; Spencer asked for one, so it has to live somewhere addressable."""
+    pts = np.array([[4.0, 4.0], [8.0, 8.0], [12.0, 12.0]])
+    lyr = layers.add_points("spots", "488 centroids", pts,
+                            features={"label": [1, 2, 3]})
+    assert list(lyr.features["label"]) == [1, 2, 3]
+    assert len(lyr.features) == 3
