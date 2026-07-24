@@ -921,22 +921,57 @@ class RegionViewer(QMainWindow):
                     colormap_by[name] = getattr(cmap, "name", cmap)
                 except Exception:                    # noqa: BLE001
                     pass
-        # Render the ROI at NATIVE res WITH its z-stack: read the FOV under the ROI STRAIGHT FROM THE
-        # READER (the 2D mosaic is a single-z preview -- Julio: "the ROI ... doesn't import the
-        # z-stack"), then CROP that z-stack to the exact ROI window inside the FOV. So the 3D volume
-        # is the exact ROI subarray, full z, native resolution. (An ROI spanning several FOVs clips
-        # to the one under its centre for now; cross-FOV native fusion is the follow-up.)
-        fov = self._roi_center_fov(region, roi_bbox)  # ROI (selected or own) -> its FOV; else centre
+        # ROI -> native CROSS-FOV fusion cropped to the box (exact subarray, full z, native res),
+        # read straight from the reader. Else the whole region's centre FOV (gallery-view recipe).
+        if roi_bbox is not None:
+            self._open_roi_3d(region, roi_bbox, contrast_by, colormap_by)
+            return
+
+        fov = self._roi_center_fov(region, roi_bbox)
         from squidmip._napari3d import open_native_3d
 
         try:
             self._native3d = open_native_3d(
-                self._reader, self._meta, region, fov=fov, roi_bbox_um=roi_bbox,
+                self._reader, self._meta, region, fov=fov,
                 contrast_by_channel=contrast_by or None,
                 colormap_by_channel=colormap_by or None,
             )
         except Exception as exc:                     # noqa: BLE001 - named to the window, never silent
             self._say(f"3D could not open: {exc}")
+
+    def _open_roi_3d(self, region: str, roi_bbox: tuple, contrast_by: dict, colormap_by: dict) -> None:
+        """3D of an ROI = native fusion of the FOVs it overlaps, cropped to the box (full z)."""
+        names = [c["name"] for c in (self._meta or {}).get("channels", [])]
+        from squidmip._napari3d import native_roi_volume, open_native_3d_volume
+
+        try:
+            volumes = native_roi_volume(self._reader, self._meta, region, roi_bbox, names)
+        except Exception as exc:                         # noqa: BLE001 - named to the window
+            self._say(f"ROI 3D fusion failed: {exc}")
+            return
+        volumes = {n: v for n, v in (volumes or {}).items()
+                   if v is not None and int(v.shape[0]) >= 2}
+        if not volumes:
+            self._say("ROI 3D: no z-stack over this ROI (single z plane, or the box is off-tissue).")
+            return
+        px = float((self._meta or {}).get("pixel_size_um") or 1.0)
+        dz = float((self._meta or {}).get("dz_um") or px)
+        max_tex = 2048
+        try:
+            max_tex = int(self._pane._live_max_3d_texture())
+        except Exception:                                # noqa: BLE001
+            pass
+        try:
+            self._native3d = open_native_3d_volume(
+                {n: np.asarray(v) for n, v in volumes.items()},
+                scale=(dz, px, px),
+                title=f"3D ROI — {self._region_label(self._regions)}",
+                contrast_by_channel=contrast_by or None,
+                colormap_by_channel=colormap_by or None,
+                max_texture=max_tex,
+            )
+        except Exception as exc:                         # noqa: BLE001 - named to the window
+            self._say(f"ROI 3D could not open: {exc}")
 
     def _render_roi_volume(self, mosaic, contrast_by: dict, colormap_by: dict) -> None:
         """Render the EXACT ROI subarray in 3D: the cropped level-0 volume this window's 2D view
