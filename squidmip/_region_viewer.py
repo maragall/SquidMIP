@@ -26,6 +26,7 @@ from typing import Any, Optional, Sequence
 import numpy as np
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
+    QAbstractItemView,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -50,6 +51,12 @@ log = logging.getLogger("squidmip.regionviewer")
 #: other window (or the plate). A parameter file on the desktop is the same idea; this is the
 #: in-session GUI form of it. Keyed by channel name -> {"clim": (lo, hi), "cmap": <name>}.
 _LUT_CLIPBOARD: "dict[str, dict]" = {}
+
+#: Distinct edge colours cycled per ROI so each annotation box is told apart (Julio: "roi boxes
+#: should have different colors"). A qualitative set, high-contrast on tissue.
+_ROI_COLORS: "tuple[str, ...]" = (
+    "#58a6ff", "#f778ba", "#3fb950", "#f0883e", "#a371f7", "#e3b341", "#39c5cf", "#ff7b72",
+)
 
 
 @dataclass(frozen=True)
@@ -165,6 +172,7 @@ class RegionViewer(QMainWindow):
         roi_bbox: Optional[tuple] = None,
         operator_specs: Optional[Sequence] = None,
         run_operator: Optional[Any] = None,
+        parent_id: Optional[int] = None,
     ) -> None:
         super().__init__(parent)
         self._reader = reader
@@ -187,6 +195,7 @@ class RegionViewer(QMainWindow):
         self._manager = manager
         self._operator_specs = list(operator_specs or [])
         self._run_operator = run_operator
+        self.parent_id = parent_id      # the view this was spawned from (ROI child) -> tree nesting
         # An ROI child carries the parent's ROI box (deck: "ROI -> child window"). Cropping the load
         # to it lands with the loader work; today it scopes the title + is recorded for that step.
         self._roi_bbox = roi_bbox
@@ -548,7 +557,25 @@ class RegionViewer(QMainWindow):
         if layer is None or layer not in list(v.layers):
             if not create:
                 return v, None
-            layer = v.add_shapes(name="ROIs", edge_color="#58a6ff", face_color="transparent")
+            # Per-ROI COLOURS + a hovering NAME label (Julio: "roi boxes should have different
+            # colors" + "an roi name hovering over the bounding box of each annotation", QuPath
+            # style). Each shape gets a name property (R1, R2, ...) that drives both the edge-colour
+            # cycle and the text label. Wrapped so a napari text/property hiccup still yields a
+            # usable ROI layer rather than breaking ROI drawing.
+            try:
+                layer = v.add_shapes(
+                    name="ROIs", face_color="transparent",
+                    properties={"name": np.array([], dtype=object)},
+                    text={"string": "{name}", "color": "white", "size": 9,
+                          "anchor": "upper_left"},
+                    edge_color="name", edge_color_cycle=list(_ROI_COLORS),
+                )
+                layer.current_properties = {"name": np.array(["R1"], dtype=object)}
+                layer.events.data.connect(
+                    lambda e=None, ly=layer: self._on_roi_data(ly))
+            except Exception:                            # noqa: BLE001 - fall back to a plain layer
+                layer = v.add_shapes(name="ROIs", edge_color="#58a6ff",
+                                     face_color="transparent")
             self._roi_layer = layer
             self._sync_roi_width(v, layer)
             try:                                         # border reacts to zoom from here on
@@ -557,6 +584,16 @@ class RegionViewer(QMainWindow):
             except Exception:                            # noqa: BLE001
                 pass
         return v, layer
+
+    @staticmethod
+    def _on_roi_data(layer) -> None:
+        """After a shape is added/removed, name the NEXT ROI R{n+1} so each box keeps a unique id
+        (which also gives it the next colour in the cycle)."""
+        try:
+            n = len(getattr(layer, "data", []) or [])
+            layer.current_properties = {"name": np.array([f"R{n + 1}"], dtype=object)}
+        except Exception:                                # noqa: BLE001 - labelling is cosmetic
+            pass
 
     def _new_roi(self) -> None:
         """Start drawing an ROI rectangle inside the mosaic (deck: boxes inside the well view)."""
@@ -901,6 +938,7 @@ class ViewerManager(QObject):
         self._windows: "dict[int, RegionViewer]" = {}
         self._next_id = 1
         self._focused_id: Optional[int] = None    # which view is active (its plate hue reads brighter)
+        self._selected_ids: "list[int]" = []      # navigator multi-selection (Linux shift/ctrl)
         # Set by the root PlateWindow so every window's "Operators for this window" dropdown is the
         # SAME registry + the SAME run_operator (the CLI engine), scoped to that view.
         self.operator_specs: "list" = []
@@ -960,10 +998,11 @@ class ViewerManager(QObject):
             return None
         base = RegionViewer._region_label(regions)
         title = f"{base}  ◂ view {parent_id}" if parent_id is not None else base
-        return self._spawn(regions, title=title, roi_bbox=roi_bbox)
+        return self._spawn(regions, title=title, roi_bbox=roi_bbox, parent_id=parent_id)
 
     def _spawn(self, regions: "list[str]", *, title: Optional[str] = None,
-               roi_bbox: Optional[tuple] = None) -> Optional[RegionViewer]:
+               roi_bbox: Optional[tuple] = None,
+               parent_id: Optional[int] = None) -> Optional[RegionViewer]:
         if self._reader is None or self._meta is None:
             log.warning("open() called before a dataset was loaded; ignoring.")
             return None
@@ -973,10 +1012,12 @@ class ViewerManager(QObject):
             self._reader, self._meta, regions, window_id=wid, title=title,
             manager=self, roi_bbox=roi_bbox,
             operator_specs=self.operator_specs, run_operator=self.run_operator,
+            parent_id=parent_id,
         )
         win.closed.connect(self._on_window_closed)
         self._windows[wid] = win
         self._focused_id = wid
+        self._selected_ids = [wid]
         win.show()
         win.raise_()
         win.activateWindow()
@@ -993,7 +1034,20 @@ class ViewerManager(QObject):
         """No view is selected -> clear the plate wash. Emitting empty regions makes the plate's hue
         refresh find no focused view and paint nothing."""
         self._focused_id = None
+        self._selected_ids = []
         self.viewFocused.emit([])
+
+    @property
+    def selected_ids(self) -> "list[int]":
+        """Window ids selected in the navigator (Linux shift/ctrl multi-select). The plate washes
+        each in its own hue."""
+        return [i for i in getattr(self, "_selected_ids", []) if i in self._windows]
+
+    def set_selected(self, ids: "Sequence[int]") -> None:
+        """The navigator selection changed (possibly many rows). Store it and re-tint the plate."""
+        self._selected_ids = [int(i) for i in ids]
+        self._focused_id = self._selected_ids[0] if self._selected_ids else None
+        self.viewFocused.emit([])                        # triggers PlateWindow._refresh_view_hues
 
     def focus(self, window_id: int) -> None:
         win = self._windows.get(int(window_id))
@@ -1075,10 +1129,13 @@ class OpenViewList(QWidget):
 
         self._tree = QTreeWidget(self)
         self._tree.setHeaderHidden(True)
-        self._tree.setRootIsDecorated(False)
-        # The plate wash STRICTLY follows the navigator selection: select a row -> wash that view;
-        # deselect (or nothing selected) -> no wash. Julio: "nothing is selected, and I still see a
-        # region purple washed." itemActivated (double-click) also raises the window.
+        # NESTED HIERARCHY with expand/collapse ARROWS (Julio: "arrows for the window object
+        # hierarchy like Blender") — ROI children nest under their parent window. Linux-style
+        # shift/ctrl MULTI-SELECT so operators can target several views at once.
+        self._tree.setRootIsDecorated(True)
+        self._tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        # The plate wash STRICTLY follows the navigator selection: select rows -> wash those views;
+        # deselect (nothing selected) -> no wash. itemActivated (double-click) also raises the window.
         self._tree.itemActivated.connect(self._on_activated)
         self._tree.itemSelectionChanged.connect(self._on_selection_changed)
         self._syncing = False   # guards refresh()'s programmatic selection from re-emitting
@@ -1110,36 +1167,42 @@ class OpenViewList(QWidget):
         self.refresh()
 
     def refresh(self) -> None:
-        # Rebuild the rows, then sync the row selection to the manager's focused view (guarded so the
-        # programmatic selection does not re-fire _on_selection_changed). No focused view => nothing
-        # selected => no wash, which is exactly the state Julio saw violated.
+        # Rebuild as a NESTED tree (ROI children under their parent window), then restore the multi-
+        # selection from the manager (guarded so the programmatic selection does not re-fire
+        # _on_selection_changed). No selection => no wash.
         self._syncing = True
         try:
             self._tree.clear()
-            focused = self._manager.focused_id
-            for win in self._manager.windows:
+            items: "dict[int, QTreeWidgetItem]" = {}
+            windows = self._manager.windows
+            by_id = {int(w.window_id): w for w in windows}
+            # Place parents before children: a window whose parent isn't open yet lands at the root.
+            for win in sorted(windows, key=lambda w: int(w.window_id)):
+                wid = int(win.window_id)
                 item = QTreeWidgetItem([win.windowTitle()])
-                item.setData(0, Qt.UserRole, int(win.window_id))
-                self._tree.addTopLevelItem(item)
-                if focused is not None and int(win.window_id) == int(focused):
+                item.setData(0, Qt.UserRole, wid)
+                pid = getattr(win, "parent_id", None)
+                parent_item = items.get(int(pid)) if pid is not None and int(pid) in by_id else None
+                if parent_item is not None:
+                    parent_item.addChild(item)
+                else:
+                    self._tree.addTopLevelItem(item)
+                items[wid] = item
+            self._tree.expandAll()                       # show the nested ROIs open by default
+            selected = set(self._manager.selected_ids)
+            for wid, item in items.items():
+                if wid in selected:
                     item.setSelected(True)
-                    self._tree.setCurrentItem(item)
-            if focused is None:
-                self._tree.clearSelection()
         finally:
             self._syncing = False
 
     def _on_selection_changed(self) -> None:
-        """Row selection IS the wash: selected -> wash that view; none -> clear the wash."""
+        """Row selection IS the wash and the operator target set (Linux multi-select): the plate
+        washes every selected view in its hue; empty selection clears the wash."""
         if self._syncing:
             return
-        items = self._tree.selectedItems()
-        if items:
-            wid = items[0].data(0, Qt.UserRole)
-            if wid is not None:
-                self._manager.focus(int(wid))
-        else:
-            self._manager.clear_focus()
+        ids = [it.data(0, Qt.UserRole) for it in self._tree.selectedItems()]
+        self._manager.set_selected([int(i) for i in ids if i is not None])
 
     def _on_activated(self, item: QTreeWidgetItem, _column: int = 0) -> None:
         wid = item.data(0, Qt.UserRole)

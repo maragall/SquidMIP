@@ -7002,15 +7002,18 @@ class PlateWindow(QMainWindow):
             self._overview.highlight_regions(regions)
 
     def _refresh_view_hues(self):
-        """Wash the plate for the CLICKED view only, in that view's own hue (Julio: "the washes only
-        show when I click the view"). Different views get different hues so threads are told apart,
-        but only one wash shows at a time. Cleared when there is no focused view (it was closed)."""
+        """Wash the plate for the SELECTED views in the navigator, each in its own hue (Linux
+        multi-select). The active (first) view reads brighter. Empty selection -> no wash (Julio:
+        "the washes only show when I click the view")."""
         if self._overview is None:
             return
         mgr = self._viewer_manager
         focused = mgr.focused_id
-        v = mgr.view_for(focused) if focused is not None else None
-        entries = [(v.regions, _view_hue(v.window_id, focused=True))] if v is not None else []
+        entries = []
+        for wid in mgr.selected_ids:
+            v = mgr.view_for(wid)
+            if v is not None:
+                entries.append((v.regions, _view_hue(v.window_id, focused=(v.window_id == focused))))
         self._overview.set_view_hues(entries)
 
     def available_views(self) -> list:
