@@ -141,8 +141,14 @@ def open_native_3d(
     channels: Optional[Sequence[str]] = None,
     contrast_by_channel: Optional[dict] = None,
     colormap_by_channel: Optional[dict] = None,
+    roi_bbox_um: Optional[Sequence[float]] = None,
 ) -> Any:
     """Open a fresh napari 3D viewer on ONE FOV's native z-stack (gallery-view's recipe).
+
+    ``roi_bbox_um`` (x0, y0, x1, y1 stage micrometres) crops each channel's native z-stack to the
+    ROI's window WITHIN the FOV, so the volume is the exact ROI subarray at native resolution and
+    full z depth -- not the whole FOV, and not the single-z 2D preview. The FOV's micrometre origin
+    is its stage position (``fov_positions_um``), matching ``mosaic_bbox_um``'s placement.
 
     Returns the napari ``Viewer`` (a popout window). Raises with a named reason if the stack cannot
     be built, so the caller can route it to the log rather than a silent no-op.
@@ -161,7 +167,25 @@ def open_native_3d(
     contrast_by_channel = contrast_by_channel or {}
     colormap_by_channel = colormap_by_channel or {}
 
-    title = f"3D native (napari) — {region} / fov {fov}"
+    # ROI window in this FOV's own pixels (its stage position is the FOV's top-left um).
+    crop = None
+    if roi_bbox_um is not None:
+        p = (meta.get("fov_positions_um") or {}).get((region, fov))
+        if p is not None:
+            try:
+                fx, fy = float(p[0]), float(p[1])
+                rx0, ry0, rx1, ry1 = (float(v) for v in roi_bbox_um)
+                fh, fw = (int(v) for v in meta["frame_shape"])
+                c0 = max(0, int(round((rx0 - fx) / px)))
+                c1 = min(fw, int(round((rx1 - fx) / px)))
+                r0 = max(0, int(round((ry0 - fy) / px)))
+                r1 = min(fh, int(round((ry1 - fy) / px)))
+                if c1 > c0 and r1 > r0:
+                    crop = (r0, r1, c0, c1)
+            except Exception:                           # noqa: BLE001 - fall back to the whole FOV
+                crop = None
+
+    title = f"3D native (napari) — {region} / fov {fov}" + (" / ROI" if crop else "")
     viewer = napari.Viewer(ndisplay=3, title=title)
     n_z = 1
     first_shape: Optional[tuple] = None
@@ -171,6 +195,9 @@ def open_native_3d(
         except Exception as exc:                        # noqa: BLE001 - named, then continue
             log.error("3D native: could not read %s/%s/fov %s: %s", region, ch, fov, exc)
             continue
+        if crop is not None:
+            r0, r1, c0, c1 = crop
+            stack = stack[..., r0:r1, c0:c1]            # exact ROI subarray, full z
         n_z = max(n_z, int(stack.shape[0]))
         kwargs = {
             "name": ch,

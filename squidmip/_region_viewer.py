@@ -921,20 +921,17 @@ class RegionViewer(QMainWindow):
                     colormap_by[name] = getattr(cmap, "name", cmap)
                 except Exception:                    # noqa: BLE001
                     pass
-        # ROI CHILD: render the EXACT ROI SUBARRAY -- the cropped level-0 volume the 2D view already
-        # shows -- not a whole FOV (Julio: "it doesn't render the exact ROI subarray in 3D"). The
-        # pane's layer.data[0] is the ROI crop from _on_plane, so its spatial extent matches 2D
-        # exactly. (A larger ROI's native cross-FOV fusion is the follow-up; this matches the view.)
-        if self._roi_bbox is not None and mosaic is not None:
-            self._render_roi_volume(mosaic, contrast_by, colormap_by)
-            return
-
+        # Render the ROI at NATIVE res WITH its z-stack: read the FOV under the ROI STRAIGHT FROM THE
+        # READER (the 2D mosaic is a single-z preview -- Julio: "the ROI ... doesn't import the
+        # z-stack"), then CROP that z-stack to the exact ROI window inside the FOV. So the 3D volume
+        # is the exact ROI subarray, full z, native resolution. (An ROI spanning several FOVs clips
+        # to the one under its centre for now; cross-FOV native fusion is the follow-up.)
         fov = self._roi_center_fov(region, roi_bbox)  # ROI (selected or own) -> its FOV; else centre
         from squidmip._napari3d import open_native_3d
 
         try:
             self._native3d = open_native_3d(
-                self._reader, self._meta, region, fov=fov,
+                self._reader, self._meta, region, fov=fov, roi_bbox_um=roi_bbox,
                 contrast_by_channel=contrast_by or None,
                 colormap_by_channel=colormap_by or None,
             )
