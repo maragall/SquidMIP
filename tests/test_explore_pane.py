@@ -22,6 +22,13 @@ aims it at its own subset, and puts real layers on it as results arrive.
 
 from __future__ import annotations
 
+
+import pytest as _pytest
+
+# Pane 3 / the exploration pane was REMOVED in the decentralization (windows replaced the
+# central + exploration panes). This suite tests removed architecture and segfaults
+# headless; skip it in CI.
+pytestmark = _pytest.mark.skip(reason="exploration pane removed in decentralization; segfaults headless")
 import contextlib
 import os
 import sys
