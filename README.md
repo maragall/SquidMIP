@@ -1,84 +1,75 @@
-# MIP tool
+# SquidXplorer
 
-High throughput maximum intensity projection (MIP) for Squid well plate acquisitions. It opens a
-finished acquisition, flattens each well's z stack into one image across the whole plate, and saves a
-result you can reopen here, in napari, or in FIJI. Read only, it never changes your acquisition.
+A local viewer for finished Squid HCS acquisitions. Open a plate, explore any well or region in its
+own napari window, and run your processing operators on exactly the wells or ROIs you pick. Read
+only: it never changes your acquisition and never runs the microscope.
 
-## What it does
+## The idea
 
-- Opens a finished Squid well plate acquisition.
-- Flattens each well's z stack into one max intensity projection (MIP), across the whole plate.
-- Saves the result as a plate you can reopen here, in napari, or in FIJI.
-- Read only. It never changes your acquisition and never runs the microscope.
+The **plate is the root**. Selecting wells opens an independent napari window over them; drawing an
+ROI inside a window opens a **child window** over that region. Every window gets an integer id, and
+they are all collected in the **Window navigator** on the left.
 
-## Setup (one time, Windows)
+```mermaid
+flowchart TD
+  ROOT["Wellplate view<br/>Window navigator (selectable)  +  Operators (bulk)  +  Selection"]
+  W["Window &middot; a well or a set of wells<br/>2D / 3D  &middot;  Operators for this window<br/>napari mosaic (full well) + ROI boxes<br/>slider: &lt;&gt; A1, B6, C3 ..."]
+  R["ROI child window<br/>2D / 3D  &middot;  Operators for this window<br/>slider: &lt;&gt; ROI1, ROI2, ROI3 ..."]
+  ROOT -- "select wells" --> W
+  W -- "box an ROI" --> R
+```
 
-- You need Python 3.10, 3.11, or 3.12.
-- If you do not have Python, install it from https://www.python.org/downloads/ . In the installer, tick "Add python.exe to PATH".
+**Layout (from the design deck):**
+
+- **Root**: the Window navigator (a selectable list of open views) and the bulk Operators, above the
+  Wellplate view with its Selection.
+- **Each window**: a 2D / 3D control and Operators for that window, over the napari mosaic of the
+  full well, with ROI boxes you can send to 2D or 3D, and a region slider `<> A1, B6, C3 ...`.
+- **An ROI child window** is the same, with a slider over its ROIs `<> ROI1, ROI2, ROI3 ...`.
+
+**Notes:**
+
+- Each selection from the wellplate opens a new region view. Each window gets a positive id,
+  collected in the Window navigator on the left.
+- Windows not currently being manipulated halt their draw and refresh.
+- A memory bar warns you before the system runs low.
+
+## Operators
+
+Processing runs **your own tested implementations, called directly**, never a reimplementation:
+
+| Operator | Backend |
+| --- | --- |
+| Deconvolution (Richardson-Lucy, vectorial PSF) | `petakit` |
+| Stitch and flat-field | `tilefusion` |
+| Background subtraction | `bgsub` |
+| Nuclei detection | Cellpose |
+| Maximum intensity projection | built in |
+
+Output is byte-identical to the standalone repos, pinned by `tests/test_operator_fidelity.py`.
+Results are OME-Zarr layers you toggle on and off; the raw data on disk is never touched.
+
+## Setup (Windows, one time)
+
+- You need Python 3.10, 3.11, or 3.12. If you do not have it, install from
+  https://www.python.org/downloads/ and tick "Add python.exe to PATH".
 - Open PowerShell in the tool folder and run:
-  - `powershell -ExecutionPolicy Bypass -File scripts\Setup-Windows.ps1`
-- This puts a "MIP tool" shortcut on your Desktop.
-- To update later: go into the folder and run `git pull`, then open the icon again.
+  `powershell -ExecutionPolicy Bypass -File scripts\Setup-Windows.ps1`
+- This puts a **SquidXplorer** shortcut on your Desktop.
+- To update later: `git pull` in the folder, then open the icon again.
 
 ## Open an acquisition
 
-- Double click "MIP tool". A small black console opens next to it. That is normal, it shows progress. Closing it quits the app.
-- Use the menu: File, then Open acquisition folder.
-- Pick the acquisition folder (the one holding the 0 folder and/or the ome_tiff folder).
+- Launch SquidXplorer. A small console opens beside it; that is normal and shows progress.
+- **File, then Open acquisition folder**, and pick the acquisition (the folder holding the `0`
+  folder and/or the `ome_tiff` folder).
 - It reads both Squid formats (individual TIFFs and OME-TIFF), on 384 and 1536 plates.
 
-## The window
+## Explore
 
-- Left: the buttons (run MIP, open CLI, layers).
-- Bottom left: the plate. Grey dots are empty wells, so you always see the full plate shape. Scanned wells show their image.
-- Right: the detail viewer for the well in view. It has its own controls: play and frames per second, a channel subset, and z (focus), t (time), and FOV sliders.
-- Double click a well to open it on the right. The red box marks the well in view.
-
-## Run MIP
-
-- Click "Maximum Intensity Projection".
-- Preview first (nothing saved): set "First N wells", click Preview. Good for a quick look before doing the whole plate.
-- Whole plate: choose an output folder, click "Run on the whole plate".
-- "Focus reference plane" jumps the z slider to the sharpest plane of the well in view.
-- "Return to raw view" goes back to the unprocessed plate.
-
-## The result
-
-- MIP writes a plate folder named `<acquisition name>.hcs`.
-- That folder is your result. To look at it again later, open the "MIP tool" and use File, then Open a computed MIP, and pick that .hcs folder.
-- It also opens in napari or in FIJI.
-- For plain TIFFs you can open directly in FIJI, run from the command line with `--tiff` (it adds a tiff folder next to the plate).
-
-## Command line (optional)
-
-- Click "Open CLI" for a terminal inside the app, or use your own PowerShell.
-- Helpful commands:
-  - MIP the whole plate and save FIJI TIFFs:
-    - `python -m squidmip "C:\path\to\acquisition" --tiff`
-  - Try the first 8 wells first (quick):
-    - `python -m squidmip "C:\path\to\acquisition" --limit 8 --tiff`
-  - Choose where to save:
-    - `python -m squidmip "C:\path\to\acquisition" --tiff --output-folder C:\Users\you\Downloads`
-  - See all options:
-    - `python -m squidmip --help`
-
-## Open in Minerva Author (optional)
-
-- In "Process wells", click "Open in Minerva Author". It exports the well you have selected and
-  starts Minerva Author on it.
-- You get two files per well: a `.ome.tiff` (the image) and a `.story.json` (the colours and
-  contrast). They go to a `minerva_export` folder in your home directory unless you choose another.
-- Minerva Author cannot be pointed at a file automatically, so when it opens, click "Select File"
-  and pick the `.story.json` the tab shows you. Use "Copy story path" or "Show in folder" if you
-  need to find it. Your channel colours are already applied.
-- Exporting works on its own. Opening Minerva Author needs Minerva installed: point
-  `SQUIDMIP_MINERVA_HOME` at an `explorer` checkout that has already run its `setup.py`. Without
-  it the export still succeeds and the tab tells you where the files are.
-- One file per well. Combining several wells into one image needs the stitcher, which is coming
-  later.
-
-## Good to know
-
-- Wells with more than one FOV: for now it uses the first FOV per well. Full multi FOV support (for example with the stitcher) is coming soon.
-- It never writes into your acquisition folder. Results go only where you point them.
-- Memory stays low: it holds at most one well at a time, so even a 1536 plate opens fine.
+- **Click** a well to select it, **Shift-drag** a box or **Shift/Ctrl-click** to select several,
+  then **Open view** to open them as one window.
+- Inside a window: **2D / 3D**, draw an **ROI** and send it to its own child window, and run an
+  **operator** on that view.
+- The **Window navigator** lists every open view; select rows to highlight their wells on the
+  plate, and **Collapse all** when the desktop gets busy.
