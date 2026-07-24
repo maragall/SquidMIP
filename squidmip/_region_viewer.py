@@ -1208,6 +1208,24 @@ class ViewerManager(QObject):
             win.activateWindow()
             self.viewFocused.emit(list(win._regions))   # move the plate wash onto this view
 
+    def raise_views(self, ids: "Sequence[int]") -> None:
+        """Bring the selected windows to the FRONT of the desktop (Julio: clicking a navigator row
+        should raise its window). Un-minimise + raise each; activate the last for keyboard focus.
+        Un-minimising also lifts a window collapsed by Collapse all."""
+        wins = [self._windows.get(int(i)) for i in ids]
+        wins = [w for w in wins if w is not None]
+        for w in wins:
+            try:
+                w.showNormal()
+                w.raise_()
+            except Exception:                            # noqa: BLE001 - best effort per window
+                pass
+        if wins:
+            try:
+                wins[-1].activateWindow()
+            except Exception:                            # noqa: BLE001
+                pass
+
     def close(self, window_id: int) -> None:
         win = self._windows.get(int(window_id))
         if win is not None:
@@ -1351,8 +1369,10 @@ class OpenViewList(QWidget):
         washes every selected view in its hue; empty selection clears the wash."""
         if self._syncing:
             return
-        ids = [it.data(0, Qt.UserRole) for it in self._tree.selectedItems()]
-        self._manager.set_selected([int(i) for i in ids if i is not None])
+        ids = [int(i) for i in (it.data(0, Qt.UserRole) for it in self._tree.selectedItems())
+               if i is not None]
+        self._manager.set_selected(ids)     # plate wash for every selected view
+        self._manager.raise_views(ids)      # and bring the selected window(s) to the front
 
     def _on_activated(self, item: QTreeWidgetItem, _column: int = 0) -> None:
         wid = item.data(0, Qt.UserRole)
