@@ -3051,8 +3051,8 @@ class _SpotWorker(QThread):
         where = f"{self._region}/{self._channel}"
         algorithm = preferred_segmenter()
         try:
-            plane = _full_res_plane(self._data, self._z)
-            log.info("%s: detecting nuclei with %s on a %s plane", where, algorithm, plane.shape)
+            plane = _full_res_mip(self._data)          # segment the MIP over z, not one z-plane
+            log.info("%s: detecting nuclei with %s on a %s MIP", where, algorithm, plane.shape)
 
             res = detect_spots(
                 plane, self._params, algorithm=algorithm,
@@ -3193,6 +3193,31 @@ def _full_res_plane(data, z_index):
         raise ValueError(
             f"expected a 2-D plane to count on, got shape {plane.shape!r}. The layer's data is "
             "neither a pyramid level list, a (z, y, x) stack, nor a (y, x) plane."
+        )
+    return plane
+
+
+def _full_res_mip(data):
+    """The full-resolution MIP (max over z) behind a napari layer's ``data`` — what cellpose / spot
+    detection segments now (Julio: "run cellpose on a MIP instead of the current z-plane").
+
+    Level 0 always (a downsampled level merges touching nuclei). A (z, y, x) stack is reduced by
+    max over z; a plain (y, x) plane IS its own MIP. The max stays lazy on a dask level until the
+    final asarray, so only the 2-D result is materialised, not the whole stack at once."""
+    if isinstance(data, (list, tuple)):
+        if not data:
+            raise ValueError("the layer holds an EMPTY multiscale pyramid — nothing to count.")
+        data = data[0] if getattr(data[0], "ndim", 0) >= 2 else np.asarray(data)
+    ndim = getattr(data, "ndim", None)
+    if ndim is None:
+        data = np.asarray(data)
+        ndim = data.ndim
+    if ndim == 3:
+        data = data.max(axis=0)                        # MIP over z (lazy on a dask level)
+    plane = np.asarray(data)
+    if plane.ndim != 2:
+        raise ValueError(
+            f"expected a 2-D MIP to count on, got shape {plane.shape!r} after the z reduction."
         )
     return plane
 
