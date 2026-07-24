@@ -568,6 +568,67 @@ def display_well_id(cell_id: str) -> str:
     return f"{_row_index(letters) + 1}{digits}"
 
 
+# --- fixed-width integer id: the flat-cache scope + the logger's numeric id -------------------
+#
+# Julio + Spencer (2026-07-24): enumerate with INTEGERS, not strings (a consultant warned string
+# keys are silently slow, and a machine may transform them). Fixed-width slots -- Row Column ROI --
+# make the id UNAMBIGUOUS and DECODABLE, unlike display_well_id's concatenated "318". Layout:
+# ``row * 1_000_000 + col * 10_000 + roi`` with 0-based row/col and a 4-digit ROI slot. A 1536-well
+# plate is 32 rows x 48 cols, so 2 digits each is ample; up to 10_000 ROIs per well.
+_ROW_MUL = 1_000_000
+_COL_MUL = 10_000
+_ROI_MAX = 10_000
+
+
+def well_code(cell_id: str) -> "Optional[int]":
+    """The fixed-width integer id for a WELL (ROI slot 0), or None for a freeform region (no row
+    letter, e.g. a tissue slide's ``manual0``). This is the flat cache SCOPE and the logger id."""
+    s = str(cell_id)
+    i = 0
+    while i < len(s) and s[i].isalpha():
+        i += 1
+    letters, digits = s[:i], s[i:]
+    if not letters or not digits.isdigit() or not letters.isupper() or len(letters) > 2:
+        return None
+    row = _row_index(letters)                 # 0-based row from the letter(s)
+    col = int(digits) - 1                      # 0-based column
+    if not (0 <= row <= 99 and 0 <= col <= 99):
+        return None
+    return row * _ROW_MUL + col * _COL_MUL
+
+
+def roi_code(cell_id: str, roi_index: int) -> "Optional[int]":
+    """The integer id for an ROI within a well: the well code plus the ROI slot (0.._ROI_MAX-1)."""
+    base = well_code(cell_id)
+    if base is None:
+        return None
+    r = int(roi_index)
+    if not (0 <= r < _ROI_MAX):
+        return None
+    return base + r
+
+
+def decode_code(code: int) -> "tuple[int, int, int]":
+    """``code -> (row, col, roi)``, all 0-based. The inverse of :func:`well_code`/:func:`roi_code`,
+    which is the whole point of the fixed-width layout: no string round-trip, no ambiguity."""
+    code = int(code)
+    return (code // _ROW_MUL, (code // _COL_MUL) % 100, code % _ROI_MAX)
+
+
+def format_code(code: int) -> str:
+    """Human form ``"RR CC OOOO"`` (Row Column ROI), e.g. ``"02 17 0003"`` -- the layout Julio drew."""
+    row, col, roi = decode_code(code)
+    return f"{row:02d} {col:02d} {roi:04d}"
+
+
+def cache_scope(cell_id: str, roi_index: "Optional[int]" = None) -> str:
+    """The flat-cache SCOPE string for a well or an ROI: the integer id when the region is a real
+    well, else the raw region key (freeform slides have no row/col to encode). ``str`` so it drops
+    straight into ``ResultCache`` keys."""
+    code = roi_code(cell_id, roi_index) if roi_index is not None else well_code(cell_id)
+    return str(code) if code is not None else str(cell_id)
+
+
 class WellPlate(Plate):
     """A standard microtitre plate: cells are wells named A1..{row}{col}, 1-based columns."""
 
