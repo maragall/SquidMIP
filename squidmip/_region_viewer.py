@@ -27,6 +27,7 @@ import numpy as np
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -246,6 +247,22 @@ class RegionViewer(QMainWindow):
             return
         self._pane = pane
 
+        # Wire the pane's OWN "Detect on: [channel] Detect nuclei" strip (the channel-aware Cellpose
+        # picker). It was only connected for the old central pane, so in a window it was a dead
+        # button -- Julio's "I can't detect nuclei on my ROI". Populate the channel list, enable it,
+        # and run detection on THIS view (the ROI crop for an ROI child).
+        try:
+            ch_combo = getattr(pane, "detect_channel", None)
+            if ch_combo is not None and ch_combo.count() == 0:
+                for c in (self._meta or {}).get("channels", []):
+                    ch_combo.addItem(str(c["name"]))
+            btn = getattr(pane, "detect_button", None)
+            if btn is not None:
+                btn.setEnabled(True)
+                btn.clicked.connect(self._detect_nuclei)
+        except Exception:                                # noqa: BLE001 - detection stays optional
+            pass
+
         # DECK LAYOUT for a child window (2026-07-23 deck, per-window slide): a TOP ROW of two
         # panels — [2D / 3D + ROI tools] on the left, [Operators for THIS window] on the right —
         # over the mosaic viewer (full well), with the region slider at the bottom. The ROI
@@ -355,10 +372,17 @@ class RegionViewer(QMainWindow):
         opr.addWidget(self._op_combo, 1)
         opr.addWidget(self._chip("Run", "Run the selected operator on THIS view's regions.",
                                  self._run_view_operator))
-        opr.addWidget(self._chip("⬤ Nuclei", "Detect nuclei (Cellpose) on THIS view's MIP and lay "
-                                 "the mask over it. On an ROI child that is the ROI's cropped data.",
-                                 self._detect_nuclei))
+        # SAVE-TO-DISK toggle, OFF by default: a window run is normally a PREVIEW ("see how the
+        # results would look"); only tick this to persist an OME-Zarr (Julio + the Spencer huddle).
+        self._save_chk = QCheckBox("save")
+        self._save_chk.setToolTip("Off = preview only (nothing written to disk). On = persist the "
+                                  "operator result as an OME-Zarr.")
+        self._save_chk.setStyleSheet("QCheckBox{color:#c9d1d9;font-size:11px;}")
+        opr.addWidget(self._save_chk)
         ov.addLayout(opr)
+        # Nuclei detection lives on the pane's own "Detect on: [channel] Detect nuclei" strip (the
+        # channel-aware Cellpose picker Julio asked for) -- wired to _detect_nuclei in _build. No
+        # duplicate control here.
         # Row 2: contrast sync (copy/paste LUTs) — window <-> window <-> plate.
         sync = QHBoxLayout(); sync.setSpacing(4)
         sync.addWidget(self._chip("⧉ Copy LUTs", "Copy this window's per-channel contrast + colormap.",
@@ -383,9 +407,12 @@ class RegionViewer(QMainWindow):
             self._say("no operator selected.")
             return
         regions = list(self._regions)
+        # SAVE OFF by default = preview (see how it looks); ON persists an OME-Zarr (Spencer huddle).
+        save = bool(self._save_chk.isChecked()) if getattr(self, "_save_chk", None) is not None else False
         try:
-            self._run_operator(key, regions=regions)
-            self._say(f"running {self._op_combo.currentText()} on {self._region_label(regions)}.")
+            self._run_operator(key, regions=regions, save=save)
+            mode = "saving" if save else "previewing"
+            self._say(f"{mode} {self._op_combo.currentText()} on {self._region_label(regions)}.")
         except Exception as exc:                          # noqa: BLE001 - named to the window
             self._say(f"could not start {self._op_combo.currentText()}: {exc}")
 
@@ -422,7 +449,16 @@ class RegionViewer(QMainWindow):
         if self._spot_worker is not None and self._spot_worker.isRunning():
             self._say("nuclei detection is already running in this window.")
             return
-        channel, layer = self._spot_source()
+        # Honour the pane's "Detect on:" channel picker; fall back to the active/first raw channel.
+        channel, layer = None, None
+        pane = self._pane
+        picker = getattr(pane, "detect_channel", None) if pane is not None else None
+        mosaic = getattr(pane, "mosaic", None) if pane is not None else None
+        if picker is not None and mosaic is not None and picker.currentText():
+            channel = picker.currentText()
+            layer = mosaic.find(_RAW_OP, channel)
+        if layer is None:
+            channel, layer = self._spot_source()
         if layer is None:
             self._say("open a region first, then detect nuclei.")
             return

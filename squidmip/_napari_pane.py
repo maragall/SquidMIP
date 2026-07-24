@@ -248,7 +248,10 @@ class MosaicPane(QWidget):
 
             self._button_source = QtViewerButtons(self._viewer)
             btn = self._button_source.ndisplayButton
-            rl.addWidget(btn)
+            # 3D is the ROI NATIVE POPOUT, not an embedded toggle (Julio: "delete this, since the 3d
+            # rendering we do on the ROIs"; the huddle: "that's not how we render 3d"). Keep the button
+            # object alive for napari's ndisplay state-sync closure, but never show it.
+            btn.hide()
             # napari's icons live in napari's stylesheet, which is applied to napari's own window.
             # Outside it the button would render as an empty square -- a control that is
             # technically visible and reads as broken. get_current_stylesheet is public and in
