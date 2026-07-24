@@ -24,6 +24,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+# Fidelity is vs the maragall standalone repos, which the clean-room CI install does not have.
+# Skip the whole module when any is absent (CI stays green); runs in full on the dev machine.
+pytest.importorskip("petakit")
+pytest.importorskip("tilefusion")
+pytest.importorskip("bgsub")
+
 
 # ======================================================================================
 # 1. bgsub  (maragall/background_subtraction) — HIGHEST PRIORITY

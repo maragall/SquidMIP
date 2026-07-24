@@ -15,6 +15,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+# These tests exercise Julio's standalone repos, which the clean-room CI install (PyPI only) does
+# NOT have. Skip the whole module when any is absent so CI stays green; they run in full on the dev
+# machine (and any CI that installs the repos). `import squidmip` itself is lazy-safe without them.
+pytest.importorskip("petakit")
+pytest.importorskip("tilefusion")
+pytest.importorskip("bgsub")
+
 import squidmip as s
 from squidmip._engine import _resolve_projector
 

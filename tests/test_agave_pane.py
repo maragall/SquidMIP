@@ -13,6 +13,13 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
+# AGAVE is decommissioned (out per the 2026-07-23 deck; base rendering not good) and the central
+# AGAVE pane this module tests was removed in the decentralization. Superseded by the gallery-view
+# native 3D path. Kept for reference; it also segfaults headless, so skip it in CI.
+pytestmark = pytest.mark.skip(reason="AGAVE decommissioned; central pane removed; segfaults headless")
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
