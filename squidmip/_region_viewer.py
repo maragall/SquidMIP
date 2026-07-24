@@ -921,6 +921,14 @@ class RegionViewer(QMainWindow):
                     colormap_by[name] = getattr(cmap, "name", cmap)
                 except Exception:                    # noqa: BLE001
                     pass
+        # ROI CHILD: render the EXACT ROI SUBARRAY -- the cropped level-0 volume the 2D view already
+        # shows -- not a whole FOV (Julio: "it doesn't render the exact ROI subarray in 3D"). The
+        # pane's layer.data[0] is the ROI crop from _on_plane, so its spatial extent matches 2D
+        # exactly. (A larger ROI's native cross-FOV fusion is the follow-up; this matches the view.)
+        if self._roi_bbox is not None and mosaic is not None:
+            self._render_roi_volume(mosaic, contrast_by, colormap_by)
+            return
+
         fov = self._roi_center_fov(region, roi_bbox)  # ROI (selected or own) -> its FOV; else centre
         from squidmip._napari3d import open_native_3d
 
@@ -932,6 +940,46 @@ class RegionViewer(QMainWindow):
             )
         except Exception as exc:                     # noqa: BLE001 - named to the window, never silent
             self._say(f"3D could not open: {exc}")
+
+    def _render_roi_volume(self, mosaic, contrast_by: dict, colormap_by: dict) -> None:
+        """Render the EXACT ROI subarray in 3D: the cropped level-0 volume this window's 2D view
+        shows (mosaic.find(RAW).data[0]), texture-bounded, carrying the on-screen contrast. This is
+        the ROI you boxed, at the same extent as 2D -- not a whole FOV."""
+        volumes: dict = {}
+        for c in (self._meta or {}).get("channels", []):
+            name = c["name"]
+            layer = mosaic.find(_RAW_OP, name)
+            if layer is None:
+                continue
+            data = layer.data
+            level0 = data[0] if isinstance(data, (list, tuple)) else data   # the ROI-cropped rung
+            if getattr(level0, "ndim", 0) < 3 or int(level0.shape[0]) < 2:
+                self._say("3D needs a z-stack; this ROI has a single z plane.")
+                return
+            volumes[name] = level0
+        if not volumes:
+            self._say("no channel on screen to render in 3D.")
+            return
+        px = float((self._meta or {}).get("pixel_size_um") or 1.0)
+        dz = float((self._meta or {}).get("dz_um") or px)
+        max_tex = 2048
+        try:
+            max_tex = int(self._pane._live_max_3d_texture())
+        except Exception:                                # noqa: BLE001 - Apple default is the floor
+            pass
+        from squidmip._napari3d import open_native_3d_volume
+
+        try:
+            self._native3d = open_native_3d_volume(
+                {n: np.asarray(v) for n, v in volumes.items()},
+                scale=(dz, px, px),
+                title=f"3D ROI — {self._region_label(self._regions)}",
+                contrast_by_channel=contrast_by or None,
+                colormap_by_channel=colormap_by or None,
+                max_texture=max_tex,
+            )
+        except Exception as exc:                         # noqa: BLE001 - named to the window
+            self._say(f"ROI 3D could not open: {exc}")
 
     def _say(self, text: str) -> None:
         # ALWAYS log to the shared logger (the app's Log window captures the root logger), tagged
