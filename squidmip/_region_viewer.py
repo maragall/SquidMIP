@@ -977,6 +977,17 @@ class ViewerManager(QObject):
         for win in list(self._windows.values()):
             win.close()
 
+    def collapse_all(self) -> None:
+        """Minimise every open window at once (declutter when a bunch are open, Julio). They stay in
+        the navigator; clicking a row restores that one (focus() does showNormal + raise)."""
+        for win in list(self._windows.values()):
+            try:
+                win.showMinimized()
+            except Exception:                            # noqa: BLE001 - best effort per window
+                pass
+        self._focused_id = None
+        self.viewFocused.emit([])                        # nothing raised -> clear the plate wash
+
     def _on_window_closed(self, win: "RegionViewer") -> None:
         wid = getattr(win, "window_id", -1)
         self._windows.pop(wid, None)
@@ -1041,7 +1052,11 @@ class OpenViewList(QWidget):
         row.setSpacing(6)
         close_btn = QPushButton("Close view")
         close_btn.clicked.connect(self._close_selected)
+        collapse_btn = QPushButton("Collapse all")
+        collapse_btn.setToolTip("Minimise every open window (click a row to bring one back).")
+        collapse_btn.clicked.connect(self._manager.collapse_all)
         row.addWidget(close_btn)
+        row.addWidget(collapse_btn)
         row.addStretch(1)
         lay.addLayout(row)
 
