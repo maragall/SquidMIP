@@ -340,7 +340,8 @@ class RegionViewer(QMainWindow):
         # popout is the single-FOV native volume for when the fused mosaic exceeds the GPU texture.
         view_box, vv = self._titled_box("2D / 3D · ROI")
         r1 = QHBoxLayout(); r1.setSpacing(4)
-        self._btn_2d = self._chip("2D", "Show the mosaic in 2D.", lambda: self._set_ndisplay(2))
+        self._btn_2d = self._chip("2D", "View the SELECTED ROI in 2D (opens it as a child window); "
+                                  "with no ROI picked, just shows the mosaic in 2D.", self._view_roi_2d)
         # 3D is ONE thing: a NATIVE-resolution popout of this view (never the whole fused mosaic,
         # which exceeds the GPU texture and renders blocky). 2D just keeps the mosaic. No embedded
         # 3D toggle, no separate "native" button -- one behaviour, so the cases don't explode.
@@ -534,6 +535,15 @@ class RegionViewer(QMainWindow):
         except Exception as exc:                         # noqa: BLE001 - named, never silent
             self._say(f"could not switch to {n}D: {exc}")
 
+    def _view_roi_2d(self) -> None:
+        """2D view of the SELECTED ROI: open it as a child window (same annotation the 3D button
+        renders in 3D). With no ROI picked, just show the mosaic in 2D."""
+        bbox, _region = self._selected_roi()
+        if bbox is None:
+            self._set_ndisplay(2)
+            return
+        self._open_roi_children()
+
     # -- ROI -> child window (the next level of the tree) --------------------------------
     @staticmethod
     def _sync_roi_width(viewer, layer, screen_px: float = 3.0) -> None:
@@ -633,31 +643,63 @@ class RegionViewer(QMainWindow):
         except Exception as exc:                         # noqa: BLE001
             self._say(f"could not clear ROIs: {exc}")
 
+    def _region_for_roi(self, bbox) -> Optional[str]:
+        """Which of THIS window's regions the ROI box sits in (by its centroid, in stage um), so an
+        ROI child opens on the ONE region it actually covers -- not all the parent's regions, which
+        is why a box drawn on B7 'did not overlap' A7/A8 and fell back to the whole region."""
+        cur = self._cursor.region if self._cursor is not None else (
+            self._regions[0] if self._regions else None)
+        if bbox is None:
+            return cur
+        cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
+        try:
+            from squidmip._mosaic_source import mosaic_bbox_um
+            for r in self._regions:
+                rb = mosaic_bbox_um(self._meta, r)
+                if rb is not None and rb[0] <= cx <= rb[2] and rb[1] <= cy <= rb[3]:
+                    return r
+        except Exception:                                # noqa: BLE001 - fall back to current region
+            pass
+        return cur
+
     def _open_roi_children(self) -> None:
-        """Open the drawn ROI(s) as child window(s) — "first dev step: one ROI, one child window"."""
+        """Open the SELECTED ROI(s) as child window(s), each scoped to the single region it sits in.
+
+        Julio: "I don't have a dropdown of which ROI to open — it opens them all. It should open the
+        one that I'm currently selected." So we open ``layer.selected_data`` (the ROI(s) selected in
+        napari's Shapes layer); with nothing selected we open the last one drawn, not the whole set."""
         v = self._napari_viewer()
         layer = self._roi_layer
         rects = list(getattr(layer, "data", []) or []) if layer is not None else []
         if v is None or layer is None or layer not in list(v.layers) or not rects:
-            self._say("no ROI to open — draw one with '▭ ROI' first.")
+            self._say("no ROI to open — draw one with '▭ new' first.")
             return
         if self._manager is None:
             self._say(f"{len(rects)} ROI(s) drawn, but this window has no manager to open children.")
             return
+        # The SELECTED ROI(s); if none are selected, the most recently drawn one.
+        sel = sorted(int(i) for i in (getattr(layer, "selected_data", None) or set()))
+        idxs = sel if sel else [len(rects) - 1]
         opened = 0
-        for rect in rects:
+        for i in idxs:
+            if i < 0 or i >= len(rects):
+                continue
             bbox = None
             try:
-                arr = np.asarray(rect)
+                arr = np.asarray(rects[i])
                 ys, xs = arr[:, -2], arr[:, -1]        # world coords are (..., y, x)
                 bbox = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
             except Exception:                            # noqa: BLE001 - a shapeless ROI still opens
                 pass
+            region = self._region_for_roi(bbox)
+            if region is None:
+                continue
             child = self._manager.open_child(
-                self._regions, roi_bbox=bbox, parent_id=self.window_id)
+                [region], roi_bbox=bbox, parent_id=self.window_id)
             if child is not None:
                 opened += 1
-        self._say(f"opened {opened} ROI child window(s).")
+        self._say(f"opened {opened} ROI child window(s) on the selected ROI"
+                  + ("s" if opened != 1 else "") + ".")
 
     # -- copy/paste LUTs: sync windows without a parameter file --------------------------
     def _per_channel_luts(self) -> "dict[str, dict]":
@@ -800,12 +842,33 @@ class RegionViewer(QMainWindow):
             self._slider.frame_done()
 
     # -- 2D -> 3D, per window -----------------------------------------------------------
-    def _roi_center_fov(self, region: str) -> Optional[int]:
+    def _selected_roi(self) -> "tuple":
+        """(bbox, region) of the ROI currently SELECTED in this window's Shapes layer, else
+        (None, None). Lets 2D/3D act on the picked ROI so one annotation serves both — Julio: "select
+        the ROI and click 2d or 3d, so I don't have to do a 2d and a 3d annotation in the same place"."""
+        layer = self._roi_layer
+        v = self._napari_viewer()
+        if layer is None or v is None or layer not in list(v.layers):
+            return None, None
+        rects = list(getattr(layer, "data", []) or [])
+        sel = sorted(int(i) for i in (getattr(layer, "selected_data", None) or set()))
+        if not sel or sel[0] >= len(rects):
+            return None, None
+        try:
+            arr = np.asarray(rects[sel[0]])
+            ys, xs = arr[:, -2], arr[:, -1]
+            bbox = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+        except Exception:                                # noqa: BLE001
+            return None, None
+        return bbox, self._region_for_roi(bbox)
+
+    def _roi_center_fov(self, region: str, bbox: Optional[tuple] = None) -> Optional[int]:
         """The FOV nearest the ROI box's centre (stage um), so an ROI's 3D lands on the tissue you
-        boxed. None (region centre) when there is no ROI."""
-        if self._roi_bbox is None:
+        boxed. ``bbox`` defaults to this window's own ROI box; None everywhere => region centre."""
+        bbox = bbox if bbox is not None else self._roi_bbox
+        if bbox is None:
             return None
-        x0, y0, x1, y1 = self._roi_bbox
+        x0, y0, x1, y1 = bbox
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
         positions = (self._meta or {}).get("fov_positions_um") or {}
         fovs = ((self._meta or {}).get("fovs_per_region") or {}).get(region) or []
@@ -833,6 +896,13 @@ class RegionViewer(QMainWindow):
         if region is None or self._reader is None or self._meta is None:
             self._say("no region to render in 3D.")
             return
+        # 3D acts on the SELECTED ROI when one is picked (parent window), else this window's own ROI
+        # box (an ROI child), else the region centre. One annotation -> 2D or 3D on demand.
+        roi_bbox = self._roi_bbox
+        if roi_bbox is None:
+            sel_bbox, sel_region = self._selected_roi()
+            if sel_bbox is not None and sel_region is not None:
+                roi_bbox, region = sel_bbox, sel_region
         mosaic = getattr(self._pane, "mosaic", None) if self._pane is not None else None
         contrast_by: dict = {}
         colormap_by: dict = {}
@@ -851,7 +921,7 @@ class RegionViewer(QMainWindow):
                     colormap_by[name] = getattr(cmap, "name", cmap)
                 except Exception:                    # noqa: BLE001
                     pass
-        fov = self._roi_center_fov(region)           # ROI -> its FOV; else region centre (None)
+        fov = self._roi_center_fov(region, roi_bbox)  # ROI (selected or own) -> its FOV; else centre
         from squidmip._napari3d import open_native_3d
 
         try:
