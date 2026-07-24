@@ -698,10 +698,14 @@ class RegionViewer(QMainWindow):
             self._say(f"3D could not open: {exc}")
 
     def _say(self, text: str) -> None:
+        # ALWAYS log to the shared logger (the app's Log window captures the root logger), tagged
+        # with this view's id -- Julio: "the logger isn't responding to what we do in the windows...
+        # I'm blind to it." The pane status bar is the in-window echo; the log window is the record
+        # of what every open view did, which is what "the logger deals with all open windows" needs.
+        if text:
+            log.info("[view %s] %s", self.window_id, text)
         if self._pane is not None and getattr(self._pane, "ok", False):
             self._pane.say(text)
-        elif text:
-            log.warning("[window %s] %s", self.window_id, text)
 
     # -- render-halt: a window not being manipulated must not keep drawing ----------------
     def set_active(self, active: bool) -> None:

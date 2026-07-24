@@ -3466,7 +3466,7 @@ class PlateWindow(QMainWindow):
 
     def __init__(self, initial_path: Optional[str] = None):
         super().__init__()
-        self.setWindowTitle("MIP tool")
+        self.setWindowTitle("SquidXplorer")
         self.resize(1600, 950)
         self._worker = None           # the operator (MIP) run
         self._preview = None          # the raw preview fill on open
@@ -6516,8 +6516,10 @@ class PlateWindow(QMainWindow):
         _view_tab = self._run_tab()
         if _view_tab is not None:      # ...and the tab showing this run can name that layer later
             _view_tab.plate_layer = layer_key
-        if getattr(self, "_raw_btn", None):
-            self._raw_btn.show()                             # now there's a processed view to return from
+        # NOTE: _raw_btn is a hidden ORPHAN (never added to a layout since the central pane was
+        # removed), so .show() made it POP UP AS A FLOATING WINDOW — Julio: "a 'return to raw view'
+        # window pops up. That I don't get." Return-to-raw is handled by the layer stack / plate mode
+        # now, so we no longer surface this stray button.
         stack_label = label if not tab_key else f"{label} · {exploration_tab_label(regions)}"
         self._op_stack.add(layer_key, stack_label)           # push the operator layer onto the stack
         self._overview.set_active_layer(layer_key)           # show it
@@ -7561,7 +7563,7 @@ def acquire_gui_slot() -> _GuiSlot:
         return _GuiSlot(fd, path)
 
     raise GuiAlreadyOpen(
-        f"a SquidMIP window is already open ({limit} allowed at once). Close it first, or "
+        f"a SquidXplorer window is already open ({limit} allowed at once). Close it first, or "
         f"raise the cap with SQUIDMIP_MAX_GUI=<n>. Lock dir: {lock_dir}"
     )
 
